@@ -17,6 +17,10 @@ fn emit(message: &OutMessage) -> Result<()> {
     Ok(())
 }
 
+fn sync_lsp(lsp: &mut lsp::LspManager, buffer: &EditorBuffer) {
+    lsp.did_change(buffer.filename(), &buffer.text(), buffer.revision());
+}
+
 fn main() -> Result<()> {
     let mut buffer = EditorBuffer::new();
     let mut lsp = lsp::LspManager::new();
@@ -29,9 +33,9 @@ fn main() -> Result<()> {
         )))?;
     }
 
-    lsp.refresh_for_file(buffer.filename());
+    lsp.refresh_for_file(buffer.filename(), &buffer.text(), buffer.revision());
     emit(&OutMessage::Ready { type_: "ready" })?;
-    emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+    emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
 
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -50,28 +54,34 @@ fn main() -> Result<()> {
         match command {
             Command::Open { filename } => {
                 match buffer.open(&filename) {
-                    Ok(()) => lsp.refresh_for_file(buffer.filename()),
+                    Ok(()) => {
+                        lsp.refresh_for_file(buffer.filename(), &buffer.text(), buffer.revision())
+                    }
                     Err(error) => emit(&OutMessage::error(format!(
                         "failed to open {filename}: {error}"
                     )))?,
                 }
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Insert { text } => {
                 buffer.insert(&text);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::DeleteBackward => {
                 buffer.delete_backward();
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::DeleteForward => {
                 buffer.delete_forward();
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::DeleteLine => {
                 buffer.delete_line();
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::DeleteRange {
                 start_row,
@@ -80,56 +90,64 @@ fn main() -> Result<()> {
                 end_col,
             } => {
                 buffer.delete_range(start_row, start_col, end_row, end_col);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Move { direction } => {
                 buffer.move_cursor(direction);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::MoveTo { row, col } => {
                 buffer.move_to(row, col);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Save => {
                 match buffer.save() {
-                    Ok(()) => emit(&OutMessage::Saved {
-                        type_: "saved",
-                        filename: buffer.filename().map(str::to_owned),
-                    })?,
+                    Ok(()) => {
+                        lsp.did_save(buffer.filename(), &buffer.text());
+                        emit(&OutMessage::Saved {
+                            type_: "saved",
+                            filename: buffer.filename().map(str::to_owned),
+                        })?
+                    }
                     Err(error) => emit(&OutMessage::error(format!("save failed: {error}")))?,
                 }
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Undo => {
                 buffer.undo();
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Redo => {
                 buffer.redo();
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                sync_lsp(&mut lsp, &buffer);
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Resize { width, height } => {
                 buffer.resize(width, height);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::SetViewport { start, height } => {
                 buffer.set_viewport(start, height);
-                emit(&OutMessage::Snapshot(buffer.snapshot(&lsp)))?;
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
             Command::Hover { row, col } => {
+                let response = lsp.hover(buffer.filename(), row, col);
                 emit(&OutMessage::LspResponse {
                     type_: "lspResponse",
-                    kind: "hover".to_owned(),
-                    status: lsp.status_for(buffer.filename()),
-                    result: Some(serde_json::json!({ "row": row, "col": col })),
+                    kind: response.kind,
+                    status: response.status,
+                    result: response.result,
                 })?;
             }
             Command::GoToDefinition { row, col } => {
+                let response = lsp.definition(buffer.filename(), row, col);
                 emit(&OutMessage::LspResponse {
                     type_: "lspResponse",
-                    kind: "definition".to_owned(),
-                    status: lsp.status_for(buffer.filename()),
-                    result: Some(serde_json::json!({ "row": row, "col": col, "target": null })),
+                    kind: response.kind,
+                    status: response.status,
+                    result: response.result,
                 })?;
             }
             Command::Completion { row, col } => {

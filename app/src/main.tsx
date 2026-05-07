@@ -2,7 +2,7 @@ import React from 'react'
 import { basename, resolve as resolvePath } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
-import { QeSidecar, type Snapshot, type SyntaxToken } from './protocol.js'
+import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, type ShellLine, type ShellSession, type ParsedLocation } from './shell.js'
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
 import { loadConfig, mergeLeaderTree, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
@@ -67,6 +67,8 @@ type PromptState =
   | { type: 'commit'; message: string }
 
 type AiMessage = { role: 'user' | 'assistant'; content: string }
+
+type LspTarget = { path?: string; row?: number; col?: number }
 
 type Panel =
   | null
@@ -275,6 +277,10 @@ function buildLeaderMap(
     open: () => void
     stage: () => void
   },
+  lsp: {
+    hover: () => void
+    definition: () => void
+  },
   userLeader: LeaderTree,
   makeCtx: () => EditorContext,
 ): LeaderNode {
@@ -306,6 +312,10 @@ function buildLeaderMap(
       g: git.open,
       s: git.stage,
     },
+    c: {
+      h: lsp.hover,
+      d: lsp.definition,
+    },
   }
   return mergeLeaderTree(builtin, userLeader, makeCtx) as LeaderNode
 }
@@ -314,9 +324,26 @@ const NODE_LABELS: Record<string, string> = {
   q: 'quit',    b: 'buffer',  f: 'file',    t: 'toggle',
   s: 'save',    k: 'kill',    n: 'next',    p: 'prev',
   N: 'new',     l: 'list',    w: 'save+quit',
-  a: 'ai',      c: 'complete', e: 'explain-err',
-  g: 'git',     d: 'diff',    r: 'refresh',
+  a: 'ai',      c: 'code',     e: 'explain-err',
+  g: 'git',     d: 'definition', r: 'refresh',
+  h: 'hover',
   o: 'open',
+}
+
+function lspHoverText(response: LspResponse): string {
+  const result = response.result as { text?: unknown; message?: unknown } | undefined
+  const text = typeof result?.text === 'string' && result.text.trim()
+    ? result.text.trim()
+    : typeof result?.message === 'string'
+      ? result.message
+      : response.status
+  return text.split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3).join('  ')
+}
+
+function lspDefinitionTarget(response: LspResponse): LspTarget | null {
+  const result = response.result as { target?: LspTarget; message?: unknown } | undefined
+  if (result?.target?.path) return result.target
+  return null
 }
 
 function printable(input: string): boolean {
@@ -781,9 +808,19 @@ function App({
       open: openGitPanel,
       stage: stageCurrentFile,
     },
+    {
+      hover: () => {
+        const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+        sidecar.hover(cursor.row, cursor.col)
+      },
+      definition: () => {
+        const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+        sidecar.goToDefinition(cursor.row, cursor.col)
+      },
+    },
     userLeader,
     makeCtx,
-  ), [actions, activeId, buffers, makeCtx, sidecar, userLeader])
+  ), [actions, activeId, buffers, makeCtx, sidecar, snapshot, userLeader])
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -1479,6 +1516,21 @@ async function main() {
           break
         case 'error':
           buffer.status = message.message
+          break
+        case 'lspResponse':
+          if (message.kind === 'definition') {
+            const target = lspDefinitionTarget(message)
+            if (target?.path) {
+              openFile(target.path, { row: target.row ?? 0, col: target.col ?? 0 })
+              buffer.status = `definition ${target.path}:${(target.row ?? 0) + 1}`
+            } else {
+              buffer.status = message.status
+            }
+          } else if (message.kind === 'hover') {
+            buffer.status = lspHoverText(message)
+          } else {
+            buffer.status = message.status
+          }
           break
         case 'exit':
           buffer.status = 'exiting'

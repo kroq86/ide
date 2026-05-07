@@ -28,6 +28,10 @@ The project is intentionally split into a React terminal UI and small sidecars. 
 - Optional: `make` and a C compiler for the legacy `native/qe-core/qe-protocol`
 - A sibling checkout/build of `terminal-react-core`
 - Optional: Ollama for AI features
+- Optional LSP servers:
+  - `typescript-language-server --stdio` for TS/JS
+  - `rust-analyzer` for Rust
+  - `pyright-langserver --stdio` for Python
 
 Expected local layout for the current prototype:
 
@@ -99,6 +103,8 @@ Press `SPC` in normal mode to open the which-key menu.
 - `SPC a p`: open AI chat
 - `SPC a c`: trigger completion
 - `SPC a e`: explain last shell error
+- `SPC c h`: LSP hover at cursor
+- `SPC c d`: LSP go to definition
 - `SPC g g`: open git panel
 - `SPC g s`: stage current file
 

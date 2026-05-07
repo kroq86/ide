@@ -33,8 +33,15 @@ export type SidecarMessage =
   | Snapshot
   | { type: 'saved'; filename: string | null }
   | { type: 'error'; message: string }
-  | { type: 'lspResponse'; kind: string; status: string; result?: unknown }
+  | LspResponse
   | { type: 'exit' }
+
+export type LspResponse = {
+  type: 'lspResponse'
+  kind: 'hover' | 'definition' | 'completion' | 'format' | string
+  status: string
+  result?: unknown
+}
 
 export type SyntaxToken = {
   row: number

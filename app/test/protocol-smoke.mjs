@@ -66,6 +66,24 @@ function waitForSnapshotAfter(offset, predicate = () => true) {
   })
 }
 
+function waitForMessageAfter(offset, type, predicate = () => true) {
+  return new Promise((resolveWait, reject) => {
+    const started = Date.now()
+    const timer = setInterval(() => {
+      const found = messages
+        .slice(offset)
+        .find(message => message.type === type && predicate(message))
+      if (found) {
+        clearInterval(timer)
+        resolveWait(found)
+      } else if (Date.now() - started > 2000) {
+        clearInterval(timer)
+        reject(new Error(`Timed out waiting for ${type}`))
+      }
+    }, 10)
+  })
+}
+
 await waitFor('ready')
 let snapshot = await waitFor('snapshot')
 assert.equal(snapshot.lines[0], 'hello')
@@ -91,6 +109,12 @@ snapshot = await waitForSnapshotAfter(mark, message => message.viewport && messa
 assert.ok(snapshot.totalLines >= 2)
 assert.ok(Array.isArray(snapshot.tokens))
 assert.ok(Array.isArray(snapshot.diagnostics))
+
+mark = messages.length
+send({ type: 'hover', row: 0, col: 0 })
+const hover = await waitForMessageAfter(mark, 'lspResponse', message => message.kind === 'hover')
+assert.equal(hover.kind, 'hover')
+assert.equal(typeof hover.status, 'string')
 
 send({ type: 'save' })
 await waitFor('saved')

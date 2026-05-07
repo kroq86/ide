@@ -45,6 +45,14 @@ impl EditorBuffer {
         self.filename.as_deref()
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn text(&self) -> String {
+        self.rope.to_string()
+    }
+
     pub fn open(&mut self, filename: &str) -> Result<()> {
         let text = fs::read_to_string(filename).with_context(|| format!("reading {filename}"))?;
         self.rope = Rope::from_str(&text);
@@ -208,7 +216,7 @@ impl EditorBuffer {
         self.changed_without_history("redo");
     }
 
-    pub fn snapshot(&self, lsp: &LspManager) -> Snapshot {
+    pub fn snapshot(&self, lsp: &mut LspManager) -> Snapshot {
         let total_lines = self.line_count();
         let visible_rows = self.visible_rows();
         let viewport_start = self.viewport_start.min(total_lines.saturating_sub(1));
@@ -216,7 +224,7 @@ impl EditorBuffer {
         let lines = self.all_lines();
         let visible_lines = lines[viewport_start..viewport_end].to_vec();
         let source = self.rope.to_string();
-        let diagnostics = lsp.diagnostics_for(self.filename(), &lines);
+        let diagnostics = lsp.diagnostics_for(self.filename());
         let token_status = if self.filename.is_some() {
             "syntax"
         } else {
@@ -493,9 +501,9 @@ mod tests {
         write!(tmp, "const answer: number = 42\n").unwrap();
         let path = tmp.path().to_string_lossy().to_string();
         let mut b = EditorBuffer::new();
-        let lsp = LspManager::new();
+        let mut lsp = LspManager::new();
         b.open(&path).unwrap();
-        let snapshot = b.snapshot(&lsp);
+        let snapshot = b.snapshot(&mut lsp);
         assert!(snapshot.tokens.iter().any(|token| token.kind == "keyword"));
         assert!(snapshot.tokens.iter().any(|token| token.kind == "number"));
     }
