@@ -1,0 +1,13 @@
+{
+  "name": "qe-react-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:native": "make -C native/qe-core qe-protocol",
+    "build": "npm run build:native && npm --prefix app run build",
+    "dev": "npm run build:native && npm --prefix app run dev --",
+    "typecheck": "npm --prefix app run typecheck",
+    "test:protocol": "npm run build:native && node app/test/protocol-smoke.mjs"
+  }
+}

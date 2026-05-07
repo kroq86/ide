@@ -1,0 +1,177 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+export type Cursor = {
+  row: number
+  col: number
+}
+
+export type Snapshot = {
+  type: 'snapshot'
+  width: number
+  height: number
+  cursor: Cursor
+  lines: string[]
+  dirty: boolean
+  filename: string | null
+  status: string
+}
+
+export type SidecarMessage =
+  | { type: 'ready' }
+  | Snapshot
+  | { type: 'saved'; filename: string | null }
+  | { type: 'error'; message: string }
+  | { type: 'exit' }
+
+type Command =
+  | { type: 'open'; filename: string }
+  | { type: 'insert'; text: string }
+  | { type: 'deleteBackward' }
+  | { type: 'deleteForward' }
+  | { type: 'deleteLine' }
+  | { type: 'deleteRange'; startRow: number; startCol: number; endRow: number; endCol: number }
+  | { type: 'move'; direction: 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'wordForward' | 'wordBackward' | 'fileStart' | 'fileEnd' }
+  | { type: 'moveTo'; row: number; col: number }
+  | { type: 'save' }
+  | { type: 'undo' }
+  | { type: 'redo' }
+  | { type: 'resize'; width: number; height: number }
+  | { type: 'quit' }
+
+type MoveDirection = Extract<Command, { type: 'move' }>['direction']
+
+export class QeSidecar extends EventEmitter {
+  #child: ChildProcessWithoutNullStreams
+  #buffer = ''
+  #closed = false
+
+  constructor(filename?: string) {
+    super()
+
+    const appDir = dirname(fileURLToPath(import.meta.url))
+    const root = join(appDir, '../..')
+    const binary = join(root, 'native/qe-core/qe-protocol')
+    const args = filename ? [filename] : []
+
+    this.#child = spawn(binary, args, {
+      cwd: root,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    this.#child.stdout.setEncoding('utf8')
+    this.#child.stdout.on('data', chunk => this.#onStdout(String(chunk)))
+    this.#child.stderr.setEncoding('utf8')
+    this.#child.stderr.on('data', chunk => {
+      this.emit('message', {
+        type: 'error',
+        message: String(chunk).trim(),
+      } satisfies SidecarMessage)
+    })
+    this.#child.on('error', error => {
+      this.emit('message', {
+        type: 'error',
+        message: `failed to start qe-protocol: ${error.message}`,
+      } satisfies SidecarMessage)
+    })
+    this.#child.on('exit', () => {
+      this.#closed = true
+      this.emit('exit')
+    })
+  }
+
+  send(command: Command): void {
+    if (this.#closed || !this.#child.stdin.writable) {
+      return
+    }
+
+    this.#child.stdin.write(`${JSON.stringify(command)}\n`)
+  }
+
+  open(filename: string): void {
+    this.send({ type: 'open', filename })
+  }
+
+  insert(text: string): void {
+    this.send({ type: 'insert', text })
+  }
+
+  deleteBackward(): void {
+    this.send({ type: 'deleteBackward' })
+  }
+
+  deleteForward(): void {
+    this.send({ type: 'deleteForward' })
+  }
+
+  deleteLine(): void {
+    this.send({ type: 'deleteLine' })
+  }
+
+  deleteRange(startRow: number, startCol: number, endRow: number, endCol: number): void {
+    this.send({ type: 'deleteRange', startRow, startCol, endRow, endCol })
+  }
+
+  moveTo(row: number, col: number): void {
+    this.send({ type: 'moveTo', row, col })
+  }
+
+  move(direction: MoveDirection): void {
+    this.send({ type: 'move', direction })
+  }
+
+  save(): void {
+    this.send({ type: 'save' })
+  }
+
+  undo(): void {
+    this.send({ type: 'undo' })
+  }
+
+  redo(): void {
+    this.send({ type: 'redo' })
+  }
+
+  resize(width: number, height: number): void {
+    this.send({ type: 'resize', width, height })
+  }
+
+  quit(): void {
+    this.send({ type: 'quit' })
+  }
+
+  kill(): void {
+    if (!this.#closed) {
+      this.#child.kill()
+    }
+  }
+
+  #onStdout(chunk: string): void {
+    this.#buffer += chunk
+
+    for (;;) {
+      const index = this.#buffer.indexOf('\n')
+      if (index === -1) {
+        return
+      }
+
+      const line = this.#buffer.slice(0, index)
+      this.#buffer = this.#buffer.slice(index + 1)
+
+      if (!line.trim()) {
+        continue
+      }
+
+      try {
+        this.emit('message', JSON.parse(line) as SidecarMessage)
+      } catch (error) {
+        this.emit('message', {
+          type: 'error',
+          message: `invalid sidecar JSON: ${String(error)}`,
+        } satisfies SidecarMessage)
+      }
+    }
+  }
+}

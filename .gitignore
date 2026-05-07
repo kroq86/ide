@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+app/node_modules/
+
+# build outputs
+app/dist/
+dist/
+
+# native build artifacts
+native/qe-core/*.o
+native/qe-core/**/*.o
+native/qe-core/**/*.a
+native/qe-core/**/*.dSYM/
+native/qe-core/qe
+native/qe-core/qe_g
+native/qe-core/qe-protocol
+native/qe-core/fbftoqe
+native/qe-core/html2png
+native/qe-core/libqhtml/csstoqe
+native/qe-core/config.h
+native/qe-core/config.mak
+*~
+
+# logs and caches
+*.log
+.cache/
+.DS_Store
+
+# local/editor state
+.claude/settings.local.json
+.env
+.env.*
+
+# local scratch files
+/f

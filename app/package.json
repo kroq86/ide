@@ -1,0 +1,23 @@
+{
+  "name": "qe-react-editor-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.tsx --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.js \"--alias:react=$(npm root)/react\" \"--define:process.env.NODE_ENV='production'\"",
+    "dev": "npm run build && node dist/main.js",
+    "dev:ui": "npm run build && node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0",
+    "react": "^19.0.0",
+    "terminal-react-core": "file:../../terminal-react-core"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
