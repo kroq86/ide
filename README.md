@@ -2,7 +2,7 @@
 
 A terminal-native React editor prototype: modal text editing in the main pane, plus shell, git, and AI panels sharing one session context.
 
-The project is intentionally split into a React terminal UI and small sidecars. The current editor sidecar is a prototype JSONL line-buffer, not the full QEmacs editor core.
+The project is intentionally split into a React terminal UI and small sidecars. The default editor sidecar is now a Rust JSONL core with a rope buffer, structured undo/redo, syntax metadata, and an LSP-ready protocol surface. The older C `qe-protocol` sidecar is still kept as legacy scaffolding.
 
 ## Current State
 
@@ -10,6 +10,7 @@ The project is intentionally split into a React terminal UI and small sidecars. 
 - Alternate-screen full-terminal rendering
 - Normal, insert, visual, command, and search modes
 - Vim-like basics: `hjkl`, `w/b`, `gg/G`, `dd`, `yy`, `p/P`, visual select/delete/yank
+- Rust editor core with `ropey`, structured transaction undo/redo, protocol v2 snapshots, tree-sitter token metadata, and LSP status/diagnostic hooks
 - Undo/redo: `u` and `Ctrl-R`
 - Lightweight buffer records with one active editor sidecar
 - Buffer commands under `SPC b`
@@ -23,7 +24,8 @@ The project is intentionally split into a React terminal UI and small sidecars. 
 
 - Node.js 22+
 - npm
-- `make` and a C compiler for `native/qe-core/qe-protocol`
+- Rust/Cargo for `native/editor-core`
+- Optional: `make` and a C compiler for the legacy `native/qe-core/qe-protocol`
 - A sibling checkout/build of `terminal-react-core`
 - Optional: Ollama for AI features
 
@@ -123,6 +125,17 @@ AI calls use Ollama by default:
 export OLLAMA_URL=http://localhost:11434
 export OLLAMA_MODEL=llama3.2:latest
 ```
+### native/editor-core/src/main.rs
+
+fn main() {
+    // initialize editor core here
+}
+
+### app/src/main.tsx
+
+import EditorCore from 'native/editor-core';
+
+// use EditorCore here
 
 The AI context currently includes the active buffer, open buffer names, recent shell sessions, and git status/diff summary.
 
@@ -134,11 +147,12 @@ app/src/protocol.ts    JSONL wrapper for the editor sidecar
 app/src/shell.ts       PTY shell sidecar and semantic shell capture
 app/src/git.ts         Git status/diff/log/stage helpers
 app/src/ai.ts          Ollama streaming chat/completion
+native/editor-core/    Rust editor core: rope buffer, undo history, syntax, LSP surface
 native/qe-core/
-  qe-protocol.c        Prototype line-buffer sidecar
+  qe-protocol.c        Legacy prototype line-buffer sidecar
 ```
 
-The long-term core is undecided. The current C sidecar is useful scaffolding; a future owned core would likely move toward a real rope buffer, structured undo, syntax, and LSP.
+`app/src/protocol.ts` prefers `native/editor-core/target/release/editor-core` and falls back to the legacy C sidecar if the Rust binary is missing. Protocol v2 keeps legacy `lines` for compatibility while adding `visibleLines`, `tokens`, `diagnostics`, `revision`, and viewport metadata.
 
 ## License Notes
 

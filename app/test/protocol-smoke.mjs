@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 
 const root = resolve(new URL('../..', import.meta.url).pathname)
-const binary = join(root, 'native/qe-core/qe-protocol')
+const binary = join(root, 'native/editor-core/target/release/editor-core')
 const dir = mkdtempSync(join(tmpdir(), 'qe-react-editor-'))
 const file = join(dir, 'sample.txt')
 writeFileSync(file, 'hello\nworld\n')
@@ -69,6 +69,9 @@ function waitForSnapshotAfter(offset, predicate = () => true) {
 await waitFor('ready')
 let snapshot = await waitFor('snapshot')
 assert.equal(snapshot.lines[0], 'hello')
+assert.equal(snapshot.protocolVersion, 2)
+assert.equal(snapshot.visibleLines[0], 'hello')
+assert.equal(typeof snapshot.revision, 'number')
 
 send({ type: 'move', direction: 'end' })
 send({ type: 'insert', text: '!' })
@@ -81,6 +84,13 @@ mark = messages.length
 send({ type: 'redo' })
 snapshot = await waitForSnapshotAfter(mark, message => message.lines[0] === 'hello!')
 assert.equal(snapshot.lines[0], 'hello!')
+
+mark = messages.length
+send({ type: 'resize', width: 80, height: 12 })
+snapshot = await waitForSnapshotAfter(mark, message => message.viewport && message.visibleLines)
+assert.ok(snapshot.totalLines >= 2)
+assert.ok(Array.isArray(snapshot.tokens))
+assert.ok(Array.isArray(snapshot.diagnostics))
 
 send({ type: 'save' })
 await waitFor('saved')

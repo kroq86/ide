@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:native": "make -C native/qe-core qe-protocol",
+    "build:native": "cargo build --release --manifest-path native/editor-core/Cargo.toml",
+    "build:legacy-native": "make -C native/qe-core qe-protocol",
     "build": "npm run build:native && npm --prefix app run build",
     "dev": "npm run build:native && npm --prefix app run dev --",
     "typecheck": "npm --prefix app run typecheck",

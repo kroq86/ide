@@ -2,7 +2,7 @@ import React from 'react'
 import { basename, resolve as resolvePath } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
-import { QeSidecar, type Snapshot } from './protocol.js'
+import { QeSidecar, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, type ShellLine, type ShellSession, type ParsedLocation } from './shell.js'
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
 import { loadConfig, mergeLeaderTree, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
@@ -122,6 +122,34 @@ function findMatches(lines: string[], query: string): Array<{ row: number; col: 
 
 type Seg = { text: string; fg: ThemeColor; bg?: ThemeColor }
 
+function syntaxColor(kind: string): ThemeColor {
+  if (kind === 'keyword') return C.magenta
+  if (kind === 'type') return C.cyan
+  if (kind === 'string') return C.green
+  if (kind === 'number' || kind === 'constant') return C.orange
+  if (kind === 'comment') return C.grey
+  return C.fg
+}
+
+function tokenSegs(line: string, row: number, tokens: SyntaxToken[] | undefined): Seg[] {
+  const rowTokens = (tokens ?? [])
+    .filter(token => token.row === row && token.endCol > token.startCol)
+    .sort((a, b) => a.startCol - b.startCol)
+  if (rowTokens.length === 0) return [{ text: line || ' ', fg: C.fg }]
+
+  const segs: Seg[] = []
+  let pos = 0
+  for (const token of rowTokens) {
+    const start = Math.max(pos, Math.min(token.startCol, line.length))
+    const end = Math.max(start, Math.min(token.endCol, line.length))
+    if (start > pos) segs.push({ text: line.slice(pos, start), fg: C.fg })
+    if (end > start) segs.push({ text: line.slice(start, end), fg: syntaxColor(token.kind) })
+    pos = end
+  }
+  if (pos < line.length) segs.push({ text: line.slice(pos), fg: C.fg })
+  return segs.length ? segs : [{ text: line || ' ', fg: C.fg }]
+}
+
 function lineSegs(
   line: string,
   row: number,
@@ -130,6 +158,7 @@ function lineSegs(
   sel: SelBounds | null,
   searchQuery: string,
   ghostText: string | null,
+  tokens?: SyntaxToken[],
 ): Seg[] {
   const isCursor = row === cursor.row
 
@@ -194,7 +223,7 @@ function lineSegs(
     return segs.length ? segs : [{ text: line || ' ', fg: C.fg }]
   }
 
-  return [{ text: line || ' ', fg: C.fg }]
+  return tokenSegs(line, row, tokens)
 }
 
 function getGitContext(): string {
@@ -539,6 +568,7 @@ function EditorPane({
   const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
   const title  = snapshot?.filename ?? filename ?? bufferName
   const dirty  = snapshot?.dirty ?? false
+  const diagnosticCount = snapshot?.diagnostics?.length ?? 0
 
   const totalRows = process.stdout.rows ?? 24
   const totalCols = process.stdout.columns ?? 80
@@ -588,6 +618,7 @@ function EditorPane({
         <Text color={dirty ? C.orange : C.fg}>{`${title}${dirty ? ' *' : ''}`}</Text>
         <Text color={C.grey}>{`${bufferIndex + 1}/${bufferCount}`}</Text>
         <Text color={C.grey}>{`${cursor.row + 1}:${cursor.col + 1}`}</Text>
+        {diagnosticCount > 0 && <Text color={C.orange}>{`diag ${diagnosticCount}`}</Text>}
         <Text color={C.grey}>{status}</Text>
         {searchQuery && <Text color={C.yellow}>{`  /${searchQuery} (${matchCount})`}</Text>}
       </Box>
@@ -617,7 +648,7 @@ function EditorPane({
           const isCursor  = actualRow === cursor.row
           const marker    = isCursor ? '>' : ' '
           const cropped   = line.slice(0, visibleCols)
-          const segs = lineSegs(cropped, actualRow, cursor, mode, sel, searchQuery, ghostText)
+          const segs = lineSegs(cropped, actualRow, cursor, mode, sel, searchQuery, ghostText, snapshot?.tokens)
 
           return (
             <Box key={index} flexDirection="row">

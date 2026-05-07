@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -10,6 +11,9 @@ export type Cursor = {
 
 export type Snapshot = {
   type: 'snapshot'
+  protocolVersion?: number
+  bufferId?: string
+  revision?: number
   width: number
   height: number
   cursor: Cursor
@@ -17,6 +21,11 @@ export type Snapshot = {
   dirty: boolean
   filename: string | null
   status: string
+  totalLines?: number
+  viewport?: { start: number; end: number }
+  visibleLines?: string[]
+  tokens?: SyntaxToken[]
+  diagnostics?: Diagnostic[]
 }
 
 export type SidecarMessage =
@@ -24,7 +33,24 @@ export type SidecarMessage =
   | Snapshot
   | { type: 'saved'; filename: string | null }
   | { type: 'error'; message: string }
+  | { type: 'lspResponse'; kind: string; status: string; result?: unknown }
   | { type: 'exit' }
+
+export type SyntaxToken = {
+  row: number
+  startCol: number
+  endCol: number
+  kind: 'keyword' | 'identifier' | 'type' | 'string' | 'number' | 'comment' | 'constant' | string
+}
+
+export type Diagnostic = {
+  row: number
+  startCol: number
+  endCol: number
+  severity: 'error' | 'warning' | 'info' | 'hint' | string
+  message: string
+  source: string
+}
 
 type Command =
   | { type: 'open'; filename: string }
@@ -39,6 +65,11 @@ type Command =
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'resize'; width: number; height: number }
+  | { type: 'setViewport'; start: number; height: number }
+  | { type: 'hover'; row: number; col: number }
+  | { type: 'goToDefinition'; row: number; col: number }
+  | { type: 'completion'; row: number; col: number }
+  | { type: 'format' }
   | { type: 'quit' }
 
 type MoveDirection = Extract<Command, { type: 'move' }>['direction']
@@ -53,7 +84,9 @@ export class QeSidecar extends EventEmitter {
 
     const appDir = dirname(fileURLToPath(import.meta.url))
     const root = join(appDir, '../..')
-    const binary = join(root, 'native/qe-core/qe-protocol')
+    const rustBinary = join(root, 'native/editor-core/target/release/editor-core')
+    const legacyBinary = join(root, 'native/qe-core/qe-protocol')
+    const binary = existsSync(rustBinary) ? rustBinary : legacyBinary
     const args = filename ? [filename] : []
 
     this.#child = spawn(binary, args, {
@@ -73,7 +106,7 @@ export class QeSidecar extends EventEmitter {
     this.#child.on('error', error => {
       this.emit('message', {
         type: 'error',
-        message: `failed to start qe-protocol: ${error.message}`,
+        message: `failed to start editor sidecar: ${error.message}`,
       } satisfies SidecarMessage)
     })
     this.#child.on('exit', () => {
@@ -136,6 +169,26 @@ export class QeSidecar extends EventEmitter {
 
   resize(width: number, height: number): void {
     this.send({ type: 'resize', width, height })
+  }
+
+  setViewport(start: number, height: number): void {
+    this.send({ type: 'setViewport', start, height })
+  }
+
+  hover(row: number, col: number): void {
+    this.send({ type: 'hover', row, col })
+  }
+
+  goToDefinition(row: number, col: number): void {
+    this.send({ type: 'goToDefinition', row, col })
+  }
+
+  completion(row: number, col: number): void {
+    this.send({ type: 'completion', row, col })
+  }
+
+  format(): void {
+    this.send({ type: 'format' })
   }
 
   quit(): void {
