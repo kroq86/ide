@@ -124,6 +124,31 @@ impl LspManager {
         self.position_request("textDocument/definition", "definition", filename, row, col)
     }
 
+    pub fn completion(&mut self, filename: Option<&str>, row: usize, col: usize) -> LspActionResult {
+        self.position_request("textDocument/completion", "completion", filename, row, col)
+    }
+
+    pub fn format_document(&mut self, filename: Option<&str>) -> Vec<TextEdit> {
+        let Some(client) = self.client.as_mut() else {
+            return Vec::new();
+        };
+        let Some(uri) = filename.and_then(file_uri) else {
+            return Vec::new();
+        };
+        if self.current_uri.as_deref() != Some(uri.as_str()) {
+            return Vec::new();
+        }
+
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true },
+        });
+        match client.request("textDocument/formatting", params, Duration::from_secs(5)) {
+            Ok(Some(result)) => parse_text_edits(&result),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn status_for(&mut self, _filename: Option<&str>) -> String {
         if let Some(client) = self.client.as_mut() {
             client.drain();
@@ -250,6 +275,11 @@ impl LspClient {
                         "synchronization": { "didSave": true },
                         "hover": { "dynamicRegistration": false },
                         "definition": { "dynamicRegistration": false },
+                        "completion": {
+                            "dynamicRegistration": false,
+                            "completionItem": { "snippetSupport": false }
+                        },
+                        "formatting": { "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false }
                     }
                 }
@@ -432,6 +462,37 @@ fn severity_name(severity: Option<u64>) -> String {
     .to_owned()
 }
 
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub start_line: usize,
+    pub start_char: usize,
+    pub end_line: usize,
+    pub end_char: usize,
+    pub new_text: String,
+}
+
+fn parse_text_edits(value: &Value) -> Vec<TextEdit> {
+    let items = match value.as_array() {
+        Some(arr) => arr.as_slice(),
+        None => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let range = item.get("range")?;
+            let start = range.get("start")?;
+            let end = range.get("end")?;
+            Some(TextEdit {
+                start_line: start.get("line")?.as_u64()? as usize,
+                start_char: start.get("character")?.as_u64()? as usize,
+                end_line: end.get("line")?.as_u64()? as usize,
+                end_char: end.get("character")?.as_u64()? as usize,
+                new_text: item.get("newText")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn normalize_lsp_result(kind: &str, result: Value) -> Value {
     if kind == "definition"
         && let Some(target) = first_location(&result)
@@ -444,6 +505,25 @@ fn normalize_lsp_result(kind: &str, result: Value) -> Value {
             "text": hover_text(&result),
             "raw": result,
         });
+    }
+    if kind == "completion" {
+        let items = if let Some(arr) = result.as_array() {
+            arr.clone()
+        } else if let Some(arr) = result.get("items").and_then(Value::as_array) {
+            arr.clone()
+        } else {
+            vec![]
+        };
+        let normalized: Vec<Value> = items.iter().filter_map(|item| {
+            let label = item.get("label")?.as_str()?.to_owned();
+            let insert_text = item.get("insertText")
+                .and_then(Value::as_str)
+                .unwrap_or(&label)
+                .to_owned();
+            let detail = item.get("detail").and_then(Value::as_str).unwrap_or("").to_owned();
+            Some(json!({ "label": label, "insertText": insert_text, "detail": detail }))
+        }).collect();
+        return json!({ "available": true, "items": normalized });
     }
     result
 }

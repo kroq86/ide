@@ -151,22 +151,29 @@ fn main() -> Result<()> {
                 })?;
             }
             Command::Completion { row, col } => {
-                // TODO: wire real LSP textDocument/completion; returning empty list for now
+                let response = lsp.completion(buffer.filename(), row, col);
                 emit(&OutMessage::LspResponse {
                     type_: "lspResponse",
-                    kind: "completion".to_owned(),
-                    status: lsp.status_for(buffer.filename()),
-                    result: Some(serde_json::json!({ "row": row, "col": col, "items": [] })),
+                    kind: response.kind,
+                    status: response.status,
+                    result: response.result,
                 })?;
             }
             Command::Format => {
-                // TODO: wire real LSP textDocument/formatting; no edits returned for now
-                emit(&OutMessage::LspResponse {
-                    type_: "lspResponse",
-                    kind: "format".to_owned(),
-                    status: lsp.status_for(buffer.filename()),
-                    result: None,
-                })?;
+                let edits = lsp.format_document(buffer.filename());
+                let status = lsp.status_for(buffer.filename());
+                if !edits.is_empty() {
+                    buffer.apply_text_edits(&edits);
+                    sync_lsp(&mut lsp, &buffer);
+                    emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
+                } else {
+                    emit(&OutMessage::LspResponse {
+                        type_: "lspResponse",
+                        kind: "format".to_owned(),
+                        status,
+                        result: Some(serde_json::json!({ "applied": 0 })),
+                    })?;
+                }
             }
             Command::Quit => break,
         }

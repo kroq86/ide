@@ -53,6 +53,44 @@ impl EditorBuffer {
         self.rope.to_string()
     }
 
+    /// Apply LSP TextEdits (from textDocument/formatting). Edits must be sorted in
+    /// reverse document order (last range first) so offsets don't shift during application.
+    pub fn apply_text_edits(&mut self, edits: &[crate::lsp::TextEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+
+        // Work on the full text string; rebuild rope at the end.
+        // This avoids fiddly rope-offset bookkeeping across multiple edits.
+        let mut text = self.rope.to_string();
+
+        // Sorted in reverse: last edit first (callers should pre-sort, but we enforce here)
+        let mut sorted: Vec<_> = edits.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.start_line.cmp(&a.start_line)
+                .then(b.start_char.cmp(&a.start_char))
+        });
+
+        for edit in sorted {
+            let start = line_char_offset(&text, edit.start_line, edit.start_char);
+            let end   = line_char_offset(&text, edit.end_line,   edit.end_char);
+            if start <= end && end <= text.len() {
+                text.replace_range(start..end, &edit.new_text);
+            }
+        }
+
+        // Clamp cursor to valid position in the new text
+        let saved_row = self.cursor.row;
+        let saved_col = self.cursor.col;
+        self.rope = ropey::Rope::from_str(&text);
+        let last = self.last_row();
+        let row = saved_row.min(last);
+        let col = saved_col.min(self.line_len(row));
+        self.cursor = crate::protocol::Cursor { row, col };
+        self.revision += 1;
+        self.changed("formatted".to_owned());
+    }
+
     pub fn open(&mut self, filename: &str) -> Result<()> {
         let text = fs::read_to_string(filename).with_context(|| format!("reading {filename}"))?;
         self.rope = Rope::from_str(&text);
@@ -442,6 +480,32 @@ impl EditorBuffer {
         self.cursor = self.char_to_cursor(idx);
         self.ensure_cursor_visible();
     }
+}
+
+/// Convert (line, character) LSP position to a byte offset in a UTF-8 string.
+fn line_char_offset(text: &str, line: usize, character: usize) -> usize {
+    let mut current_line = 0;
+    let mut byte_offset = 0;
+    for ch in text.chars() {
+        if current_line == line {
+            break;
+        }
+        if ch == '\n' {
+            current_line += 1;
+        }
+        byte_offset += ch.len_utf8();
+    }
+    // Now advance by `character` UTF-16 code units (LSP uses UTF-16)
+    // For ASCII content (common case) this is the same as char count.
+    let mut col = 0usize;
+    for ch in text[byte_offset..].chars() {
+        if col >= character || ch == '\n' {
+            break;
+        }
+        col += if ch as u32 > 0xFFFF { 2 } else { 1 };
+        byte_offset += ch.len_utf8();
+    }
+    byte_offset
 }
 
 #[cfg(test)]

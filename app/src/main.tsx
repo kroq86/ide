@@ -2137,6 +2137,17 @@ async function main() {
             }
           } else if (message.kind === 'hover') {
             buffer.status = lspHoverText(message)
+          } else if (message.kind === 'completion') {
+            const result = message.result as { available?: boolean; items?: Array<{ label: string; insertText: string; detail: string }> } | undefined
+            const items = result?.items ?? []
+            if (items.length > 0) {
+              // Show top completion item as ghost text; user presses Tab to accept
+              const top = items[0]!
+              setGhostText(top.insertText)
+              buffer.status = `completion: ${items.length} item${items.length === 1 ? '' : 's'} — Tab to accept`
+            } else {
+              buffer.status = message.status
+            }
           } else {
             buffer.status = message.status
           }
