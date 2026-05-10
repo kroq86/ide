@@ -36,3 +36,6 @@ mcp-data/
 
 # local scratch files
 /f
+
+# working notes / design drafts
+docs/

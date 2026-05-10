@@ -7,7 +7,8 @@
     "build": "esbuild src/main.tsx --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.js \"--alias:react=$(npm root)/react\" \"--define:process.env.NODE_ENV='production'\"",
     "dev": "npm run build && node dist/main.js",
     "dev:ui": "npm run build && node dist/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/leader.test.ts test/helpers.test.ts test/git.test.ts test/ai-context.test.ts test/codeclaw.test.ts"
   },
   "dependencies": {
     "node-pty": "^1.1.0",

@@ -58,13 +58,16 @@ export type QeConfig = {
 
 // ── Loader ───────────────────────────────────────────────────────────────────
 
-const CONFIG_PATHS = [
+export const CONFIG_PATHS = [
   join(homedir(), '.config', 'qe', 'config.js'),
   join(homedir(), '.config', 'qe', 'config.mjs'),
   join(homedir(), '.qe', 'config.js'),
 ]
 
 let _config: QeConfig = {}
+let _configPath: string | null = null
+
+export function getConfigPath(): string | null { return _configPath }
 
 export async function loadConfig(): Promise<QeConfig> {
   for (const p of CONFIG_PATHS) {
@@ -72,12 +75,27 @@ export async function loadConfig(): Promise<QeConfig> {
     try {
       const mod = await import(p) as { default?: QeConfig }
       _config = mod.default ?? {}
+      _configPath = p
       return _config
     } catch (e) {
       process.stderr.write(`qe: config error in ${p}: ${String(e)}\n`)
     }
   }
   return _config
+}
+
+// Re-import with a timestamp query string to bust Node's ESM module cache
+export async function reloadConfig(): Promise<QeConfig> {
+  const p = _configPath
+  if (!p || !existsSync(p)) return _config
+  try {
+    const mod = await import(`${p}?t=${Date.now()}`) as { default?: QeConfig }
+    _config = mod.default ?? {}
+    return _config
+  } catch (e) {
+    process.stderr.write(`qe: config reload error in ${p}: ${String(e)}\n`)
+    return _config
+  }
 }
 
 export function getConfig(): QeConfig {

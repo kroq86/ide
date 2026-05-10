@@ -9,6 +9,7 @@
     "build": "npm run build:native && npm --prefix app run build",
     "dev": "npm run build:native && npm --prefix app run dev --",
     "typecheck": "npm --prefix app run typecheck",
+    "test": "npm --prefix app run test && node app/test/protocol-smoke.mjs",
     "test:protocol": "npm run build:native && node app/test/protocol-smoke.mjs",
     "test:codeclaw": "cd app && npm exec tsx test/codeclaw.test.ts"
   }

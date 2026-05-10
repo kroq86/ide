@@ -1,10 +1,18 @@
 import React from 'react'
-import { basename, resolve as resolvePath } from 'node:path'
+import { dirname, join, resolve as resolvePath } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, type ShellLine, type ParsedLocation } from './shell.js'
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
+import {
+  REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
+  buildLeaderMap, flattenLeader, isLeafAction,
+  findNearestTestScript, extractFirstCodeBlock, extractFirstLocation,
+  printable, printableText, bufferName,
+  type LeaderNode, type CmdItem,
+} from './leader.js'
 import {
   applyPatchProposal,
   assessPatchRisk,
@@ -21,12 +29,13 @@ import {
   type TraceSummary,
   type VerifyResult,
 } from './codeclaw.js'
-import { loadConfig, mergeLeaderTree, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
+import { loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
 import {
   loadGitStatus, loadFileHunks, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
   getGitLog, buildGitDisplayLines,
   type GitStatusData, type GitFileEntry, type GitDisplayLine, type GitLogEntry,
 } from './git.js'
+
 
 type ThemeColor = `#${string}`
 type Theme = {
@@ -59,13 +68,6 @@ let C: Theme = {
 
 type EditorMode = 'normal' | 'insert' | 'visual' | 'command' | 'search'
 
-interface LeaderNode {
-  [key: string]: (() => void) | LeaderNode
-}
-
-function isLeafAction(v: (() => void) | LeaderNode): v is () => void {
-  return typeof v === 'function'
-}
 
 type EditorBuffer = {
   id: string
@@ -100,6 +102,7 @@ type Panel =
   | null
   | { type: 'shell' }
   | { type: 'whichkey'; node: LeaderNode; path: string }
+  | { type: 'cmdpalette'; query: string; cursor: number; items: CmdItem[] }
   | { type: 'ai'; focused: boolean }
   | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string }
 
@@ -270,100 +273,50 @@ function updateGitEntry(entries: GitFileEntry[], path: string, fn: (e: GitFileEn
   return entries.map(e => e.path === path ? fn(e) : e)
 }
 
-function extractFirstCodeBlock(text: string): string | null {
-  const m = text.match(/```(?:\w+\n|\n)?([\s\S]*?)```/)
-  const cmd = m?.[1]?.trim()
-  return cmd && cmd.length > 0 ? cmd : null
-}
-
-function extractFirstLocation(text: string): ParsedLocation | null {
-  // Backtick-wrapped: `src/main.tsx:47:12`
-  const bt = text.match(/`([^`\s]+\.(?:ts|tsx|js|jsx|mjs|py|rs|go|c|cpp|h|rb|java)):(\d+)(?::(\d+))?`/)
-  if (bt) return { file: bt[1]!, row: +bt[2]! - 1, col: bt[3] ? +bt[3] - 1 : 0, message: '' }
-  // Bare reference: file.ts:47 or file.ts:47:12
-  const bare = text.match(/\b([\w./\\-]+\.(?:ts|tsx|js|jsx|mjs|py|rs|go|c|cpp|h|rb|java)):(\d+)(?::(\d+))?/)
-  if (bare) return { file: bare[1]!, row: +bare[2]! - 1, col: bare[3] ? +bare[3] - 1 : 0, message: '' }
-  return null
-}
-
 // ── Leader helpers ────────────────────────────────────────────────────────────
 
-function buildLeaderMap(
-  sidecar: QeSidecar,
-  setPanel: (fn: Panel | ((prev: Panel) => Panel)) => void,
-  buffers: {
-    openSwitcher: () => void
-    openFilePrompt: () => void
-    next: () => void
-    previous: () => void
-    kill: () => void
-    newScratch: () => void
-    quitAll: () => void
-  },
-  ai: {
-    openChat: () => void
-    triggerCompletion: () => void
-    explainError: () => void
-    fixFailure: () => void
-    showTrace: () => void
-  },
-  git: {
-    open: () => void
-    stage: () => void
-  },
-  lsp: {
-    hover: () => void
-    definition: () => void
-  },
-  userLeader: LeaderTree,
-  makeCtx: () => EditorContext,
-): LeaderNode {
-  const builtin: LeaderNode = {
-    q: {
-      q: buffers.quitAll,
-      w: () => { sidecar.save(); buffers.quitAll() },
-    },
-    b: {
-      b: buffers.openSwitcher,
-      l: buffers.openSwitcher,
-      k: buffers.kill,
-      n: buffers.next,
-      p: buffers.previous,
-      s: () => sidecar.save(),
-      N: buffers.newScratch,
-    },
-    f: { f: buffers.openFilePrompt, s: () => sidecar.save() },
-    t: {
-      t: () => setPanel(prev => prev?.type === 'shell' ? null : { type: 'shell' }),
-      a: () => setPanel(prev => prev?.type === 'ai' ? null : { type: 'ai', focused: true }),
-    },
-    a: {
-      p: ai.openChat,
-      c: ai.triggerCompletion,
-      e: ai.explainError,
-      f: ai.fixFailure,
-      t: ai.showTrace,
-    },
-    g: {
-      g: git.open,
-      s: git.stage,
-    },
-    c: {
-      h: lsp.hover,
-      d: lsp.definition,
-    },
-  }
-  return mergeLeaderTree(builtin, userLeader, makeCtx) as LeaderNode
-}
+// ── Command palette panel ─────────────────────────────────────────────────────
 
-const NODE_LABELS: Record<string, string> = {
-  q: 'quit',    b: 'buffer',  f: 'file/fix', t: 'toggle',
-  s: 'save',    k: 'kill',    n: 'next',    p: 'prev',
-  N: 'new',     l: 'list',    w: 'save+quit',
-  a: 'ai',      c: 'code',     e: 'explain-err',
-  g: 'git',     d: 'definition', r: 'refresh',
-  h: 'hover',
-  o: 'open',
+function CmdPalettePanel({
+  items, query, cursor, width,
+}: {
+  items: CmdItem[]
+  query: string
+  cursor: number
+  width: number
+}) {
+  const filtered = query
+    ? items.filter(it => it.label.toLowerCase().includes(query.toLowerCase()) || it.keys.includes(query))
+    : items
+  const visible = filtered.slice(0, 12)
+
+  return (
+    <Box flexDirection="column" borderStyle="single" borderColor={C.violet} paddingX={1} width={width}>
+      <Text bold color={C.violet}>M-x  <Text color={C.grey}>j/k=navigate  Enter=run  Esc=close</Text></Text>
+      <Box flexDirection="row" marginTop={1}>
+        <Text color={C.yellow}>{'> '}</Text>
+        <Text color={C.fg}>{query}</Text>
+        <Text color={C.grey}>{'_'}</Text>
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        {visible.length === 0
+          ? <Text color={C.grey}>no commands match</Text>
+          : visible.map((item, i) => {
+              const active = i === cursor % visible.length
+              return (
+                <Box key={item.keys} flexDirection="row">
+                  <Text color={active ? C.bg : C.grey} backgroundColor={active ? C.violet : undefined}>{' '}</Text>
+                  <Text color={active ? C.cyan : C.fg} backgroundColor={active ? C.bg : undefined} bold={active}>
+                    {` ${item.label.padEnd(36)} `}
+                  </Text>
+                  <Text color={C.grey} backgroundColor={active ? C.bg : undefined}>{item.keys}</Text>
+                </Box>
+              )
+            })
+        }
+      </Box>
+    </Box>
+  )
 }
 
 function lspHoverText(response: LspResponse): string {
@@ -380,18 +333,6 @@ function lspDefinitionTarget(response: LspResponse): LspTarget | null {
   const result = response.result as { target?: LspTarget; message?: unknown } | undefined
   if (result?.target?.path) return result.target
   return null
-}
-
-function printable(input: string): boolean {
-  return input.length === 1 && input >= ' ' && input <= '~'
-}
-
-function printableText(input: string): boolean {
-  return input.length > 0 && /^[\x20-\x7e]+$/.test(input)
-}
-
-function bufferName(filename: string | null): string {
-  return filename ? basename(filename) : '*scratch*'
 }
 
 function isDirty(buffer: EditorBuffer): boolean {
@@ -901,6 +842,8 @@ function App({
     previousBuffer: () => void
     newScratch: () => void
     quitAll: () => void
+    reloadConfig: () => Promise<void>
+    openConfig: () => void
   }
 }) {
   const activeIndex = Math.max(0, buffers.findIndex(buffer => buffer.id === activeId))
@@ -999,7 +942,7 @@ function App({
 
   const leaderMap = React.useMemo(() => buildLeaderMap(
     sidecar,
-    setPanel,
+    setPanel as (v: unknown) => void,
     {
       openSwitcher: () => {
         enterNormal()
@@ -1023,6 +966,12 @@ function App({
       explainError: () => explainLastError(),
       fixFailure: () => runCodeClawFix(),
       showTrace: () => showLastTrace(),
+      rerunLast: () => {
+        const last = shell.lastRun
+        if (!last) return
+        void shell.runTracked(last.command)
+        setPanel({ type: 'shell' })
+      },
     },
     {
       open: openGitPanel,
@@ -1038,9 +987,28 @@ function App({
         sidecar.goToDefinition(cursor.row, cursor.col)
       },
     },
+    {
+      open:   actions.openConfig,
+      reload: () => { void actions.reloadConfig() },
+    },
+    {
+      testFile: () => {
+        const file = snapshot?.filename ?? null
+        const script = findNearestTestScript(file)
+        if (!script) return
+        void shell.runTracked(script)
+        setPanel({ type: 'shell' })
+      },
+      testAll: () => {
+        const script = findNearestTestScript(snapshot?.filename ?? null)
+        if (!script) return
+        void shell.runTracked(script)
+        setPanel({ type: 'shell' })
+      },
+    },
     userLeader,
     makeCtx,
-  ), [actions, activeId, buffers, makeCtx, sidecar, snapshot, userLeader])
+  ), [actions, activeId, buffers, makeCtx, sidecar, shell, snapshot, userLeader])
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -1086,14 +1054,17 @@ function App({
     const ctrl = new AbortController()
     aiAbortRef.current = ctrl
 
+    const { rules, memory } = loadCodeClawProject(process.cwd())
     const ctx: AiContext = {
-      filename:     snapshot?.filename ?? null,
-      lines:        snapshot?.lines    ?? [],
-      cursor:       snapshot?.cursor   ?? { row: 0, col: 0 },
+      filename:      snapshot?.filename ?? null,
+      lines:         snapshot?.lines    ?? [],
+      cursor:        snapshot?.cursor   ?? { row: 0, col: 0 },
       shellLines,
       shellSessions: shell.sessions,
-      gitContext:   getGitContext(),
-      openBuffers:  buffers.map(b => b.snapshot?.filename ?? b.filename ?? b.name),
+      gitContext:    getGitContext(),
+      openBuffers:   buffers.map(b => b.snapshot?.filename ?? b.filename ?? b.name),
+      projectRules:  rules  || undefined,
+      projectMemory: memory || undefined,
     }
 
     void (async () => {
@@ -1334,6 +1305,49 @@ function App({
     if (key.ctrl && input === 'q') { actions.quitAll(); return }
     if (key.ctrl && input === 't') {
       setPanel(prev => prev?.type === 'shell' ? null : { type: 'shell' })
+      return
+    }
+
+    // ── Command palette ───────────────────────────────────────────────────────
+    if (panel?.type === 'cmdpalette') {
+      if (key.escape) { setPanel(null); return }
+      if (key.return) {
+        const { items, query, cursor } = panel
+        const filtered = query
+          ? items.filter(it => it.label.toLowerCase().includes(query.toLowerCase()) || it.keys.includes(query))
+          : items
+        const item = filtered[cursor % Math.max(1, filtered.length)]
+        if (item) { item.action(); setPanel(null) }
+        return
+      }
+      if (input === 'j' && !panel.query) {
+        setPanel(prev => prev?.type === 'cmdpalette' ? { ...prev, cursor: prev.cursor + 1 } : prev)
+        return
+      }
+      if (input === 'k' && !panel.query) {
+        setPanel(prev => prev?.type === 'cmdpalette' ? { ...prev, cursor: Math.max(0, prev.cursor - 1) } : prev)
+        return
+      }
+      if (key.downArrow) {
+        setPanel(prev => prev?.type === 'cmdpalette' ? { ...prev, cursor: prev.cursor + 1 } : prev)
+        return
+      }
+      if (key.upArrow) {
+        setPanel(prev => prev?.type === 'cmdpalette' ? { ...prev, cursor: Math.max(0, prev.cursor - 1) } : prev)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPanel(prev => prev?.type === 'cmdpalette'
+          ? { ...prev, query: prev.query.slice(0, -1), cursor: 0 }
+          : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPanel(prev => prev?.type === 'cmdpalette'
+          ? { ...prev, query: prev.query + input, cursor: 0 }
+          : prev)
+        return
+      }
       return
     }
 
@@ -1826,8 +1840,9 @@ function App({
     ? buildGitDisplayLines(panel.data, panel.logEntries)
     : null
   const panelRows = panel === null || panel.type === 'ai' ? 0
-    : panel.type === 'shell' ? 3 + shellRows
-    : panel.type === 'git'   ? Math.min(Math.floor(totalRows * 0.6), (gitDisplayLines?.length ?? 0) + 3)
+    : panel.type === 'shell'      ? 3 + shellRows
+    : panel.type === 'git'        ? Math.min(Math.floor(totalRows * 0.6), (gitDisplayLines?.length ?? 0) + 3)
+    : panel.type === 'cmdpalette' ? 0
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
   const editorHeight = Math.max(1, totalRows - panelRows)
 
@@ -1882,6 +1897,9 @@ function App({
       {panel?.type === 'whichkey' && (
         <WhichKeyPanel node={panel.node} path={panel.path} totalCols={totalCols} />
       )}
+      {panel?.type === 'cmdpalette' && (
+        <CmdPalettePanel items={panel.items} query={panel.query} cursor={panel.cursor} width={Math.min(70, totalCols - 4)} />
+      )}
       {panel?.type === 'shell' && (
         <ShellPane
           lines={shellLines}
@@ -1917,7 +1935,7 @@ async function main() {
   const cols = process.stdout.columns || 80
   const rows = process.stdout.rows    || 24
 
-  const cfg = await loadConfig()
+  let cfg = await loadConfig()
   if (cfg.theme) C = { ...C, ...(cfg.theme as Partial<Theme>) }
 
   const shell = new ShellSidecar(cwd, cols, Math.floor(rows * 0.3))
@@ -2140,6 +2158,36 @@ async function main() {
   const initial = createBuffer(filename ?? null)
   activateBuffer(initial)
 
+  function openConfig() {
+    const existing = getConfigPath()
+    if (existing) { openFile(existing); return }
+    // Create the default config file with a starter template
+    import('node:fs').then(({ mkdirSync, writeFileSync }) => {
+      import('node:path').then(({ dirname }) => {
+        const target = CONFIG_PATHS[0]!
+        mkdirSync(dirname(target), { recursive: true })
+        const template = [
+          `// ~/.config/qe/config.js — qe editor user config`,
+          `// Add custom keybindings under "leader". Keys receive an EditorContext.`,
+          ``,
+          `export default {`,
+          `  // leader: {`,
+          `  //   z: { r: (ctx) => ctx.shell.run('cargo test') },`,
+          `  // },`,
+          `}`,
+        ].join('\n')
+        writeFileSync(target, template, 'utf8')
+        openFile(target)
+      })
+    })
+  }
+
+  async function reloadCfg() {
+    cfg = await reloadConfig()
+    if (cfg.theme) C = { ...C, ...(cfg.theme as Partial<Theme>) }
+    refresh()
+  }
+
   const view = () => {
     const cur = shell.currentLine
     const displayLines = cur.trim()
@@ -2164,6 +2212,8 @@ async function main() {
             previousBuffer,
             newScratch,
             quitAll,
+            reloadConfig: reloadCfg,
+            openConfig,
           }}
         />
       </AlternateScreen>

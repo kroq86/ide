@@ -3,11 +3,11 @@ import { dirname, join } from 'node:path'
 import type { ShellLine, ShellSession } from './shell.js'
 
 const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://localhost:11434'
-const OLLAMA_MODEL = process.env['OLLAMA_MODEL'] ?? 'llama3.2:latest'
+const OLLAMA_MODEL = process.env['OLLAMA_MODEL'] ?? 'qwen2.5-coder:1.5b'
 
 const RUNNER_DEPS = ['tsx', 'ts-node', 'tsc', 'typescript', 'vitest', 'jest', 'mocha', 'node']
 
-function findProjectContext(filePath: string | null): string {
+export function findProjectContext(filePath: string | null): string {
   if (!filePath) return ''
   let dir = dirname(filePath)
   for (let i = 0; i < 6; i++) {
@@ -39,7 +39,7 @@ function findProjectContext(filePath: string | null): string {
   return ''
 }
 
-function buildShellContext(sessions?: ShellSession[], fallbackLines?: ShellLine[]): string {
+export function buildShellContext(sessions?: ShellSession[], fallbackLines?: ShellLine[]): string {
   if (sessions?.length) {
     // Last 3 sessions, max 10 lines each — enough context, not enough to confuse small models
     const recent = sessions.slice(-3)
@@ -64,6 +64,15 @@ export type AiContext = {
   shellSessions?: ShellSession[]
   gitContext?: string
   openBuffers?: string[]
+  projectRules?: string
+  projectMemory?: string
+}
+
+export function buildProjectMemoryPart(rules?: string, memory?: string): string {
+  const parts: string[] = []
+  if (rules?.trim())  parts.push(`Project rules:\n${rules.trim().slice(0, 800)}`)
+  if (memory?.trim()) parts.push(`Project memory:\n${memory.trim().slice(0, 800)}`)
+  return parts.length > 0 ? `\n\n${parts.join('\n\n')}` : ''
 }
 
 export async function* streamChat(
@@ -78,14 +87,15 @@ export async function* streamChat(
   const bufPart     = context.openBuffers?.length
     ? `\nOpen buffers: ${context.openBuffers.join(', ')}`
     : ''
-  const projectPart = findProjectContext(context.filename)
+  const projectPart  = findProjectContext(context.filename)
+  const memoryPart   = buildProjectMemoryPart(context.projectRules, context.projectMemory)
 
   const systemContent =
     `You are a coding assistant embedded in a terminal editor with a shell pane, git pane, and editor pane.\n` +
     `You can see the user's current file, recent shell output, and git context below.\n` +
     `When the user asks to run something, prefer npm scripts over raw npx commands. Only suggest commands using available runners.\n` +
     `File: ${context.filename ?? 'untitled'}  cursor: ${context.cursor.row + 1}:${context.cursor.col + 1}${bufPart}\n` +
-    `\`\`\`\n${fileSnippet}\n\`\`\`${shellPart}${gitPart}${projectPart}`
+    `\`\`\`\n${fileSnippet}\n\`\`\`${shellPart}${gitPart}${projectPart}${memoryPart}`
 
   const response = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: 'POST',
