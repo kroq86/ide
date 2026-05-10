@@ -8,7 +8,7 @@ import { ShellSidecar, type ShellLine, type ParsedLocation, type ShellRun } from
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
 import {
   REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
-  buildLeaderMap, flattenLeader, isLeafAction,
+  buildLeaderMap, flattenLeader, isLeafAction, whichKeyDesc,
   findNearestTestScript, extractFirstCodeBlock, extractFirstLocation,
   printable, printableText, bufferName,
   type LeaderNode, type CmdItem,
@@ -426,7 +426,7 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
     rowGroups.push(
       entries.slice(i, i + NUM_COLS).map(([k, v]) => ({
         key: k,
-        desc: isLeafAction(v) ? (NODE_LABELS[k] ?? k) : `+${NODE_LABELS[k] ?? k}`,
+        desc: whichKeyDesc(path, k, v),
       })),
     )
   }

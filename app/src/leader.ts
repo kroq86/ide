@@ -64,6 +64,20 @@ export const COMMAND_LABELS: Record<string, string> = {
   'c r': 'config: reload config',
   'm t f': 'mode: test current file',
   'm t a': 'mode: test all',
+  ':': 'command palette',
+}
+
+/**
+ * Label shown in the which-key panel for one key. Uses COMMAND_LABELS with the full
+ * sequence (e.g. `a f`) so leaves match reality; NODE_LABELS alone is wrong under nested menus.
+ */
+export function whichKeyDesc(parentPath: string, key: string, val: (() => void) | LeaderNode): string {
+  const parent = parentPath.trimEnd().trim()
+  const cmdPath = parent ? `${parent} ${key}` : key
+  if (isLeafAction(val)) {
+    return COMMAND_LABELS[cmdPath] ?? NODE_LABELS[key] ?? key
+  }
+  return `+${NODE_LABELS[key] ?? key}`
 }
 
 export function flattenLeader(node: LeaderNode, prefix = ''): CmdItem[] {

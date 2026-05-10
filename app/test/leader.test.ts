@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  buildLeaderMap, flattenLeader, isLeafAction,
+  buildLeaderMap, flattenLeader, isLeafAction, whichKeyDesc,
   COMMAND_LABELS, NODE_LABELS,
   type LeaderNode, type CmdItem,
 } from '../src/leader.ts'
@@ -172,6 +172,22 @@ describe('COMMAND_LABELS coverage', () => {
     for (const key of Object.keys(COMMAND_LABELS)) {
       assert.ok(keySet.has(`SPC ${key}`), `COMMAND_LABELS has "${key}" but no matching keybinding`)
     }
+  })
+})
+
+describe('whichKeyDesc', () => {
+  const map = makeMap()
+  const aiBranch = map['a'] as LeaderNode
+
+  it('uses COMMAND_LABELS under SPC a so f/r are not file/git labels', () => {
+    assert.equal(whichKeyDesc('a ', 'f', aiBranch['f']!), 'ai: fix failure (CodeClaw)')
+    assert.equal(whichKeyDesc('a ', 'r', aiBranch['r']!), 'ai: review git diff (CodeClaw)')
+    assert.equal(whichKeyDesc('a ', 'p', aiBranch['p']!), 'ai: open chat')
+    assert.equal(whichKeyDesc('a ', 'c', aiBranch['c']!), 'ai: trigger completion')
+  })
+
+  it('uses +group for submenu roots', () => {
+    assert.equal(whichKeyDesc('', 'a', aiBranch), '+ai')
   })
 })
 
