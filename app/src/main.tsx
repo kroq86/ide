@@ -19,6 +19,7 @@ import {
   buildTrace,
   collectGitContext,
   generatePatchProposal,
+  generateReviewProposal,
   loadCodeClawProject,
   makeTraceId,
   readLatestTrace,
@@ -26,6 +27,8 @@ import {
   type FixContext,
   type PatchProposal,
   type PatchRiskAssessment,
+  type ReviewFinding,
+  type ReviewProposal,
   type TraceSummary,
   type VerifyResult,
 } from './codeclaw.js'
@@ -97,6 +100,12 @@ type CodeClawFixState =
   | { status: 'trace'; latest: TraceSummary | null }
   | { status: 'done'; message: string; tracePath: string; verify?: VerifyResult }
   | { status: 'error'; message: string; tracePath?: string }
+
+type ReviewState =
+  | { status: 'idle' }
+  | { status: 'generating' }
+  | { status: 'findings'; proposal: ReviewProposal; cursor: number }
+  | { status: 'error'; message: string }
 
 type Panel =
   | null
@@ -440,7 +449,7 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
 // ── AI chat panel ─────────────────────────────────────────────────────────────
 
 function AiPanel({
-  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, scrollOffset,
+  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, reviewState, scrollOffset,
 }: {
   messages: AiMessage[]
   input: string
@@ -451,6 +460,7 @@ function AiPanel({
   navHint?: string
   shellHint?: string
   fixState: CodeClawFixState
+  reviewState: ReviewState
   scrollOffset: number
 }) {
   const borderColor = focused ? C.green : C.grey
@@ -460,16 +470,19 @@ function AiPanel({
   const visible = messages.slice(-msgAreaRows - clampedOffset, sliceEnd)
   const hiddenAbove = Math.max(0, messages.length - msgAreaRows - clampedOffset)
   const fixLines = codeClawFixLines(fixState, msgAreaRows)
+  const reviewLns = reviewLines(reviewState, msgAreaRows)
+  const overlayLines = reviewLns.length > 0 ? reviewLns : fixLines
 
   const scrollHint = clampedOffset > 0 ? `  ↑${clampedOffset} scrolled  j/k=scroll` : !focused && messages.length > msgAreaRows ? '  k=scroll up' : ''
-  const hint = streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : fixState.status !== 'idle' ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
+  const overlayActive = fixState.status !== 'idle' || reviewState.status !== 'idle'
+  const hint = streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
       <Text bold color={borderColor}>*AI*  {hint}{scrollHint}</Text>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
-        {fixLines.length > 0
-          ? fixLines.map((line, i) => (
+        {overlayLines.length > 0
+          ? overlayLines.map((line, i) => (
               <Text key={i} color={line.color} wrap={line.wrap ?? 'truncate'}>{line.text || ' '}</Text>
             ))
           : visible.length === 0
@@ -600,6 +613,48 @@ function codeClawFixLines(
   } else {
     lines.push({ text: 'Accept? [a] apply  [r] reject  [e] edit prompt', color: C.yellow, wrap: 'wrap' })
   }
+  return lines.slice(0, maxRows)
+}
+
+function reviewLines(
+  state: ReviewState,
+  maxRows: number,
+): Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> {
+  if (state.status === 'idle') return []
+  if (state.status === 'generating') {
+    return [{ text: 'CodeClaw Review — generating…', color: C.cyan }]
+  }
+  if (state.status === 'error') {
+    return [
+      { text: 'CodeClaw Review failed', color: C.red },
+      { text: state.message, color: C.fg, wrap: 'wrap' },
+    ]
+  }
+
+  const { proposal, cursor } = state
+  const severityColor = (s: ReviewFinding['severity']): ThemeColor =>
+    s === 'blocker' ? C.red : s === 'warning' ? C.yellow : C.cyan
+
+  const lines: Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> = [
+    {
+      text: `CodeClaw Review — ${proposal.safeToCommit ? '✓ safe to commit' : '✗ not safe to commit'}  (${proposal.findings.length} finding${proposal.findings.length !== 1 ? 's' : ''})`,
+      color: proposal.safeToCommit ? C.green : C.red,
+    },
+    { text: proposal.summary, color: C.fg, wrap: 'wrap' },
+  ]
+
+  for (let i = 0; i < proposal.findings.length; i++) {
+    const f = proposal.findings[i]!
+    const prefix = i === cursor ? '▶ ' : '  '
+    const loc = f.line != null ? `${f.file}:${f.line}` : f.file
+    lines.push({ text: `${prefix}[${f.severity.toUpperCase()}] ${loc} — ${f.title}`, color: severityColor(f.severity) })
+    if (i === cursor) {
+      lines.push({ text: `    ${f.explanation}`, color: C.fg, wrap: 'wrap' })
+      if (f.rule) lines.push({ text: `    rule: ${f.rule}`, color: C.grey, wrap: 'wrap' })
+    }
+  }
+
+  lines.push({ text: 'j/k=navigate  f=fix  i=ignore  t=trace  x=dismiss', color: C.grey })
   return lines.slice(0, maxRows)
 }
 
@@ -868,6 +923,7 @@ function App({
   const [aiStreaming,    setAiStreaming]     = React.useState(false)
   const [aiScrollOffset, setAiScrollOffset] = React.useState(0)
   const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
+  const [reviewState, setReviewState] = React.useState<ReviewState>({ status: 'idle' })
   const [shellInput, setShellInput] = React.useState('')
   const [shellRunning, setShellRunning] = React.useState(false)
 
@@ -972,6 +1028,7 @@ function App({
         void shell.runTracked(last.command)
         setPanel({ type: 'shell' })
       },
+      review: () => runCodeClawReview(),
     },
     {
       open: openGitPanel,
@@ -1190,6 +1247,34 @@ function App({
     })()
   }
 
+  function runCodeClawReview() {
+    const gitCtx = collectGitContext(process.cwd())
+    const { rules } = loadCodeClawProject(process.cwd())
+    const activeFile = snapshot?.filename ?? ''
+    const openBuffers = buffers.map(b => b.filename ?? b.id)
+
+    setReviewState({ status: 'generating' })
+    setPanel({ type: 'ai', focused: false })
+    setAiStreaming(true)
+
+    aiAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    aiAbortRef.current = ctrl
+
+    void (async () => {
+      try {
+        const diff = [gitCtx.diff, gitCtx.status].filter(Boolean).join('\n')
+        const proposal = await generateReviewProposal(diff, rules, activeFile, openBuffers, ctrl.signal)
+        setReviewState({ status: 'findings', proposal, cursor: 0 })
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error)
+        setReviewState({ status: 'error', message })
+      } finally {
+        setAiStreaming(false)
+      }
+    })()
+  }
+
   function rejectCodeClawFix() {
     if (fixState.status !== 'proposal' && fixState.status !== 'editing') return
     const trace = buildTrace(fixState.traceId, fixState.startedAt, fixState.context, fixState.proposal, false)
@@ -1361,9 +1446,39 @@ function App({
       return
     }
 
+    // ── AI panel (unfocused) — review findings navigation ────────────────────
+    if (panel?.type === 'ai' && !panel.focused && reviewState.status === 'findings') {
+      if (input === 'j') {
+        setReviewState(s => s.status === 'findings' ? { ...s, cursor: Math.min(s.cursor + 1, s.proposal.findings.length - 1) } : s)
+        return
+      }
+      if (input === 'k') {
+        setReviewState(s => s.status === 'findings' ? { ...s, cursor: Math.max(s.cursor - 1, 0) } : s)
+        return
+      }
+      if (input === 'i') {
+        setReviewState(s => s.status === 'findings' ? { ...s, cursor: Math.min(s.cursor + 1, s.proposal.findings.length - 1) } : s)
+        return
+      }
+      if (input === 'f') {
+        const finding = reviewState.proposal.findings[reviewState.cursor]
+        if (finding?.suggestedPatch) {
+          const request = `Fix: ${finding.title}\n${finding.explanation}`
+          runCodeClawFix(request)
+        }
+        return
+      }
+      if (input === 't') { showLastTrace(); return }
+      if (input === 'x') { setReviewState({ status: 'idle' }); return }
+    }
+
     // ── AI panel (unfocused) — dismiss fixState overlay + scroll chat ────────
     if (panel?.type === 'ai' && !panel.focused) {
-      if (input === 'x' && fixState.status !== 'idle') { setFixState({ status: 'idle' }); return }
+      if (input === 'x' && (fixState.status !== 'idle' || reviewState.status !== 'idle')) {
+        setFixState({ status: 'idle' })
+        setReviewState({ status: 'idle' })
+        return
+      }
       if (input === '!' && aiShellCmd) {
         if (shell.mode === 'runner') {
           setShellInput(aiShellCmd)
@@ -1373,13 +1488,15 @@ function App({
         setPanel({ type: 'shell' })
         return
       }
-      if (input === 'j') {
-        setAiScrollOffset(prev => Math.max(0, prev - 1))
-        return
-      }
-      if (input === 'k') {
-        setAiScrollOffset(prev => prev + 1)
-        return
+      if (reviewState.status === 'idle') {
+        if (input === 'j') {
+          setAiScrollOffset(prev => Math.max(0, prev - 1))
+          return
+        }
+        if (input === 'k') {
+          setAiScrollOffset(prev => prev + 1)
+          return
+        }
       }
     }
 
@@ -1885,6 +2002,7 @@ function App({
           navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
           shellHint={aiShellCmd ? aiShellCmd.split('\n')[0] : undefined}
           fixState={fixState}
+          reviewState={reviewState}
           scrollOffset={aiScrollOffset}
         />
       </Box>

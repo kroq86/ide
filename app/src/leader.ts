@@ -54,7 +54,8 @@ export const COMMAND_LABELS: Record<string, string> = {
   'a e': 'ai: explain last error',
   'a f': 'ai: fix failure (CodeClaw)',
   'a t': 'ai: show trace',
-  'a r': 'ai: rerun last shell command',
+  'a l': 'ai: rerun last shell command',
+  'a r': 'ai: review git diff (CodeClaw)',
   'g g': 'git: open panel',
   'g s': 'git: stage current',
   'c h': 'code: hover (LSP)',
@@ -100,6 +101,7 @@ export function buildLeaderMap(
     fixFailure: () => void
     showTrace: () => void
     rerunLast: () => void
+    review: () => void
   },
   git: {
     open: () => void
@@ -151,7 +153,8 @@ export function buildLeaderMap(
       e: ai.explainError,
       f: ai.fixFailure,
       t: ai.showTrace,
-      r: ai.rerunLast,
+      l: ai.rerunLast,
+      r: ai.review,
     },
     g: {
       g: git.open,

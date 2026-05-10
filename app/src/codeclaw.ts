@@ -90,6 +90,22 @@ export type PatchRiskAssessment = {
   requiresConfirm: boolean
 }
 
+export type ReviewFinding = {
+  severity: 'blocker' | 'warning' | 'note'
+  file: string
+  line?: number
+  title: string
+  explanation: string
+  suggestedPatch?: string
+  rule?: string
+}
+
+export type ReviewProposal = {
+  summary: string
+  findings: ReviewFinding[]
+  safeToCommit: boolean
+}
+
 export type TraceSummary = {
   trace: CodeClawTrace
   path: string
@@ -203,6 +219,91 @@ export function parsePatchProposal(raw: string): PatchProposal {
     : undefined
 
   return { summary, rootCause, files, verifyCommand, risk, notes }
+}
+
+export async function generateReviewProposal(
+  gitDiff: string,
+  rules: string,
+  activeFile: string,
+  _openBuffers: string[],
+  signal: AbortSignal,
+): Promise<ReviewProposal> {
+  // Keep the prompt short — small models (1.5b) fail on long structured prompts
+  const rulesSnippet = rules ? rules.slice(0, 500) : 'none'
+  const diffSnippet  = gitDiff ? gitDiff.slice(0, 1200) : '(no changes)'
+  const prompt = `Review this git diff for bugs, style issues, and rule violations.
+Return JSON only: {"summary":"<one sentence>","safeToCommit":true|false,"findings":[{"severity":"blocker|warning|note","file":"<path>","title":"<short>","explanation":"<detail>"}]}
+
+Rules: ${rulesSnippet}
+
+Active file: ${activeFile || 'unknown'}
+
+Diff:
+${diffSnippet}`
+
+  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      prompt,
+      stream: false,
+      format: 'json',
+    }),
+    signal,
+  })
+
+  if (!response.ok) {
+    throw new Error(`ollama ${response.status}: ${await response.text()}`)
+  }
+
+  const payload = await response.json() as { response?: string }
+  const raw = payload.response ?? ''
+  return parseReviewProposal(raw)
+}
+
+export function parseReviewProposal(raw: string): ReviewProposal {
+  const json = extractJson(raw)
+  let value: unknown
+  try {
+    value = JSON.parse(json)
+  } catch {
+    // Model returned non-JSON — wrap it as a single note finding
+    return {
+      summary: 'Model returned unstructured output',
+      safeToCommit: false,
+      findings: [{ severity: 'note', file: '(unknown)', title: 'Raw model output', explanation: raw.slice(0, 400) }],
+    }
+  }
+
+  if (!isObject(value)) {
+    return { summary: 'Invalid response shape', safeToCommit: false, findings: [] }
+  }
+
+  const rec = value as Record<string, unknown>
+  const summary = typeof rec['summary'] === 'string' && rec['summary'].trim()
+    ? rec['summary']
+    : 'Review complete'
+  const safeToCommit = typeof rec['safeToCommit'] === 'boolean' ? rec['safeToCommit'] : false
+
+  const rawFindings = Array.isArray(rec['findings']) ? rec['findings'] : []
+  const findings: ReviewFinding[] = rawFindings.flatMap((f, i) => {
+    if (!isObject(f)) return []
+    const fRec = f as Record<string, unknown>
+    const severity = fRec['severity']
+    const normSeverity: ReviewFinding['severity'] =
+      severity === 'blocker' ? 'blocker' : severity === 'warning' ? 'warning' : 'note'
+    const file = typeof fRec['file'] === 'string' && fRec['file'].trim() ? fRec['file'] : `(file ${i})`
+    const lineRaw = fRec['line']
+    const line = typeof lineRaw === 'number' ? lineRaw : undefined
+    const title = typeof fRec['title'] === 'string' && fRec['title'].trim() ? fRec['title'] : 'Finding'
+    const explanation = typeof fRec['explanation'] === 'string' ? fRec['explanation'] : ''
+    const suggestedPatch = typeof fRec['suggestedPatch'] === 'string' && fRec['suggestedPatch'].trim() ? fRec['suggestedPatch'] : undefined
+    const rule = typeof fRec['rule'] === 'string' && fRec['rule'].trim() ? fRec['rule'] : undefined
+    return [{ severity: normSeverity, file, line, title, explanation, suggestedPatch, rule }]
+  })
+
+  return { summary, findings, safeToCommit }
 }
 
 export function applyPatchProposal(cwd: string, proposal: PatchProposal): { ok: true } | { ok: false; error: string } {
