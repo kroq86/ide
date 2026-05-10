@@ -135,6 +135,8 @@ native/qe-core/         Legacy QEmacs-derived prototype scaffolding
 
 The editor sidecar prefers `native/editor-core/target/release/editor-core` and falls back to the legacy C sidecar if the Rust binary is missing.
 
+The Rust editor core pulls **`lsp-types`** from crates.io to deserialize `textDocument/completion` and `textDocument/formatting` results; malformed or extended payloads fall back to the previous manual JSON path. **Not** wired yet (defer until multibuffer diff or measured subprocess cost): **`similar`** for richer diff hunks, **`git2`** for in-process git (or a future `gitContext` sidecar command).
+
 ## License Notes
 
 QEmacs-derived files under `native/qe-core/` retain their original LGPL terms. The TypeScript prototype code in `app/` is local project code.

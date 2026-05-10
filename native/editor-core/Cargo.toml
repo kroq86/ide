@@ -3,8 +3,12 @@ name = "editor-core"
 version = "0.1.0"
 edition = "2024"
 
+# Deferred Rust crates (see README Architecture): `similar` — diff hunks / edit merge UX;
+# `git2` — in-process git instead of TS spawnSync (would pair with a protocol command).
+
 [dependencies]
 anyhow = "1.0"
+lsp-types = "0.97"
 ropey = "1.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

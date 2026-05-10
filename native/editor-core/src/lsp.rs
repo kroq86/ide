@@ -1,5 +1,8 @@
 use crate::protocol::Diagnostic;
 use anyhow::{Context, Result};
+use lsp_types::{
+    CompletionItem, CompletionResponse, CompletionTextEdit, TextEdit as LspTextEdit,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -472,6 +475,22 @@ pub struct TextEdit {
 }
 
 fn parse_text_edits(value: &Value) -> Vec<TextEdit> {
+    match serde_json::from_value::<Vec<LspTextEdit>>(value.clone()) {
+        Ok(edits) => edits
+            .into_iter()
+            .map(|e| TextEdit {
+                start_line: e.range.start.line as usize,
+                start_char: e.range.start.character as usize,
+                end_line: e.range.end.line as usize,
+                end_char: e.range.end.character as usize,
+                new_text: e.new_text,
+            })
+            .collect(),
+        Err(_) => parse_text_edits_fallback(value),
+    }
+}
+
+fn parse_text_edits_fallback(value: &Value) -> Vec<TextEdit> {
     let items = match value.as_array() {
         Some(arr) => arr.as_slice(),
         None => return Vec::new(),
@@ -493,6 +512,67 @@ fn parse_text_edits(value: &Value) -> Vec<TextEdit> {
         .collect()
 }
 
+fn normalize_completion_result(result: Value) -> Value {
+    match serde_json::from_value::<CompletionResponse>(result.clone()) {
+        Ok(response) => {
+            let items_vec = match response {
+                CompletionResponse::Array(a) => a,
+                CompletionResponse::List(l) => l.items,
+            };
+            let normalized: Vec<Value> = items_vec
+                .into_iter()
+                .map(completion_item_to_normalized_json)
+                .collect();
+            json!({ "available": true, "items": normalized })
+        }
+        Err(_) => normalize_completion_fallback(&result),
+    }
+}
+
+fn completion_item_to_normalized_json(item: CompletionItem) -> Value {
+    let label = item.label.to_string();
+    let insert_text = insert_text_for_completion_item(&item);
+    let detail = item.detail.unwrap_or_default();
+    json!({ "label": label, "insertText": insert_text, "detail": detail })
+}
+
+fn insert_text_for_completion_item(item: &CompletionItem) -> String {
+    if let Some(ref t) = item.insert_text {
+        if !t.is_empty() {
+            return t.clone();
+        }
+    }
+    match &item.text_edit {
+        Some(CompletionTextEdit::Edit(te)) => te.new_text.clone(),
+        Some(CompletionTextEdit::InsertAndReplace(ir)) => ir.new_text.clone(),
+        None => item.label.to_string(),
+    }
+}
+
+fn normalize_completion_fallback(result: &Value) -> Value {
+    let items = if let Some(arr) = result.as_array() {
+        arr.clone()
+    } else if let Some(arr) = result.get("items").and_then(Value::as_array) {
+        arr.clone()
+    } else {
+        vec![]
+    };
+    let normalized: Vec<Value> = items
+        .iter()
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?.to_owned();
+            let insert_text = item
+                .get("insertText")
+                .and_then(Value::as_str)
+                .unwrap_or(&label)
+                .to_owned();
+            let detail = item.get("detail").and_then(Value::as_str).unwrap_or("").to_owned();
+            Some(json!({ "label": label, "insertText": insert_text, "detail": detail }))
+        })
+        .collect();
+    json!({ "available": true, "items": normalized })
+}
+
 fn normalize_lsp_result(kind: &str, result: Value) -> Value {
     if kind == "definition"
         && let Some(target) = first_location(&result)
@@ -507,23 +587,7 @@ fn normalize_lsp_result(kind: &str, result: Value) -> Value {
         });
     }
     if kind == "completion" {
-        let items = if let Some(arr) = result.as_array() {
-            arr.clone()
-        } else if let Some(arr) = result.get("items").and_then(Value::as_array) {
-            arr.clone()
-        } else {
-            vec![]
-        };
-        let normalized: Vec<Value> = items.iter().filter_map(|item| {
-            let label = item.get("label")?.as_str()?.to_owned();
-            let insert_text = item.get("insertText")
-                .and_then(Value::as_str)
-                .unwrap_or(&label)
-                .to_owned();
-            let detail = item.get("detail").and_then(Value::as_str).unwrap_or("").to_owned();
-            Some(json!({ "label": label, "insertText": insert_text, "detail": detail }))
-        }).collect();
-        return json!({ "available": true, "items": normalized });
+        return normalize_completion_result(result);
     }
     result
 }
@@ -729,5 +793,58 @@ mod tests {
         let normalized = normalize_lsp_result("definition", value);
         assert_eq!(normalized["available"], true);
         assert_eq!(normalized["target"]["row"], 7);
+    }
+
+    #[test]
+    fn parses_text_edits_via_lsp_types() {
+        let value = json!([
+            {
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                },
+                "newText": "hello"
+            }
+        ]);
+        let edits = parse_text_edits(&value);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "hello");
+        assert_eq!(edits[0].start_line, 0);
+    }
+
+    #[test]
+    fn parses_text_edits_fallback_on_malformed() {
+        let value = json!([{ "range": "broken" }]);
+        let edits = parse_text_edits(&value);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn normalize_completion_array_via_lsp_types() {
+        let raw = json!([
+            {
+                "label": "foo",
+                "insertText": "foo",
+                "detail": "detail"
+            }
+        ]);
+        let out = normalize_lsp_result("completion", raw);
+        assert_eq!(out["available"], true);
+        assert_eq!(out["items"][0]["label"], "foo");
+        assert_eq!(out["items"][0]["insertText"], "foo");
+    }
+
+    #[test]
+    fn normalize_completion_list_via_lsp_types() {
+        let raw = json!({
+            "isIncomplete": false,
+            "items": [
+                { "label": "bar", "detail": "d" }
+            ]
+        });
+        let out = normalize_lsp_result("completion", raw);
+        assert_eq!(out["items"].as_array().unwrap().len(), 1);
+        assert_eq!(out["items"][0]["label"], "bar");
+        assert_eq!(out["items"][0]["insertText"], "bar");
     }
 }
