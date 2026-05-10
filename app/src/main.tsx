@@ -21,9 +21,12 @@ import {
   generatePatchProposal,
   generateReviewProposal,
   loadCodeClawProject,
+  loadTasks,
   makeTraceId,
   readLatestTrace,
+  resolveTaskCommand,
   writeTrace,
+  type CodeClawTask,
   type FixContext,
   type PatchProposal,
   type PatchRiskAssessment,
@@ -554,7 +557,7 @@ function codeClawFixLines(
       { text: `Files changed: ${trace.proposal?.filesChanged?.join(', ') || '(none)'}`, color: C.fg, wrap: 'wrap' },
       { text: `Accepted: ${trace.accepted ? 'yes' : 'no'}`, color: trace.accepted ? C.green : C.yellow },
       { text: `Risk: ${trace.proposal?.assessedRisk?.level ?? trace.proposal?.risk ?? '(unknown)'}`, color: C.yellow },
-      { text: `Verify command: ${trace.verify?.command ?? '(not run)'}`, color: C.fg, wrap: 'wrap' },
+      { text: `Verify task: ${trace.verify?.command ?? '(not run)'}`, color: C.fg, wrap: 'wrap' },
       { text: `Verify result: ${trace.verify ? (trace.verify.passed ? 'passed' : 'failed') : '(not run)'}`, color: trace.verify?.passed ? C.green : C.red },
       { text: `Trace file: ${path}`, color: C.grey, wrap: 'wrap' },
     ]
@@ -597,7 +600,7 @@ function codeClawFixLines(
   }
 
   lines.push({ text: 'Verify:', color: C.cyan })
-  lines.push({ text: proposal.verifyCommand, color: C.fg, wrap: 'wrap' })
+  lines.push({ text: proposal.verifyTask, color: C.fg, wrap: 'wrap' })
   lines.push({ text: `Risk: ${risk.level} (${risk.reasons.join('; ')})`, color: risk.level === 'high' ? C.red : risk.level === 'medium' ? C.yellow : C.green, wrap: 'wrap' })
   if (proposal.notes?.length) {
     lines.push({ text: `Notes: ${proposal.notes.join(' ')}`, color: C.grey, wrap: 'wrap' })
@@ -1234,7 +1237,8 @@ function App({
 
     void (async () => {
       try {
-        const proposal = await generatePatchProposal(context, ctrl.signal)
+        const tasks = loadTasks(process.cwd())
+        const proposal = await generatePatchProposal(context, ctrl.signal, tasks)
         setFixState({ status: 'proposal', traceId, startedAt, context, proposal, risk: assessPatchRisk(proposal), mediumConfirm: false })
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
@@ -1306,7 +1310,10 @@ function App({
         sidecar.open(activePath)
       }
 
-      const verifyCommand = proposal.verifyCommand || context.lastFailedRun.command
+      const tasks = loadTasks(process.cwd())
+      const verifyCommand = resolveTaskCommand(proposal.verifyTask, tasks)
+        ?? (proposal.verifyTask.includes(' ') ? proposal.verifyTask : null)
+        ?? context.lastFailedRun.command
       const verify = await shell.runTracked(verifyCommand)
       const result: VerifyResult = { run: verify }
       const trace = buildTrace(traceId, startedAt, context, proposal, true, result)

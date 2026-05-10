@@ -95,7 +95,7 @@ assert.equal(assessPatchRisk({
   ...proposal,
   files: [...proposal.files, { path: 'extra.txt', unifiedDiff: proposal.files[0]!.unifiedDiff.replaceAll('sample.txt', 'extra.txt') }],
 }).level, 'medium')
-assert.equal(assessPatchRisk({ ...proposal, verifyCommand: '' }).level, 'high')
+assert.equal(assessPatchRisk({ ...proposal, verifyTask: '' }).level, 'high')
 assert.equal(assessPatchRisk({
   ...proposal,
   files: [{ path: 'package-lock.json', unifiedDiff: proposal.files[0]!.unifiedDiff.replaceAll('sample.txt', 'package-lock.json') }],

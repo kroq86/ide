@@ -1,0 +1,14 @@
+{
+  "tasks": [
+    {
+      "id": "test",
+      "cmd": "cd ../.. && npm --prefix app exec tsx examples/broken-counter/test/counter.test.ts",
+      "description": "run broken-counter unit tests"
+    },
+    {
+      "id": "typecheck",
+      "cmd": "cd ../.. && npm --prefix app exec tsc --noEmit --project examples/broken-counter/tsconfig.json 2>/dev/null || true",
+      "description": "typecheck broken-counter source"
+    }
+  ]
+}

@@ -31,7 +31,8 @@ export type PatchProposal = {
     path: string
     unifiedDiff: string
   }>
-  verifyCommand: string
+  /** Task ID from .codeclaw/tasks.json. Falls back to the last failed command if unresolvable. */
+  verifyTask: string
   risk: 'low' | 'medium' | 'high'
   notes?: string[]
 }
@@ -126,6 +127,37 @@ export function codeClawDir(cwd: string): string {
   return join(cwd, '.codeclaw')
 }
 
+export type CodeClawTask = {
+  id: string
+  cmd: string
+  description?: string
+}
+
+export function loadTasks(cwd: string): CodeClawTask[] {
+  const path = join(codeClawDir(cwd), 'tasks.json')
+  if (!existsSync(path)) return []
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as { tasks?: unknown }).tasks)) return []
+    const arr = (raw as { tasks: unknown[] }).tasks
+    return arr.flatMap(t => {
+      if (typeof t !== 'object' || t === null) return []
+      const rec = t as Record<string, unknown>
+      const id  = typeof rec['id']  === 'string' && rec['id'].trim()  ? rec['id']  : null
+      const cmd = typeof rec['cmd'] === 'string' && rec['cmd'].trim() ? rec['cmd'] : null
+      if (!id || !cmd) return []
+      const description = typeof rec['description'] === 'string' ? rec['description'] : undefined
+      return [{ id, cmd, description }]
+    })
+  } catch {
+    return []
+  }
+}
+
+export function resolveTaskCommand(taskId: string, tasks: CodeClawTask[]): string | null {
+  return tasks.find(t => t.id === taskId)?.cmd ?? null
+}
+
 export function loadCodeClawProject(cwd: string): { rules: string; memory: string } {
   const dir = codeClawDir(cwd)
   const rulesPath = join(dir, 'rules.md')
@@ -154,8 +186,8 @@ export function createFixContext(input: FixContextInput): FixContext {
   }
 }
 
-export async function generatePatchProposal(context: FixContext, signal: AbortSignal): Promise<PatchProposal> {
-  const prompt = buildProposalPrompt(context)
+export async function generatePatchProposal(context: FixContext, signal: AbortSignal, tasks: CodeClawTask[] = []): Promise<PatchProposal> {
+  const prompt = buildProposalPrompt(context, tasks)
   const response = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -194,7 +226,7 @@ export function parsePatchProposal(raw: string): PatchProposal {
   if (!isObject(value)) throw new Error('proposal must be an object')
   const summary = readString(value, 'summary')
   const rootCause = readString(value, 'rootCause')
-  const verifyCommand = readOptionalString(value, 'verifyCommand')
+  const verifyTask = readOptionalString(value, 'verifyTask') || readOptionalString(value, 'verifyCommand')
   const risk = readString(value, 'risk')
   if (risk !== 'low' && risk !== 'medium' && risk !== 'high') {
     throw new Error('proposal risk must be low, medium, or high')
@@ -218,7 +250,7 @@ export function parsePatchProposal(raw: string): PatchProposal {
     ? notesValue.filter((note): note is string => typeof note === 'string')
     : undefined
 
-  return { summary, rootCause, files, verifyCommand, risk, notes }
+  return { summary, rootCause, files, verifyTask, risk, notes }
 }
 
 export async function generateReviewProposal(
@@ -359,7 +391,7 @@ export function assessPatchRisk(proposal: PatchProposal): PatchRiskAssessment {
     }
   }
 
-  if (!proposal.verifyCommand.trim()) raise('high', 'missing verification command')
+  if (!proposal.verifyTask.trim()) raise('high', 'missing verify task')
   if (proposal.files.length > 1) raise('medium', 'multiple files changed')
   if (changedLines.length > 80) raise('medium', 'large diff')
   if (filePaths.some(isTestPath)) raise('medium', 'test file changed')
@@ -491,7 +523,7 @@ function validatePatchPath(path: string): void {
   }
 }
 
-function buildProposalPrompt(context: FixContext): string {
+function buildProposalPrompt(context: FixContext, tasks: CodeClawTask[] = []): string {
   const compact = {
     ...context,
     activeFile: trimFile(context.activeFile),
@@ -503,13 +535,20 @@ function buildProposalPrompt(context: FixContext): string {
     memory: context.memory?.slice(0, 4000),
   }
 
+  const tasksList = tasks.length > 0
+    ? `Available verify tasks (use one of these IDs for "verifyTask"):\n${tasks.map(t => `  ${t.id}: ${t.cmd}${t.description ? ` — ${t.description}` : ''}`).join('\n')}`
+    : 'No tasks.json found — use a shell command string as verifyTask.'
+
   return [
     'You are CodeClaw Fix, an AI workflow engine inside a terminal-native developer workspace.',
     'Return ONLY strict JSON. Do not use markdown fences. Do not include prose outside the JSON.',
     'Your JSON must match this TypeScript type exactly:',
-    '{ "summary": string, "rootCause": string, "files": [{ "path": string, "unifiedDiff": string }], "verifyCommand": string, "risk": "low" | "medium" | "high", "notes"?: string[] }',
+    '{ "summary": string, "rootCause": string, "files": [{ "path": string, "unifiedDiff": string }], "verifyTask": string, "risk": "low" | "medium" | "high", "notes"?: string[] }',
+    '"verifyTask" must be a task ID from the list below, or a shell command if no tasks are defined.',
     'Each unifiedDiff must be a complete git-apply compatible unified diff for that file.',
     'Use the smallest safe change that fixes the observed failure.',
+    '',
+    tasksList,
     '',
     'FixContext:',
     JSON.stringify(compact, null, 2),
