@@ -137,6 +137,33 @@ export async function* streamChat(
   }
 }
 
+/**
+ * Strip markdown fences / language tags small models often emit around inline completions.
+ * Pass the full streamed accumulator each update (handles partial ``` lines by returning '').
+ */
+export function sanitizeInlineCompletion(acc: string): string {
+  let s = acc
+  if (/^\s*```/.test(s)) {
+    // Language tag is only word-like chars — do not use [^`\n]* or it eats the whole code line.
+    const blockOpen = s.match(/^\s*```\s*[\w.#+-]*\s*\r?\n/)
+    if (blockOpen) {
+      s = s.slice(blockOpen[0].length)
+    } else if (/^\s*```\s*[\w.#+-]*\s*$/.test(s) || /^\s*```\s*$/.test(s)) {
+      return ''
+    } else {
+      const inlineOpen = s.match(/^\s*```\s*[\w.#+-]*\s+(.*)$/s)
+      if (inlineOpen && inlineOpen[1] !== undefined) {
+        s = inlineOpen[1]
+      } else {
+        return ''
+      }
+    }
+  }
+  s = s.replace(/\r?\n```[^\n`]*$/g, '')
+  s = s.replace(/```\s*$/g, '')
+  return s
+}
+
 export async function* streamCompletion(
   filename: string | null,
   lines: string[],
@@ -156,11 +183,16 @@ export async function* streamCompletion(
 
   const shellContext =
     shellLines && shellLines.length > 0
-      ? `\nRecent shell output:\n${shellLines.slice(-20).map(l => l.text).join('\n')}\n`
+      ? `\nRecent shell output (context only — never quote or repeat these lines in your completion):\n${shellLines.slice(-12).map(l => l.text).join('\n').slice(-1200)}\n`
       : ''
 
   const prompt =
-    `Complete the code at the cursor. Output ONLY the inserted text, nothing else.\n` +
+    `Complete the code at the cursor position (between <prefix> and <suffix>).\n` +
+    `Rules:\n` +
+    `- Output ONLY the raw characters to insert at the gap between prefix and suffix.\n` +
+    `- Do NOT use markdown. Do NOT use triple-backtick code fences. Do NOT write a language tag (e.g. typescript).\n` +
+    `- Do NOT repeat shell prompts, npm commands, or terminal noise from context.\n` +
+    `- Do NOT add explanations, quotes, or "Here is".\n` +
     `File: ${filename ?? 'untitled'}${shellContext}\n` +
     `<prefix>${prefix}</prefix><suffix>${suffix}</suffix>`
 

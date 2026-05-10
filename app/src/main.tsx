@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
-import { streamCompletion, streamChat, type AiContext } from './ai.js'
+import { streamCompletion, streamChat, sanitizeInlineCompletion, type AiContext } from './ai.js'
 import {
   REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
   buildLeaderMap, flattenLeader, isLeafAction, whichKeyDesc,
@@ -403,17 +403,21 @@ function lineSegs(
   sel: SelBounds | null,
   searchQuery: string,
   ghostText: string | null,
+  completionStreaming: boolean,
+  thinkingTick: number,
   tokens?: SyntaxToken[],
 ): Seg[] {
   const isCursor = row === cursor.row
 
-  // Ghost text (insert mode only)
-  if (isCursor && ghostText !== null && ghostText.length > 0) {
+  // Ghost inline completion (+ spinner while Ollama streams, same tick as AI panel)
+  if (isCursor && ghostText !== null && (ghostText.length > 0 || completionStreaming)) {
     const pre = line.slice(0, cursor.col)
     const post = line.slice(cursor.col)
+    const spin = completionStreaming ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : ''
     return [
       { text: `${pre}|`, fg: C.blue },
-      { text: ghostText, fg: C.grey },
+      ...(ghostText.length > 0 ? [{ text: ghostText, fg: C.grey }] : []),
+      ...(spin ? [{ text: spin, fg: C.grey }] : []),
       { text: post || ' ', fg: C.blue },
     ]
   }
@@ -1024,6 +1028,8 @@ type EditorPaneProps = {
   activeBufferId: string
   prompt: PromptState | null
   ghostText: string | null
+  completionStreaming: boolean
+  thinkingTick: number
   mode: EditorMode
   scrollOffset: number
   panelRows: number
@@ -1038,7 +1044,7 @@ type EditorPaneProps = {
 
 function EditorPane({
   filename, snapshot, status, bufferName, bufferIndex, bufferCount, buffers, prompt,
-  activeBufferId, ghostText, mode, scrollOffset, panelRows, paneWidth, panel,
+  activeBufferId, ghostText, completionStreaming, thinkingTick, mode, scrollOffset, panelRows, paneWidth, panel,
   paneHeight, sel, searchQuery, cmdBuf, searchBuf,
 }: EditorPaneProps) {
   const lines  = snapshot?.lines  ?? ['']
@@ -1143,7 +1149,10 @@ function EditorPane({
             startCol: Math.min(sel.startCol, visibleCols),
             endCol:   Math.min(sel.endCol,   visibleCols),
           } : null
-          const segs = lineSegs(cropped, actualRow, cursor, mode, clippedSel, searchQuery, ghostText, snapshot?.tokens)
+          const segs = lineSegs(
+            cropped, actualRow, cursor, mode, clippedSel, searchQuery, ghostText,
+            completionStreaming, thinkingTick, snapshot?.tokens,
+          )
 
           return (
             <Box key={index} flexDirection="row">
@@ -1196,7 +1205,8 @@ function App({
   const filename = activeBuffer.snapshot?.filename ?? activeBuffer.filename ?? undefined
 
   const [mode,           setMode]           = React.useState<EditorMode>('normal')
-  const [ghostText,      setGhostText]      = React.useState<string | null>(null)
+  const [ghostText,          setGhostText]          = React.useState<string | null>(null)
+  const [completionStreaming, setCompletionStreaming] = React.useState(false)
   const [scrollOffset,   setScrollOffset]   = React.useState(0)
   const [panel,          setPanel]          = React.useState<Panel>(null)
   const [visualAnchor,   setVisualAnchor]   = React.useState<{ row: number; col: number } | null>(null)
@@ -1223,6 +1233,7 @@ function App({
     || fixState.status === 'generating'
     || fixState.status === 'applying'
     || reviewState.status === 'generating'
+    || completionStreaming
 
   React.useEffect(() => {
     if (!aiPanelBusy) return
@@ -1240,6 +1251,7 @@ function App({
   const enterNormal = React.useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
+    setCompletionStreaming(false)
     setGhostText(null)
     setPrompt(null)
     pendingKeyRef.current = null
@@ -1277,6 +1289,7 @@ function App({
   React.useEffect(() => {
     abortRef.current?.abort()
     abortRef.current = null
+    setCompletionStreaming(false)
     setGhostText(null)
     setPrompt(null)
     pendingKeyRef.current = null
@@ -1748,6 +1761,7 @@ function App({
     abortRef.current?.abort()
     const controller = new AbortController()
     abortRef.current = controller
+    setCompletionStreaming(true)
     setGhostText('')
     void (async () => {
       try {
@@ -1756,9 +1770,14 @@ function App({
           snapshot.filename, snapshot.lines, snapshot.cursor, controller.signal, shellLines,
         )) {
           acc += chunk
-          setGhostText(acc)
+          const cleaned = sanitizeInlineCompletion(acc)
+          setGhostText(cleaned.length > 0 ? cleaned : '')
         }
-      } catch { setGhostText(null) }
+      } catch {
+        setGhostText(null)
+      } finally {
+        setCompletionStreaming(false)
+      }
     })()
   }
 
@@ -2625,6 +2644,8 @@ function App({
       activeBufferId={activeId}
       prompt={prompt}
       ghostText={ghostText}
+      completionStreaming={completionStreaming}
+      thinkingTick={thinkingTick}
       mode={mode}
       scrollOffset={scrollOffset}
       panelRows={panelRows}

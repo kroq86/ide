@@ -7,6 +7,7 @@ import {
   findProjectContext,
   buildShellContext,
   buildProjectMemoryPart,
+  sanitizeInlineCompletion,
 } from '../src/ai.ts'
 import type { ShellSession } from '../src/shell.ts'
 
@@ -169,5 +170,33 @@ describe('buildProjectMemoryPart', () => {
     const idx = result.indexOf('Project memory:')
     const section = result.slice(idx)
     assert.ok(section.length < 900, `memory section not capped: ${section.length} chars`)
+  })
+})
+
+describe('sanitizeInlineCompletion', () => {
+  it('passes through plain code', () => {
+    assert.equal(sanitizeInlineCompletion('const n = 1'), 'const n = 1')
+  })
+
+  it('removes opening fence with language line', () => {
+    assert.equal(sanitizeInlineCompletion('```typescript\nconst x = 1'), 'const x = 1')
+    assert.equal(sanitizeInlineCompletion('``` typescript\nfoo'), 'foo')
+    assert.equal(sanitizeInlineCompletion('```\nfoo'), 'foo')
+  })
+
+  it('returns empty while fence line is incomplete', () => {
+    assert.equal(sanitizeInlineCompletion(''), '')
+    assert.equal(sanitizeInlineCompletion('`'), '`')
+    assert.equal(sanitizeInlineCompletion('```'), '')
+    assert.equal(sanitizeInlineCompletion('```typescript'), '')
+  })
+
+  it('handles same-line fence open', () => {
+    assert.equal(sanitizeInlineCompletion('```ts const a = 2'), 'const a = 2')
+  })
+
+  it('strips trailing fence', () => {
+    assert.equal(sanitizeInlineCompletion('ok\n```'), 'ok')
+    assert.equal(sanitizeInlineCompletion('line```'), 'line')
   })
 })
