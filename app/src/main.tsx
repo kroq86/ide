@@ -925,6 +925,9 @@ function App({
     setVisualLineMode(false)
     setCmdBuf('')
     setSearchBuf('')
+    setSearchQuery('')
+    searchQueryRef.current = ''
+    searchIdxRef.current = 0
     setScrollOffset(0)
     setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1404,6 +1407,7 @@ function App({
       }
       if (input === 'P') {
         const result = pushGit(process.cwd())
+        openGitPanel()
         if (!result.ok) { setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev) }
         return
       }
@@ -1454,8 +1458,8 @@ function App({
         if (msg) {
           const result = commitGit(process.cwd(), msg)
           setPrompt(null)
+          openGitPanel()
           if (!result.ok) {
-            openGitPanel()
             setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev)
           }
         } else {
@@ -1969,7 +1973,8 @@ async function main() {
   }
 
   function orderedBuffers(): EditorBuffer[] {
-    return [...buffers].sort((a, b) => a.id.localeCompare(b.id))
+    const num = (id: string) => parseInt(id.replace(/^.*-/, ''), 10) || 0
+    return [...buffers].sort((a, b) => num(a.id) - num(b.id))
   }
 
   function cycleBuffer(delta: number): void {

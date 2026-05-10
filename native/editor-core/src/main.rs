@@ -151,6 +151,7 @@ fn main() -> Result<()> {
                 })?;
             }
             Command::Completion { row, col } => {
+                // TODO: wire real LSP textDocument/completion; returning empty list for now
                 emit(&OutMessage::LspResponse {
                     type_: "lspResponse",
                     kind: "completion".to_owned(),
@@ -159,6 +160,7 @@ fn main() -> Result<()> {
                 })?;
             }
             Command::Format => {
+                // TODO: wire real LSP textDocument/formatting; no edits returned for now
                 emit(&OutMessage::LspResponse {
                     type_: "lspResponse",
                     kind: "format".to_owned(),

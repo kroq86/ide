@@ -12,7 +12,8 @@ if (!Number.isInteger(port) || port <= 0) {
 }
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const binary = join(root, 'native/qe-core/qe-protocol')
+// Rust editor-core binary (build with: cd native/editor-core && cargo build --release)
+const binary = join(root, 'native/editor-core/target/release/editor-core')
 const child = spawn(binary, editorArgs, {
   stdio: ['pipe', 'pipe', 'inherit'],
 })
