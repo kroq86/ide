@@ -82,7 +82,7 @@ type PromptState =
   | { type: 'file'; query: string }
   | { type: 'commit'; message: string }
 
-type AiMessage = { role: 'user' | 'assistant'; content: string }
+type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
 
 type LspTarget = { path?: string; row?: number; col?: number }
 
@@ -268,6 +268,12 @@ function getGitContext(): string {
 
 function updateGitEntry(entries: GitFileEntry[], path: string, fn: (e: GitFileEntry) => GitFileEntry): GitFileEntry[] {
   return entries.map(e => e.path === path ? fn(e) : e)
+}
+
+function extractFirstCodeBlock(text: string): string | null {
+  const m = text.match(/```(?:\w+\n|\n)?([\s\S]*?)```/)
+  const cmd = m?.[1]?.trim()
+  return cmd && cmd.length > 0 ? cmd : null
 }
 
 function extractFirstLocation(text: string): ParsedLocation | null {
@@ -493,7 +499,7 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
 // ── AI chat panel ─────────────────────────────────────────────────────────────
 
 function AiPanel({
-  messages, input, streaming, focused, width, height, navHint, fixState,
+  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, scrollOffset,
 }: {
   messages: AiMessage[]
   input: string
@@ -502,17 +508,24 @@ function AiPanel({
   width: number
   height: number
   navHint?: string
+  shellHint?: string
   fixState: CodeClawFixState
+  scrollOffset: number
 }) {
   const borderColor = focused ? C.green : C.grey
-  const totalRows = process.stdout.rows ?? 24
-  const msgAreaRows = Math.max(3, totalRows - 8)
-  const visible = messages.slice(-msgAreaRows)
+  const msgAreaRows = Math.max(3, height - 8)
+  const clampedOffset = Math.min(scrollOffset, Math.max(0, messages.length - msgAreaRows))
+  const sliceEnd = clampedOffset === 0 ? undefined : -clampedOffset
+  const visible = messages.slice(-msgAreaRows - clampedOffset, sliceEnd)
+  const hiddenAbove = Math.max(0, messages.length - msgAreaRows - clampedOffset)
   const fixLines = codeClawFixLines(fixState, msgAreaRows)
+
+  const scrollHint = clampedOffset > 0 ? `  ↑${clampedOffset} scrolled  j/k=scroll` : !focused && messages.length > msgAreaRows ? '  k=scroll up' : ''
+  const hint = streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : fixState.status !== 'idle' ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
-      <Text bold color={borderColor}>*AI*  {streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : 'SPC a p=focus'}</Text>
+      <Text bold color={borderColor}>*AI*  {hint}{scrollHint}</Text>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
         {fixLines.length > 0
           ? fixLines.map((line, i) => (
@@ -520,20 +533,28 @@ function AiPanel({
             ))
           : visible.length === 0
           ? <Text color={C.grey}>Ask anything about the current file...</Text>
-          : visible.map((msg, i) => (
-              <Box key={i} flexDirection="column" marginBottom={1}>
-                <Text bold color={msg.role === 'user' ? C.cyan : C.green}>
-                  {msg.role === 'user' ? 'You' : 'AI'}
-                </Text>
-                <Text color={C.fg} wrap="wrap">
-                  {msg.content || (streaming && i === visible.length - 1 ? '▋' : ' ')}
-                </Text>
-              </Box>
-            ))
+          : <>
+              {hiddenAbove > 0 && (
+                <Text color={C.grey}>{`  ↑ ${hiddenAbove} more message${hiddenAbove === 1 ? '' : 's'}`}</Text>
+              )}
+              {visible.map((msg, i) => (
+                <Box key={i} flexDirection="column" marginBottom={1}>
+                  <Text bold color={msg.role === 'user' ? C.cyan : msg.error ? C.red : C.green}>
+                    {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
+                  </Text>
+                  <Text color={msg.error ? C.red : C.fg} wrap="wrap">
+                    {msg.content || (streaming && i === visible.length - 1 ? '▋' : ' ')}
+                  </Text>
+                </Box>
+              ))}
+            </>
         }
       </Box>
       {navHint && (
         <Text color={C.yellow}>{`  Tab → ${navHint}`}</Text>
+      )}
+      {shellHint && (
+        <Text color={C.green}>{`  ! → run in shell: ${shellHint}`}</Text>
       )}
       {focused && (
         <Box flexDirection="row" marginTop={1}>
@@ -899,9 +920,10 @@ function App({
   const [searchQuery,    setSearchQuery]    = React.useState('')
   const [prompt,         setPrompt]         = React.useState<PromptState | null>(null)
 
-  const [aiMessages, setAiMessages] = React.useState<AiMessage[]>([])
-  const [aiInput,    setAiInput]    = React.useState('')
-  const [aiStreaming, setAiStreaming] = React.useState(false)
+  const [aiMessages,     setAiMessages]     = React.useState<AiMessage[]>([])
+  const [aiInput,        setAiInput]        = React.useState('')
+  const [aiStreaming,    setAiStreaming]     = React.useState(false)
+  const [aiScrollOffset, setAiScrollOffset] = React.useState(0)
   const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
   const [shellInput, setShellInput] = React.useState('')
   const [shellRunning, setShellRunning] = React.useState(false)
@@ -929,6 +951,7 @@ function App({
     searchQueryRef.current = ''
     searchIdxRef.current = 0
     setScrollOffset(0)
+    setAiScrollOffset(0)
     setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bufferKey])
@@ -938,6 +961,14 @@ function App({
     if (aiStreaming) return null
     const last = aiMessages[aiMessages.length - 1]
     if (last?.role === 'assistant' && last.content) return extractFirstLocation(last.content)
+    return null
+  }, [aiStreaming, aiMessages])
+
+  // Parse first code block from last AI response — offered as a shell command via !
+  const aiShellCmd = React.useMemo<string | null>(() => {
+    if (aiStreaming) return null
+    const last = aiMessages[aiMessages.length - 1]
+    if (last?.role === 'assistant' && last.content) return extractFirstCodeBlock(last.content)
     return null
   }, [aiStreaming, aiMessages])
 
@@ -1049,6 +1080,7 @@ function App({
     const userMsg: AiMessage = { role: 'user', content: text }
     setAiMessages(prev => [...prev, userMsg, { role: 'assistant', content: '' }])
     setAiStreaming(true)
+    setAiScrollOffset(0)
 
     aiAbortRef.current?.abort()
     const ctrl = new AbortController()
@@ -1076,8 +1108,29 @@ function App({
             return msgs
           })
         }
-      } catch { /* aborted or network error */ }
+      } catch (err) {
+        if (ctrl.signal.aborted) {
+          // Remove the trailing assistant bubble only if it received no content
+          setAiMessages(prev => {
+            const last = prev[prev.length - 1]
+            return last?.role === 'assistant' && !last.content ? prev.slice(0, -1) : prev
+          })
+        } else {
+          const msg = err instanceof Error ? err.message : String(err)
+          setAiMessages(prev => {
+            const msgs = [...prev]
+            const last = msgs[msgs.length - 1]
+            if (last?.role === 'assistant' && !last.content) {
+              msgs[msgs.length - 1] = { role: 'assistant', content: `[Error: ${msg}]`, error: true }
+            } else {
+              msgs.push({ role: 'assistant', content: `[Error: ${msg}]`, error: true })
+            }
+            return msgs
+          })
+        }
+      }
       setAiStreaming(false)
+      setAiScrollOffset(0)
     })()
   }
 
@@ -1294,6 +1347,28 @@ function App({
       return
     }
 
+    // ── AI panel (unfocused) — dismiss fixState overlay + scroll chat ────────
+    if (panel?.type === 'ai' && !panel.focused) {
+      if (input === 'x' && fixState.status !== 'idle') { setFixState({ status: 'idle' }); return }
+      if (input === '!' && aiShellCmd) {
+        if (shell.mode === 'runner') {
+          setShellInput(aiShellCmd)
+        } else {
+          shell.write(aiShellCmd)
+        }
+        setPanel({ type: 'shell' })
+        return
+      }
+      if (input === 'j') {
+        setAiScrollOffset(prev => Math.max(0, prev - 1))
+        return
+      }
+      if (input === 'k') {
+        setAiScrollOffset(prev => prev + 1)
+        return
+      }
+    }
+
     // ── AI panel (focused) ───────────────────────────────────────────────────
     if (panel?.type === 'ai' && fixState.status === 'proposal' && !aiStreaming) {
       if (input === 'a') { acceptCodeClawFix(); return }
@@ -1309,6 +1384,15 @@ function App({
     if (panel?.type === 'ai' && panel.focused) {
       if (key.escape)                                  { setPanel({ type: 'ai', focused: false }); return }
       if (key.ctrl && input === 'c')                   { aiAbortRef.current?.abort(); setAiStreaming(false); return }
+      if (input === '!' && !aiInput && aiShellCmd) {
+        if (shell.mode === 'runner') {
+          setShellInput(aiShellCmd)
+        } else {
+          shell.write(aiShellCmd)
+        }
+        setPanel({ type: 'shell' })
+        return
+      }
       if (key.tab) {
         if (aiNavLoc) { actions.openFile(aiNavLoc.file, { row: aiNavLoc.row, col: aiNavLoc.col }); setPanel({ type: 'ai', focused: false }) }
         return
@@ -1784,7 +1868,9 @@ function App({
           width={aiWidth}
           height={totalRows}
           navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
+          shellHint={aiShellCmd ? aiShellCmd.split('\n')[0] : undefined}
           fixState={fixState}
+          scrollOffset={aiScrollOffset}
         />
       </Box>
     )
