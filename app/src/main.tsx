@@ -42,7 +42,7 @@ import {
 } from './codeclaw.js'
 import { loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
 import {
-  loadGitStatus, loadFileHunks, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
+  loadGitStatus, loadFileHunks, getGitRepoRoot, hunkNewStartRow, resolveRepoFilePath, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
   getGitLog, buildGitDisplayLines,
   type GitStatusData, type GitFileEntry, type GitDisplayLine, type GitLogEntry,
 } from './git.js'
@@ -136,13 +136,186 @@ function selectionBounds(
   anchor: { row: number; col: number },
   cursor: { row: number; col: number },
   lineMode: boolean,
+  lines?: string[],
 ): SelBounds {
   let startRow = anchor.row, startCol = anchor.col
   let endRow   = cursor.row, endCol   = cursor.col
   if (startRow > endRow || (startRow === endRow && startCol > endCol)) {
     [startRow, startCol, endRow, endCol] = [endRow, endCol, startRow, startCol]
   }
+  if (lineMode && lines) {
+    startCol = 0
+    const endLine = lines[endRow] ?? ''
+    endCol = endLine.length > 0 ? endLine.length - 1 : 0
+  }
   return { startRow, startCol, endRow, endCol, lineMode }
+}
+
+/** Snapshot for restoring visual selection (expand-region / contract). */
+type VisualSnap = {
+  anchor: { row: number; col: number }
+  cursor: { row: number; col: number }
+  lineMode: boolean
+}
+
+function lastInclusiveCol(lines: string[], row: number): number {
+  const len = (lines[row] ?? '').length
+  return Math.max(0, len - 1)
+}
+
+function selFromBounds(bounds: SelBounds, lines: string[]): SelBounds {
+  return selectionBounds(
+    { row: bounds.startRow, col: bounds.startCol },
+    { row: bounds.endRow, col: bounds.endCol },
+    bounds.lineMode,
+    lines,
+  )
+}
+
+function selEqual(a: SelBounds, b: SelBounds): boolean {
+  return (
+    a.startRow === b.startRow &&
+    a.startCol === b.startCol &&
+    a.endRow === b.endRow &&
+    a.endCol === b.endCol &&
+    a.lineMode === b.lineMode
+  )
+}
+
+function intervalForRow(sel: SelBounds, row: number, lines: string[]): [number, number] | null {
+  if (row < sel.startRow || row > sel.endRow) return null
+  const last = lastInclusiveCol(lines, row)
+  if (sel.lineMode) return [0, last]
+  const sc = row === sel.startRow ? sel.startCol : 0
+  const ec = row === sel.endRow ? sel.endCol : last
+  return [Math.min(sc, ec), Math.max(sc, ec)]
+}
+
+function selContains(outer: SelBounds, inner: SelBounds, lines: string[]): boolean {
+  const o = selFromBounds(outer, lines)
+  const i = selFromBounds(inner, lines)
+  for (let r = i.startRow; r <= i.endRow; r++) {
+    const oi = intervalForRow(o, r, lines)
+    const ii = intervalForRow(i, r, lines)
+    if (oi === null || ii === null) return false
+    if (ii[0] < oi[0] || ii[1] > oi[1]) return false
+  }
+  return true
+}
+
+function selStrictContains(outer: SelBounds, inner: SelBounds, lines: string[]): boolean {
+  const o = selFromBounds(outer, lines)
+  const i = selFromBounds(inner, lines)
+  return selContains(o, i, lines) && !selEqual(o, i)
+}
+
+function wordBoundsOnLine(line: string, col: number): { start: number; end: number } {
+  const chars = [...line]
+  if (chars.length === 0) return { start: 0, end: 0 }
+  const c = Math.min(Math.max(0, col), chars.length - 1)
+  const isWord = (ch: string | undefined) => ch !== undefined && /[\p{L}\p{N}_]/u.test(ch)
+  if (!isWord(chars[c])) return { start: col, end: col }
+  let s = c
+  while (s > 0 && isWord(chars[s - 1])) s--
+  let e = c
+  while (e + 1 < chars.length && isWord(chars[e + 1])) e++
+  return { start: s, end: e }
+}
+
+function wordExpandSel(
+  lines: string[],
+  anchor: { row: number; col: number },
+  cursor: { row: number; col: number },
+): SelBounds | null {
+  if (anchor.row !== cursor.row) return null
+  const line = lines[anchor.row] ?? ''
+  const wa = wordBoundsOnLine(line, anchor.col)
+  const wc = wordBoundsOnLine(line, cursor.col)
+  const sc = Math.min(wa.start, wc.start)
+  const ec = Math.max(wa.end, wc.end)
+  return { startRow: anchor.row, startCol: sc, endRow: anchor.row, endCol: ec, lineMode: false }
+}
+
+function fullLinesSel(lines: string[], startRow: number, endRow: number): SelBounds {
+  if (lines.length === 0) return { startRow: 0, startCol: 0, endRow: 0, endCol: 0, lineMode: false }
+  const sr = Math.max(0, startRow)
+  const er = Math.min(Math.max(0, lines.length - 1), endRow)
+  return {
+    startRow: sr,
+    startCol: 0,
+    endRow: er,
+    endCol: lastInclusiveCol(lines, er),
+    lineMode: false,
+  }
+}
+
+function paragraphSel(lines: string[], row: number): SelBounds {
+  if (lines.length === 0) return { startRow: 0, startCol: 0, endRow: 0, endCol: 0, lineMode: false }
+  const r = Math.max(0, Math.min(row, lines.length - 1))
+  let start = r
+  while (start > 0 && (lines[start - 1] ?? '').trim() !== '') start--
+  let end = r
+  while (end + 1 < lines.length && (lines[end + 1] ?? '').trim() !== '') end++
+  return {
+    startRow: start,
+    startCol: 0,
+    endRow: end,
+    endCol: lastInclusiveCol(lines, end),
+    lineMode: false,
+  }
+}
+
+function bufferSel(lines: string[]): SelBounds {
+  if (lines.length === 0) return { startRow: 0, startCol: 0, endRow: 0, endCol: 0, lineMode: false }
+  const er = lines.length - 1
+  return { startRow: 0, startCol: 0, endRow: er, endCol: lastInclusiveCol(lines, er), lineMode: false }
+}
+
+function boundsToVisualSnap(bounds: SelBounds, lines: string[]): VisualSnap {
+  const n = selFromBounds(bounds, lines)
+  return {
+    anchor: { row: n.startRow, col: n.startCol },
+    cursor: { row: n.endRow, col: n.endCol },
+    lineMode: n.lineMode,
+  }
+}
+
+/** Emacs-style expand-region: next strictly larger selection (word → lines → line-vis → paragraph → buffer). */
+function expandRegionOnce(
+  lines: string[],
+  anchor: { row: number; col: number },
+  cursor: { row: number; col: number },
+  lineMode: boolean,
+): VisualSnap | null {
+  const cur = selectionBounds(anchor, cursor, lineMode, lines)
+  const candidates: SelBounds[] = []
+
+  if (!lineMode) {
+    const w = wordExpandSel(lines, anchor, cursor)
+    if (w) candidates.push(selFromBounds(w, lines))
+  }
+
+  candidates.push(selFromBounds(fullLinesSel(lines, cur.startRow, cur.endRow), lines))
+
+  candidates.push(selFromBounds(
+    {
+      startRow: cur.startRow,
+      startCol: 0,
+      endRow: cur.endRow,
+      endCol: lastInclusiveCol(lines, cur.endRow),
+      lineMode: true,
+    },
+    lines,
+  ))
+
+  candidates.push(selFromBounds(paragraphSel(lines, cur.startRow), lines))
+  candidates.push(selFromBounds(bufferSel(lines), lines))
+
+  for (const raw of candidates) {
+    const c = selFromBounds(raw, lines)
+    if (selStrictContains(c, cur, lines)) return boundsToVisualSnap(c, lines)
+  }
+  return null
 }
 
 function getVisualText(lines: string[], sel: SelBounds): string {
@@ -728,7 +901,7 @@ function GitPanel({ data, cursor, pendingKey, logEntries, gitError, displayLines
   const hint = gitError ? `ERROR: ${gitError}`
     : pendingKey === 'c' ? 'c=commit  Esc=cancel'
     : pendingKey === 'l' ? 'l=log  Esc=cancel'
-    : 'j/k  TAB=expand  s/u=stage  cc=commit  F=pull  P=push  q=close'
+    : 'j/k  TAB=expand  Ret=open file  s/u=stage  cc=commit  F=pull  P=push  q/Esc=close'
   const hintColor: ThemeColor = gitError ? C.red : C.grey
 
   return (
@@ -887,9 +1060,9 @@ function EditorPane({
   } else if (mode === 'insert') {
     hintLine = 'Tab=complete  Esc=normal'
   } else if (mode === 'visual') {
-    hintLine = 'y=yank  d=delete  V=line  Esc=normal'
+    hintLine = 'y=yank  d=delete  o=swap  v=expand  V=contract  hjkl/arrows=extend  Esc=normal'
   } else {
-    hintLine = 'SPC=menu  -=dired  i=insert  /=search  :=cmd  Ctrl-Q=quit'
+    hintLine = 'SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
   }
 
   const matchCount = searchQuery ? findMatches(lines, searchQuery).length : 0
@@ -1000,6 +1173,8 @@ function App({
   const [panel,          setPanel]          = React.useState<Panel>(null)
   const [visualAnchor,   setVisualAnchor]   = React.useState<{ row: number; col: number } | null>(null)
   const [visualLineMode, setVisualLineMode] = React.useState(false)
+  /** Stack of selections before each expand (contract pops). Not react state — avoids stale handlers. */
+  const visualExpandHistoryRef = React.useRef<VisualSnap[]>([])
   const [cmdBuf,         setCmdBuf]         = React.useState('')
   const [searchBuf,      setSearchBuf]      = React.useState('')
   const [searchQuery,    setSearchQuery]    = React.useState('')
@@ -1044,6 +1219,7 @@ function App({
     setMode('normal')
     setVisualAnchor(null)
     setVisualLineMode(false)
+    visualExpandHistoryRef.current = []
     setCmdBuf('')
     setSearchBuf('')
   }, [])
@@ -1079,6 +1255,7 @@ function App({
     setMode('normal')
     setVisualAnchor(null)
     setVisualLineMode(false)
+    visualExpandHistoryRef.current = []
     setCmdBuf('')
     setSearchBuf('')
     setSearchQuery('')
@@ -1531,7 +1708,7 @@ function App({
 
   function stageCurrentFile() {
     if (snapshot?.filename) {
-      spawnSync('git', ['add', '--', snapshot.filename], { cwd: process.cwd(), timeout: 3000 })
+      spawnSync('git', ['add', '--', snapshot.filename], { cwd: getGitRepoRoot(process.cwd()), timeout: 3000 })
       setPanel(prev => prev?.type === 'git'
         ? { ...prev, data: loadGitStatus(process.cwd()), cursor: 0 }
         : prev)
@@ -1802,6 +1979,23 @@ function App({
         return
       }
 
+      if (key.return) {
+        const cwd = process.cwd()
+        if (cursorEntry?.type === 'file') {
+          actions.openFile(resolveRepoFilePath(cwd, cursorEntry.entry.path))
+          setPanel(null)
+          return
+        }
+        if (cursorEntry?.type === 'hunk') {
+          const abs = resolveRepoFilePath(cwd, cursorEntry.entry.path)
+          const row = hunkNewStartRow(cursorEntry.hunk.header)
+          actions.openFile(abs, row != null ? { row, col: 0 } : undefined)
+          setPanel(null)
+          return
+        }
+        return
+      }
+
       if (input === 's') {
         if (cursorEntry?.type === 'file')  stageEntry(process.cwd(), cursorEntry.entry)
         else if (cursorEntry?.type === 'hunk') stageEntry(process.cwd(), cursorEntry.entry, cursorEntry.hunk)
@@ -2066,29 +2260,65 @@ function App({
 
     // ── Visual mode ───────────────────────────────────────────────────────────
     if (mode === 'visual') {
-      // movement still works
-      if (input === 'h') { sidecar.move('left'); return }
-      if (input === 'j') { sidecar.move('down'); return }
-      if (input === 'k') { sidecar.move('up');   return }
-      if (input === 'l') { sidecar.move('right'); return }
-      if (input === 'w') { sidecar.move('wordForward'); return }
-      if (input === 'b') { sidecar.move('wordBackward'); return }
-      if (input === '0') { sidecar.move('home'); return }
-      if (input === '$') { sidecar.move('end');  return }
-      if (input === 'G') { sidecar.move('fileEnd'); return }
-      if (input === 'g') { sidecar.move('fileStart'); return }
+      if (input === 'v' && snapshot && visualAnchor) {
+        const curSnap: VisualSnap = {
+          anchor: { ...visualAnchor },
+          cursor: { ...snapshot.cursor },
+          lineMode: visualLineMode,
+        }
+        const next = expandRegionOnce(snapshot.lines, visualAnchor, snapshot.cursor, visualLineMode)
+        if (next) {
+          visualExpandHistoryRef.current.push(curSnap)
+          setVisualAnchor(next.anchor)
+          setVisualLineMode(next.lineMode)
+          sidecar.moveTo(next.cursor.row, next.cursor.col)
+        }
+        return
+      }
 
-      if (input === 'V') { setVisualLineMode(prev => !prev); return }
+      if (input === 'V' && snapshot && visualAnchor) {
+        const h = visualExpandHistoryRef.current
+        if (h.length > 0) {
+          const prev = h.pop()!
+          setVisualAnchor(prev.anchor)
+          setVisualLineMode(prev.lineMode)
+          sidecar.moveTo(prev.cursor.row, prev.cursor.col)
+        }
+        return
+      }
+
+      // movement extends selection (hjkl + arrows) — clears expand/contract stack
+      if (input === 'h' || key.leftArrow)  { visualExpandHistoryRef.current = []; sidecar.move('left');  return }
+      if (input === 'j' || key.downArrow)  { visualExpandHistoryRef.current = []; sidecar.move('down');  return }
+      if (input === 'k' || key.upArrow)    { visualExpandHistoryRef.current = []; sidecar.move('up');    return }
+      if (input === 'l' || key.rightArrow) { visualExpandHistoryRef.current = []; sidecar.move('right'); return }
+      if (input === 'w') { visualExpandHistoryRef.current = []; sidecar.move('wordForward'); return }
+      if (input === 'b') { visualExpandHistoryRef.current = []; sidecar.move('wordBackward'); return }
+      if (input === '0') { visualExpandHistoryRef.current = []; sidecar.move('home'); return }
+      if (input === '$') { visualExpandHistoryRef.current = []; sidecar.move('end');  return }
+      if (input === 'G') { visualExpandHistoryRef.current = []; sidecar.move('fileEnd'); return }
+      if (input === 'g') { visualExpandHistoryRef.current = []; sidecar.move('fileStart'); return }
+
+      if (input === 'o' && snapshot && visualAnchor) {
+        visualExpandHistoryRef.current = []
+        const ar = visualAnchor.row
+        const ac = visualAnchor.col
+        const cr = snapshot.cursor.row
+        const cc = snapshot.cursor.col
+        setVisualAnchor({ row: cr, col: cc })
+        sidecar.moveTo(ar, ac)
+        return
+      }
 
       if (input === 'y' && snapshot && visualAnchor) {
-        const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode)
+        const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
         yankRegisterRef.current = getVisualText(snapshot.lines, sel)
         enterNormal()
         return
       }
 
       if ((input === 'd' || input === 'c') && snapshot && visualAnchor) {
-        const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode)
+        const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
         yankRegisterRef.current = getVisualText(snapshot.lines, sel)
         if (sel.lineMode) {
           sidecar.deleteRange(sel.startRow, 0, sel.endRow, 999999)
@@ -2112,6 +2342,14 @@ function App({
         /* stay with resolved path */
       }
       setPanel({ type: 'dired', path, cursor: 0 })
+      return
+    }
+    if (input === '[' || input === '{') {
+      sidecar.move('paragraphBackward')
+      return
+    }
+    if (input === ']' || input === '}') {
+      sidecar.move('paragraphForward')
       return
     }
     if (key.ctrl && input === 's') { saveCurrentBuffer(); return }
@@ -2200,13 +2438,23 @@ function App({
         break
       case 'v':
         if (snapshot) {
-          setVisualAnchor({ ...snapshot.cursor })
+          const cur = snapshot.cursor
+          visualExpandHistoryRef.current = []
+          setVisualAnchor({ ...cur })
           setVisualLineMode(false)
           setMode('visual')
+          const next = expandRegionOnce(snapshot.lines, cur, cur, false)
+          if (next) {
+            visualExpandHistoryRef.current.push({ anchor: { ...cur }, cursor: { ...cur }, lineMode: false })
+            setVisualAnchor(next.anchor)
+            setVisualLineMode(next.lineMode)
+            sidecar.moveTo(next.cursor.row, next.cursor.col)
+          }
         }
         break
       case 'V':
         if (snapshot) {
+          visualExpandHistoryRef.current = []
           setVisualAnchor({ row: snapshot.cursor.row, col: 0 })
           setVisualLineMode(true)
           setMode('visual')
@@ -2224,7 +2472,7 @@ function App({
   })
 
   const sel: SelBounds | null = (mode === 'visual' && visualAnchor && snapshot)
-    ? selectionBounds(visualAnchor, snapshot.cursor, visualLineMode)
+    ? selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
     : null
 
   const aiWidth = panel?.type === 'ai' ? Math.floor(totalCols * 0.42) : 0
@@ -2234,9 +2482,26 @@ function App({
     ? buildGitDisplayLines(panel.data, panel.logEntries)
     : null
   const diredEntries = panel?.type === 'dired' ? readDiredEntries(panel.path) : []
+
+  if (panel?.type === 'git') {
+    return (
+      <Box flexDirection="column" width={totalCols} height={totalRows}>
+        <GitPanel
+          data={panel.data}
+          cursor={panel.cursor}
+          pendingKey={panel.pendingKey}
+          logEntries={panel.logEntries}
+          gitError={panel.gitError}
+          displayLines={gitDisplayLines!}
+          totalRows={totalRows}
+          totalCols={totalCols}
+        />
+      </Box>
+    )
+  }
+
   const panelRows = panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell'      ? 3 + shellRows
-    : panel.type === 'git'        ? Math.min(Math.floor(totalRows * 0.6), (gitDisplayLines?.length ?? 0) + 3)
     : panel.type === 'dired'
       ? Math.min(Math.floor(totalRows * 0.48), Math.max(7, diredEntries.length + 4))
     : panel.type === 'cmdpalette' ? 0
@@ -2308,18 +2573,6 @@ function App({
           input={shellInput}
           running={shellRunning}
           height={panelRows}
-        />
-      )}
-      {panel?.type === 'git' && (
-        <GitPanel
-          data={panel.data}
-          cursor={panel.cursor}
-          pendingKey={panel.pendingKey}
-          logEntries={panel.logEntries}
-          gitError={panel.gitError}
-          displayLines={gitDisplayLines!}
-          totalRows={panelRows}
-          totalCols={totalCols}
         />
       )}
       {panel?.type === 'dired' && (

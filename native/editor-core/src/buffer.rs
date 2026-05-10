@@ -247,6 +247,8 @@ impl EditorBuffer {
             }
             MoveDirection::WordForward => self.word_forward(),
             MoveDirection::WordBackward => self.word_backward(),
+            MoveDirection::ParagraphForward => self.paragraph_forward(),
+            MoveDirection::ParagraphBackward => self.paragraph_backward(),
         }
     }
 
@@ -473,6 +475,85 @@ impl EditorBuffer {
         self.line_text(row).chars().count()
     }
 
+    fn line_is_blank(&self, row: usize) -> bool {
+        self.line_text(row).trim().is_empty()
+    }
+
+    fn paragraph_forward(&mut self) {
+        let n = self.line_count();
+        let mut r = self.cursor.row.min(self.last_row());
+
+        if self.line_is_blank(r) {
+            while r < n && self.line_is_blank(r) {
+                r += 1;
+            }
+            if r >= n {
+                let lr = self.last_row();
+                self.move_to(lr, self.line_len(lr));
+                return;
+            }
+            self.move_to(r, 0);
+            return;
+        }
+
+        while r < n && !self.line_is_blank(r) {
+            r += 1;
+        }
+        if r >= n {
+            let lr = self.last_row();
+            self.move_to(lr, self.line_len(lr));
+            return;
+        }
+        while r < n && self.line_is_blank(r) {
+            r += 1;
+        }
+        if r >= n {
+            let lr = self.last_row();
+            self.move_to(lr, self.line_len(lr));
+            return;
+        }
+        self.move_to(r, 0);
+    }
+
+    fn paragraph_backward(&mut self) {
+        let mut r = self.cursor.row.min(self.last_row());
+
+        if self.line_is_blank(r) {
+            while r > 0 && self.line_is_blank(r) {
+                r -= 1;
+            }
+            if self.line_is_blank(r) {
+                self.move_to(0, 0);
+                return;
+            }
+            while r > 0 && !self.line_is_blank(r - 1) {
+                r -= 1;
+            }
+            self.move_to(r, 0);
+            return;
+        }
+
+        while r > 0 && !self.line_is_blank(r - 1) {
+            r -= 1;
+        }
+        if r == 0 {
+            self.move_to(0, 0);
+            return;
+        }
+        r -= 1;
+        while r > 0 && self.line_is_blank(r) {
+            r -= 1;
+        }
+        if self.line_is_blank(r) {
+            self.move_to(0, 0);
+            return;
+        }
+        while r > 0 && !self.line_is_blank(r - 1) {
+            r -= 1;
+        }
+        self.move_to(r, 0);
+    }
+
     fn word_forward(&mut self) {
         let chars: Vec<char> = self.rope.chars().collect();
         let mut idx = self.cursor_char();
@@ -615,5 +696,21 @@ mod tests {
         assert_eq!(b.filename().map(str::to_owned), Some(path.clone()));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
         assert!(!b.dirty);
+    }
+
+    #[test]
+    fn paragraph_jump_across_blank_lines() {
+        use crate::protocol::MoveDirection;
+        let mut b = EditorBuffer::new();
+        b.insert("fn a() {}\n\nfn b() {}\n\nfn c() {}\n");
+        b.move_to(0, 5);
+        b.move_cursor(MoveDirection::ParagraphForward);
+        assert_eq!(b.cursor, Cursor { row: 2, col: 0 });
+        b.move_cursor(MoveDirection::ParagraphForward);
+        assert_eq!(b.cursor, Cursor { row: 4, col: 0 });
+        b.move_cursor(MoveDirection::ParagraphBackward);
+        assert_eq!(b.cursor, Cursor { row: 2, col: 0 });
+        b.move_cursor(MoveDirection::ParagraphBackward);
+        assert_eq!(b.cursor, Cursor { row: 0, col: 0 });
     }
 }

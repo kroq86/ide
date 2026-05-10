@@ -1,8 +1,27 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+/** Prefer newest Rust editor-core (release vs debug) so dev `cargo build` matches TS protocol; fallback to legacy qe-protocol. */
+export function resolveEditorCoreBinary(repoRoot: string): string {
+  const debugPath = join(repoRoot, 'native/editor-core/target/debug/editor-core')
+  const releasePath = join(repoRoot, 'native/editor-core/target/release/editor-core')
+  const legacyPath = join(repoRoot, 'native/qe-core/qe-protocol')
+
+  let choice: { path: string; mtime: number } | null = null
+  for (const path of [releasePath, debugPath]) {
+    if (!existsSync(path)) continue
+    try {
+      const mtime = statSync(path).mtimeMs
+      if (!choice || mtime > choice.mtime) choice = { path, mtime }
+    } catch {
+      /* unreadable */
+    }
+  }
+  return choice?.path ?? legacyPath
+}
 
 export type Cursor = {
   row: number
@@ -66,7 +85,7 @@ type Command =
   | { type: 'deleteForward' }
   | { type: 'deleteLine' }
   | { type: 'deleteRange'; startRow: number; startCol: number; endRow: number; endCol: number }
-  | { type: 'move'; direction: 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'wordForward' | 'wordBackward' | 'fileStart' | 'fileEnd' }
+  | { type: 'move'; direction: 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'wordForward' | 'wordBackward' | 'fileStart' | 'fileEnd' | 'paragraphForward' | 'paragraphBackward' }
   | { type: 'moveTo'; row: number; col: number }
   | { type: 'save' }
   | { type: 'saveAs'; filename: string }
@@ -92,9 +111,7 @@ export class QeSidecar extends EventEmitter {
 
     const appDir = dirname(fileURLToPath(import.meta.url))
     const root = join(appDir, '../..')
-    const rustBinary = join(root, 'native/editor-core/target/release/editor-core')
-    const legacyBinary = join(root, 'native/qe-core/qe-protocol')
-    const binary = existsSync(rustBinary) ? rustBinary : legacyBinary
+    const binary = resolveEditorCoreBinary(root)
     const args = filename ? [filename] : []
 
     this.#child = spawn(binary, args, {

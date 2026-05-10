@@ -1,8 +1,8 @@
 import { describe, it, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import {
   loadGitStatus,
@@ -10,6 +10,10 @@ import {
   pushGit,
   getGitLog,
   buildGitDisplayLines,
+  loadFileHunks,
+  getGitRepoRoot,
+  hunkNewStartRow,
+  resolveRepoFilePath,
   type GitStatusData,
 } from '../src/git.ts'
 
@@ -90,6 +94,49 @@ describe('getGitLog', () => {
     const limited = getGitLog(repo, 1)
     assert.ok(limited.length <= 1)
     assert.ok(all.length >= limited.length)
+  })
+})
+
+describe('getGitRepoRoot', () => {
+  it('returns top-level from a nested cwd', () => {
+    const nested = join(repo, 'rootprobe-nested')
+    mkdirSync(nested, { recursive: true })
+    assert.equal(realpathSync(getGitRepoRoot(nested)), realpathSync(repo))
+  })
+})
+
+describe('hunkNewStartRow', () => {
+  it('parses unified diff @@ line for new-file side', () => {
+    assert.equal(hunkNewStartRow('@@ -10,7 +22,9 @@ fn foo'), 21)
+    assert.equal(hunkNewStartRow('@@ -0,0 +1,5 @@'), 0)
+    assert.equal(hunkNewStartRow('bad'), null)
+  })
+})
+
+describe('resolveRepoFilePath', () => {
+  it('joins repo root with relative path', () => {
+    assert.equal(
+      resolveRepoFilePath(repo, 'x/y.txt'),
+      resolvePath(join(getGitRepoRoot(repo), 'x/y.txt')),
+    )
+  })
+})
+
+describe('loadFileHunks', () => {
+  it('loads unstaged diff when cwd is a subdirectory (pathspecs are repo-relative)', () => {
+    const deepDir = join(repo, 'diff-from-subdir')
+    mkdirSync(deepDir, { recursive: true })
+    const rel = 'diff-from-subdir/watched.txt'
+    writeFileSync(join(repo, rel), 'line1\n')
+    spawnSync('git', ['add', '--', rel], { cwd: repo, stdio: 'ignore' })
+    commitGit(repo, 'add watched')
+    writeFileSync(join(repo, rel), 'line1\nline2\n')
+    const hunks = loadFileHunks(deepDir, rel, 'unstaged')
+    assert.ok(hunks.length > 0, 'diff should not be empty when git runs from repo root')
+    assert.ok(
+      hunks.some(h => h.lines.some(l => l.startsWith('+') || l.startsWith('-'))),
+      'expected +/- diff lines',
+    )
   })
 })
 

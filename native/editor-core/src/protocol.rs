@@ -124,6 +124,12 @@ pub enum MoveDirection {
     FileStart,
     #[serde(rename = "fileEnd")]
     FileEnd,
+    /// Next non-empty block after a blank-line gap (like vim `}` on paragraphs).
+    #[serde(rename = "paragraphForward")]
+    ParagraphForward,
+    /// Previous block start separated by blank lines (like vim `{`).
+    #[serde(rename = "paragraphBackward")]
+    ParagraphBackward,
 }
 
 #[derive(Debug, Serialize)]
