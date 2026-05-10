@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -17,15 +18,22 @@ export type ParsedLocation = {
   message: string
 }
 
-export type ShellSession = {
-  cmd: string
-  output: string[]             // cleaned text lines (for AI context)
-  errors: string[]             // raw error lines
-  locations: ParsedLocation[]  // navigable file:line references
+export type ShellRun = {
+  id: string
+  command: string
+  cwd: string
+  startedAt: string
+  endedAt?: string
+  exitCode?: number
+  stdout: string
+  stderr: string
+  locations: ParsedLocation[]
 }
 
+export type ShellSession = ShellRun
+export type TrackedShellResult = ShellRun
+
 function parseErrorLine(text: string): { isError: boolean; location: ParsedLocation | null } {
-  // TypeScript: src/main.tsx(47,12): error TS2345: message
   const tsMatch = text.match(/^(.+?\.tsx?)\((\d+),(\d+)\):\s+(?:error|warning)\s+TS\d+:\s+(.*)$/)
   if (tsMatch) {
     return {
@@ -34,7 +42,6 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
     }
   }
 
-  // Cargo/Rust location: "  --> src/main.rs:47:12"
   const cargoLoc = text.match(/^\s+-->\s+(.+?):(\d+):(\d+)/)
   if (cargoLoc) {
     return {
@@ -43,7 +50,6 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
     }
   }
 
-  // Python: '  File "foo.py", line 47'
   const pyFile = text.match(/^\s+File "(.+?)", line (\d+)/)
   if (pyFile) {
     return {
@@ -52,7 +58,6 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
     }
   }
 
-  // Pytest: "FAILED tests/test_foo.py::test_bar"
   const pytestFail = text.match(/^FAILED\s+([\w./\\-]+\.py)::(.+)$/)
   if (pytestFail) {
     return {
@@ -61,7 +66,6 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
     }
   }
 
-  // Node.js stack frame: "    at Foo.bar (/path/file.js:47:12)"
   const nodeStack = text.match(/^\s+at\s+.+?\((.+?\.(?:js|ts|mjs|cjs)):(\d+):(\d+)\)/)
   if (nodeStack) {
     return {
@@ -70,10 +74,7 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
     }
   }
 
-  // Cargo error line (no location on this line — follows separately)
   if (/^error(\[E\d+\])?:\s/.test(text)) return { isError: true, location: null }
-
-  // Generic error signals
   if (/^(FAILED|ERROR)\s/.test(text)) return { isError: true, location: null }
   if (/SyntaxError|ReferenceError|TypeError|RangeError/.test(text)) return { isError: true, location: null }
   if (/\berror:\s/i.test(text) && !/no\s+errors?/i.test(text)) return { isError: true, location: null }
@@ -84,12 +85,20 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
 
 export class ShellSidecar extends EventEmitter {
   #term: ReturnType<typeof pty.spawn>
+  #cwd: string
   #lines: ShellLine[] = []
   #buf = ''
-  #sessions: ShellSession[] = []
+  #inputLine = ''
+  #runs: ShellRun[] = []
+  #tracked = new Map<string, {
+    run: ShellRun
+    timer: ReturnType<typeof setTimeout>
+    resolve: (result: TrackedShellResult) => void
+  }>()
 
   constructor(cwd: string, cols: number, rows: number) {
     super()
+    this.#cwd = cwd
     const shell = process.env['SHELL'] ?? '/bin/sh'
     try {
       this.#term = pty.spawn(shell, [], {
@@ -112,17 +121,19 @@ export class ShellSidecar extends EventEmitter {
       for (const raw of parts) {
         const text = stripAnsi(raw)
         if (!text.trim()) continue
+
+        if (this.#handleTrackedExit(text.trim())) continue
+
         const { isError, location } = parseErrorLine(text)
         const line: ShellLine = { text, isError }
         this.#lines.push(line)
         if (this.#lines.length > 500) this.#lines.shift()
 
-        const session = this.#sessions[this.#sessions.length - 1]
-        if (session) {
-          session.output.push(text)
-          if (session.output.length > 200) session.output.shift()
-          if (isError) session.errors.push(text)
-          if (location) session.locations.push(location)
+        const run = this.#runs[this.#runs.length - 1]
+        if (run && !run.endedAt) {
+          appendTail(run, 'stdout', text)
+          if (isError) appendTail(run, 'stderr', text)
+          if (location) run.locations.push(location)
         }
 
         this.emit('line', line)
@@ -137,38 +148,126 @@ export class ShellSidecar extends EventEmitter {
 
   get currentLine(): string { return stripAnsi(this.#buf) }
 
-  get sessions(): ShellSession[] { return this.#sessions }
+  get sessions(): ShellSession[] { return this.#runs }
+
+  get runs(): ShellRun[] { return this.#runs }
+
+  get lastRun(): ShellRun | null { return this.#runs[this.#runs.length - 1] ?? null }
+
+  get lastFailedRun(): ShellRun | null {
+    for (let i = this.#runs.length - 1; i >= 0; i--) {
+      const run = this.#runs[i]!
+      if (run.exitCode !== undefined && run.exitCode !== 0) return run
+    }
+    return null
+  }
 
   get lastError(): ShellSession | null {
-    for (let i = this.#sessions.length - 1; i >= 0; i--) {
-      if (this.#sessions[i]!.errors.length > 0) return this.#sessions[i]!
+    for (let i = this.#runs.length - 1; i >= 0; i--) {
+      if (this.#runs[i]!.stderr.trim()) return this.#runs[i]!
     }
     return null
   }
 
   get lastLocation(): ParsedLocation | null {
-    for (let i = this.#sessions.length - 1; i >= 0; i--) {
-      const locs = this.#sessions[i]!.locations
+    for (let i = this.#runs.length - 1; i >= 0; i--) {
+      const locs = this.#runs[i]!.locations
       if (locs.length > 0) return locs[0]!
     }
     return null
   }
 
   write(data: string) {
-    if (data === '\r') {
-      const cmd = this.currentLine.trim()
-      if (cmd) this.#startSession(cmd)
-    } else if (data.endsWith('\r') && data.length > 1) {
-      const cmd = stripAnsi(data.slice(0, -1)).trim()
-      if (cmd) this.#startSession(cmd)
+    if (data === '\x7f') {
+      this.#inputLine = this.#inputLine.slice(0, -1)
+    } else if (data === '\x15' || data === '\r' || (data.endsWith('\r') && data.length > 1)) {
+      this.#inputLine = ''
+    } else if (isPlainInput(data)) {
+      this.#inputLine += data
     }
     this.#term?.write(data)
   }
 
-  #startSession(cmd: string): void {
-    const session: ShellSession = { cmd, output: [], errors: [], locations: [] }
-    this.#sessions.push(session)
-    if (this.#sessions.length > 50) this.#sessions.shift()
+  submitCurrentInput(): Promise<TrackedShellResult | null> {
+    const cmd = this.#inputLine.trim()
+    this.#inputLine = ''
+    if (!cmd) {
+      this.#term?.write('\r')
+      return Promise.resolve(null)
+    }
+    this.#term?.write('\x15')
+    return this.runTracked(cmd)
+  }
+
+  runTracked(command: string): Promise<TrackedShellResult> {
+    const cmd = command.trim()
+    if (!cmd) {
+      const now = new Date().toISOString()
+      return Promise.resolve({ id: '', command: cmd, cwd: this.#cwd, startedAt: now, endedAt: now, stdout: '', stderr: '', locations: [] })
+    }
+
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`
+    const run = this.#startRun(id, cmd)
+
+    if (!this.#term) {
+      const result = spawnSync(cmd, {
+        cwd: this.#cwd,
+        encoding: 'utf8',
+        shell: true,
+        timeout: 120000,
+      })
+      run.stdout = trimTail(result.stdout ?? '')
+      run.stderr = trimTail(result.stderr ?? '')
+      run.exitCode = result.status ?? undefined
+      run.endedAt = new Date().toISOString()
+      for (const line of `${run.stdout}\n${run.stderr}`.split('\n')) {
+        const parsed = parseErrorLine(line)
+        if (parsed.location) run.locations.push(parsed.location)
+      }
+      return Promise.resolve({ ...run })
+    }
+
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        this.#tracked.delete(id)
+        run.endedAt = new Date().toISOString()
+        resolve({ ...run })
+      }, 120000)
+
+      this.#tracked.set(id, { run, timer, resolve })
+      const sentinel = `__CODECLAW_EXIT_${id}:`
+      this.#term?.write(`(${cmd}); __codeclaw_status=$?; printf '\\n${sentinel}%s\\n' "$__codeclaw_status"\r`)
+    })
+  }
+
+  #startRun(id: string, command: string): ShellRun {
+    const run: ShellRun = {
+      id,
+      command,
+      cwd: this.#cwd,
+      startedAt: new Date().toISOString(),
+      stdout: '',
+      stderr: '',
+      locations: [],
+    }
+    this.#runs.push(run)
+    if (this.#runs.length > 50) this.#runs.shift()
+    return run
+  }
+
+  #handleTrackedExit(text: string): boolean {
+    const match = text.match(/__CODECLAW_EXIT_([^:]+):(\d+)/)
+    if (!match) return false
+
+    const tracked = this.#tracked.get(match[1]!)
+    if (!tracked) return true
+
+    clearTimeout(tracked.timer)
+    this.#tracked.delete(match[1]!)
+    tracked.run.exitCode = parseInt(match[2]!, 10)
+    tracked.run.endedAt = new Date().toISOString()
+    tracked.resolve({ ...tracked.run })
+    return true
   }
 
   resize(cols: number, rows: number) { this.#term?.resize(cols, rows) }
@@ -179,4 +278,17 @@ export class ShellSidecar extends EventEmitter {
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[^[\]]/g
 function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '').replace(/\r/g, '')
+}
+
+function isPlainInput(data: string): boolean {
+  return data.length > 0 && /^[\x20-\x7e]+$/.test(data)
+}
+
+function appendTail(run: ShellRun, field: 'stdout' | 'stderr', line: string): void {
+  const next = run[field] ? `${run[field]}\n${line}` : line
+  run[field] = trimTail(next)
+}
+
+function trimTail(text: string): string {
+  return text.replace(/\r/g, '').split('\n').slice(-200).join('\n').trimEnd()
 }

@@ -3,8 +3,24 @@ import { basename, resolve as resolvePath } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
-import { ShellSidecar, type ShellLine, type ShellSession, type ParsedLocation } from './shell.js'
+import { ShellSidecar, type ShellLine, type ParsedLocation } from './shell.js'
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
+import {
+  applyPatchProposal,
+  assessPatchRisk,
+  buildTrace,
+  collectGitContext,
+  generatePatchProposal,
+  loadCodeClawProject,
+  makeTraceId,
+  readLatestTrace,
+  writeTrace,
+  type FixContext,
+  type PatchProposal,
+  type PatchRiskAssessment,
+  type TraceSummary,
+  type VerifyResult,
+} from './codeclaw.js'
 import { loadConfig, mergeLeaderTree, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
 import {
   loadGitStatus, loadFileHunks, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
@@ -69,6 +85,16 @@ type PromptState =
 type AiMessage = { role: 'user' | 'assistant'; content: string }
 
 type LspTarget = { path?: string; row?: number; col?: number }
+
+type CodeClawFixState =
+  | { status: 'idle' }
+  | { status: 'generating'; traceId: string; startedAt: string; context: FixContext }
+  | { status: 'proposal'; traceId: string; startedAt: string; context: FixContext; proposal: PatchProposal; risk: PatchRiskAssessment; mediumConfirm: boolean }
+  | { status: 'editing'; traceId: string; startedAt: string; context: FixContext; proposal: PatchProposal }
+  | { status: 'applying'; traceId: string; startedAt: string; context: FixContext; proposal: PatchProposal; risk: PatchRiskAssessment }
+  | { status: 'trace'; latest: TraceSummary | null }
+  | { status: 'done'; message: string; tracePath: string; verify?: VerifyResult }
+  | { status: 'error'; message: string; tracePath?: string }
 
 type Panel =
   | null
@@ -272,6 +298,8 @@ function buildLeaderMap(
     openChat: () => void
     triggerCompletion: () => void
     explainError: () => void
+    fixFailure: () => void
+    showTrace: () => void
   },
   git: {
     open: () => void
@@ -307,6 +335,8 @@ function buildLeaderMap(
       p: ai.openChat,
       c: ai.triggerCompletion,
       e: ai.explainError,
+      f: ai.fixFailure,
+      t: ai.showTrace,
     },
     g: {
       g: git.open,
@@ -321,7 +351,7 @@ function buildLeaderMap(
 }
 
 const NODE_LABELS: Record<string, string> = {
-  q: 'quit',    b: 'buffer',  f: 'file',    t: 'toggle',
+  q: 'quit',    b: 'buffer',  f: 'file/fix', t: 'toggle',
   s: 'save',    k: 'kill',    n: 'next',    p: 'prev',
   N: 'new',     l: 'list',    w: 'save+quit',
   a: 'ai',      c: 'code',     e: 'explain-err',
@@ -441,7 +471,7 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
 // ── AI chat panel ─────────────────────────────────────────────────────────────
 
 function AiPanel({
-  messages, input, streaming, focused, width, navHint,
+  messages, input, streaming, focused, width, navHint, fixState,
 }: {
   messages: AiMessage[]
   input: string
@@ -449,17 +479,23 @@ function AiPanel({
   focused: boolean
   width: number
   navHint?: string
+  fixState: CodeClawFixState
 }) {
   const borderColor = focused ? C.green : C.grey
   const totalRows = process.stdout.rows ?? 24
   const msgAreaRows = Math.max(3, totalRows - 8)
   const visible = messages.slice(-msgAreaRows)
+  const fixLines = codeClawFixLines(fixState, msgAreaRows)
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width}>
-      <Text bold color={borderColor}>*AI*  {streaming ? '...' : focused ? 'i=send  Esc=focus editor' : 'SPC a p=focus'}</Text>
+      <Text bold color={borderColor}>*AI*  {streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : 'SPC a p=focus'}</Text>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
-        {visible.length === 0
+        {fixLines.length > 0
+          ? fixLines.map((line, i) => (
+              <Text key={i} color={line.color} wrap={line.wrap ?? 'truncate'}>{line.text || ' '}</Text>
+            ))
+          : visible.length === 0
           ? <Text color={C.grey}>Ask anything about the current file...</Text>
           : visible.map((msg, i) => (
               <Box key={i} flexDirection="column" marginBottom={1}>
@@ -485,6 +521,101 @@ function AiPanel({
       )}
     </Box>
   )
+}
+
+function codeClawFixLines(
+  state: CodeClawFixState,
+  maxRows: number,
+): Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> {
+  if (state.status === 'idle') return []
+  if (state.status === 'generating') {
+    return [
+      { text: 'CodeClaw fix', color: C.cyan },
+      { text: 'Building session context and asking AI for a structured patch...', color: C.grey },
+    ]
+  }
+  if (state.status === 'applying') {
+    return [
+      { text: 'CodeClaw fix', color: C.cyan },
+      { text: 'Applying patch and rerunning verification...', color: C.grey },
+    ]
+  }
+  if (state.status === 'trace') {
+    if (!state.latest) {
+      return [
+        { text: 'CodeClaw trace', color: C.cyan },
+        { text: 'No trace entries yet. Run SPC a f, accept or reject a proposal, then come back here.', color: C.grey, wrap: 'wrap' },
+      ]
+    }
+    const { trace, path } = state.latest
+    const lines: Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> = [
+      { text: 'CodeClaw trace last', color: C.cyan },
+      { text: `Workflow: ${trace.workflow}`, color: C.fg },
+      { text: `Failure command: ${trace.input?.command ?? '(unknown)'}`, color: C.fg, wrap: 'wrap' },
+      { text: `Root cause: ${trace.proposal?.rootCause ?? '(none recorded)'}`, color: C.fg, wrap: 'wrap' },
+      { text: `Files changed: ${trace.proposal?.filesChanged?.join(', ') || '(none)'}`, color: C.fg, wrap: 'wrap' },
+      { text: `Accepted: ${trace.accepted ? 'yes' : 'no'}`, color: trace.accepted ? C.green : C.yellow },
+      { text: `Risk: ${trace.proposal?.assessedRisk?.level ?? trace.proposal?.risk ?? '(unknown)'}`, color: C.yellow },
+      { text: `Verify command: ${trace.verify?.command ?? '(not run)'}`, color: C.fg, wrap: 'wrap' },
+      { text: `Verify result: ${trace.verify ? (trace.verify.passed ? 'passed' : 'failed') : '(not run)'}`, color: trace.verify?.passed ? C.green : C.red },
+      { text: `Trace file: ${path}`, color: C.grey, wrap: 'wrap' },
+    ]
+    return lines.slice(0, maxRows)
+  }
+  if (state.status === 'done') {
+    return [
+      { text: 'CodeClaw fix complete', color: C.green },
+      { text: state.message, color: C.fg, wrap: 'wrap' },
+      { text: `Trace: ${state.tracePath}`, color: C.grey, wrap: 'wrap' },
+    ]
+  }
+  if (state.status === 'error') {
+    return [
+      { text: 'CodeClaw fix failed', color: C.red },
+      { text: state.message, color: C.fg, wrap: 'wrap' },
+      ...(state.tracePath ? [{ text: `Trace: ${state.tracePath}`, color: C.grey as ThemeColor, wrap: 'wrap' as const }] : []),
+    ]
+  }
+
+  const proposal = state.proposal
+  const risk = state.status === 'proposal' ? state.risk : assessPatchRisk(proposal)
+  const lines: Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> = [
+    { text: 'Root cause:', color: C.cyan },
+    { text: proposal.rootCause, color: C.fg, wrap: 'wrap' },
+    { text: 'Summary:', color: C.cyan },
+    { text: proposal.summary, color: C.fg, wrap: 'wrap' },
+    { text: 'Patch:', color: C.cyan },
+  ]
+
+  for (const file of proposal.files) {
+    lines.push({ text: file.path, color: C.yellow })
+    for (const diffLine of file.unifiedDiff.split('\n').slice(0, Math.max(6, maxRows - 12))) {
+      const color = diffLine.startsWith('+') && !diffLine.startsWith('+++') ? C.green
+        : diffLine.startsWith('-') && !diffLine.startsWith('---') ? C.red
+        : diffLine.startsWith('@@') ? C.magenta
+        : C.grey
+      lines.push({ text: diffLine, color })
+    }
+  }
+
+  lines.push({ text: 'Verify:', color: C.cyan })
+  lines.push({ text: proposal.verifyCommand, color: C.fg, wrap: 'wrap' })
+  lines.push({ text: `Risk: ${risk.level} (${risk.reasons.join('; ')})`, color: risk.level === 'high' ? C.red : risk.level === 'medium' ? C.yellow : C.green, wrap: 'wrap' })
+  if (proposal.notes?.length) {
+    lines.push({ text: `Notes: ${proposal.notes.join(' ')}`, color: C.grey, wrap: 'wrap' })
+  }
+  if (state.status === 'editing') {
+    lines.push({ text: 'Edit request, then press Enter to regenerate. Esc cancels edit.', color: C.yellow, wrap: 'wrap' })
+  } else if (risk.level === 'high') {
+    lines.push({ text: 'High risk: manual patch only. [r] reject  [e] edit prompt', color: C.red, wrap: 'wrap' })
+  } else if (risk.requiresConfirm && state.status === 'proposal' && state.mediumConfirm) {
+    lines.push({ text: 'Medium risk: press [a] again to confirm apply. [r] reject  [e] edit prompt', color: C.yellow, wrap: 'wrap' })
+  } else if (risk.requiresConfirm) {
+    lines.push({ text: 'Medium risk: [a] review confirm  [r] reject  [e] edit prompt', color: C.yellow, wrap: 'wrap' })
+  } else {
+    lines.push({ text: 'Accept? [a] apply  [r] reject  [e] edit prompt', color: C.yellow, wrap: 'wrap' })
+  }
+  return lines.slice(0, maxRows)
 }
 
 // ── Git panel ─────────────────────────────────────────────────────────────────
@@ -738,6 +869,7 @@ function App({
   const [aiMessages, setAiMessages] = React.useState<AiMessage[]>([])
   const [aiInput,    setAiInput]    = React.useState('')
   const [aiStreaming, setAiStreaming] = React.useState(false)
+  const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
 
   const pendingKeyRef    = React.useRef<string | null>(null)
   const yankRegisterRef  = React.useRef<string | null>(null)
@@ -803,6 +935,8 @@ function App({
       openChat: () => setPanel({ type: 'ai', focused: true }),
       triggerCompletion: () => triggerCompletion(),
       explainError: () => explainLastError(),
+      fixFailure: () => runCodeClawFix(),
+      showTrace: () => showLastTrace(),
     },
     {
       open: openGitPanel,
@@ -898,17 +1032,137 @@ function App({
       ? [
           `Explain and fix this shell error:`,
           ``,
-          `Command: \`${lastErr.cmd}\``,
+          `Command: \`${lastErr.command}\``,
           ``,
           `Errors:`,
-          ...lastErr.errors,
+          ...lastErr.stderr.split('\n').filter(Boolean),
           ``,
           `Output (last 20 lines):`,
-          ...lastErr.output.slice(-20),
+          ...lastErr.stdout.split('\n').slice(-20),
         ].join('\n')
       : 'No shell error detected yet. What can I help with?'
     setPanel({ type: 'ai', focused: false })
     sendAiMessage(text)
+  }
+
+  function buildFixContext(userRequest: string, previous?: FixContext): FixContext | null {
+    const lastFailedRun = shell.lastFailedRun ?? previous?.lastFailedRun
+    if (!lastFailedRun) return null
+
+    const project = loadCodeClawProject(process.cwd())
+    const activePath = snapshot?.filename ?? activeBuffer.filename ?? '*scratch*'
+    const activeContent = snapshot?.lines.join('\n') ?? ''
+
+    return {
+      activeFile: {
+        path: activePath,
+        content: activeContent,
+        cursor: snapshot?.cursor
+          ? { line: snapshot.cursor.row + 1, column: snapshot.cursor.col + 1 }
+          : undefined,
+      },
+      openBuffers: buffers
+        .filter(buffer => buffer.snapshot?.filename || buffer.filename)
+        .map(buffer => ({
+          path: buffer.snapshot?.filename ?? buffer.filename ?? buffer.name,
+          content: buffer.snapshot?.lines.join('\n') ?? '',
+        })),
+      lastFailedRun,
+      git: collectGitContext(process.cwd()),
+      rules: project.rules,
+      memory: project.memory,
+      userRequest,
+    }
+  }
+
+  function runCodeClawFix(
+    userRequest = 'Fix this failure using current session context.',
+    previous?: FixContext,
+  ) {
+    const context = buildFixContext(userRequest, previous)
+    if (!context) {
+      setFixState({ status: 'error', message: 'No failed tracked shell run yet. Run a command from the shell pane first.' })
+      setPanel({ type: 'ai', focused: false })
+      return
+    }
+
+    const startedAt = new Date().toISOString()
+    const traceId = makeTraceId(new Date(startedAt))
+    setFixState({ status: 'generating', traceId, startedAt, context })
+    setPanel({ type: 'ai', focused: false })
+    setAiStreaming(true)
+
+    aiAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    aiAbortRef.current = ctrl
+
+    void (async () => {
+      try {
+        const proposal = await generatePatchProposal(context, ctrl.signal)
+        setFixState({ status: 'proposal', traceId, startedAt, context, proposal, risk: assessPatchRisk(proposal), mediumConfirm: false })
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error)
+        const trace = buildTrace(traceId, startedAt, context, null, false, undefined, message)
+        const tracePath = writeTrace(process.cwd(), trace)
+        setFixState({ status: 'error', message, tracePath })
+      } finally {
+        setAiStreaming(false)
+      }
+    })()
+  }
+
+  function rejectCodeClawFix() {
+    if (fixState.status !== 'proposal' && fixState.status !== 'editing') return
+    const trace = buildTrace(fixState.traceId, fixState.startedAt, fixState.context, fixState.proposal, false)
+    const tracePath = writeTrace(process.cwd(), trace)
+    setFixState({ status: 'done', message: 'Patch rejected. No files changed.', tracePath })
+  }
+
+  function acceptCodeClawFix() {
+    if (fixState.status !== 'proposal') return
+    const { traceId, startedAt, context, proposal, risk } = fixState
+    if (!risk.canAutoApply) return
+    if (risk.requiresConfirm && !fixState.mediumConfirm) {
+      setFixState({ ...fixState, mediumConfirm: true })
+      return
+    }
+    setFixState({ status: 'applying', traceId, startedAt, context, proposal, risk })
+
+    void (async () => {
+      const applied = applyPatchProposal(process.cwd(), proposal)
+      if (!applied.ok) {
+        const trace = buildTrace(traceId, startedAt, context, proposal, true, undefined, applied.error)
+        const tracePath = writeTrace(process.cwd(), trace)
+        setFixState({ status: 'error', message: applied.error, tracePath })
+        return
+      }
+
+      const activePath = snapshot?.filename ?? activeBuffer.filename
+      if (activePath && proposal.files.some(file => resolvePath(file.path) === resolvePath(activePath))) {
+        sidecar.open(activePath)
+      }
+
+      const verifyCommand = proposal.verifyCommand || context.lastFailedRun.command
+      const verify = await shell.runTracked(verifyCommand)
+      const result: VerifyResult = { run: verify }
+      const trace = buildTrace(traceId, startedAt, context, proposal, true, result)
+      const tracePath = writeTrace(process.cwd(), trace)
+      const passed = result.run.exitCode === 0
+      setFixState({
+        status: 'done',
+        message: passed
+          ? `Verification passed: ${result.run.command}`
+          : `Verification failed${result.run.exitCode === undefined ? '' : ` with exit ${result.run.exitCode}`}: ${result.run.command}`,
+        tracePath,
+        verify: result,
+      })
+      setPanel({ type: 'shell' })
+    })()
+  }
+
+  function showLastTrace() {
+    setFixState({ status: 'trace', latest: readLatestTrace(process.cwd()) })
+    setPanel({ type: 'ai', focused: false })
   }
 
   function openGitPanel() {
@@ -953,7 +1207,7 @@ function App({
     else if (t.startsWith('e ') && t.length > 2) {
       actions.openFile(t.slice(2).trim())
     } else if (t.startsWith('!') && t.length > 1) {
-      shell.write(t.slice(1) + '\r')
+      void shell.runTracked(t.slice(1))
       setPanel({ type: 'shell' })
     }
   }
@@ -986,6 +1240,17 @@ function App({
     }
 
     // ── AI panel (focused) ───────────────────────────────────────────────────
+    if (panel?.type === 'ai' && fixState.status === 'proposal' && !aiStreaming) {
+      if (input === 'a') { acceptCodeClawFix(); return }
+      if (input === 'r') { rejectCodeClawFix(); return }
+      if (input === 'e') {
+        setFixState({ ...fixState, status: 'editing' })
+        setAiInput(fixState.context.userRequest)
+        setPanel({ type: 'ai', focused: true })
+        return
+      }
+    }
+
     if (panel?.type === 'ai' && panel.focused) {
       if (key.escape)                                  { setPanel({ type: 'ai', focused: false }); return }
       if (key.ctrl && input === 'c')                   { aiAbortRef.current?.abort(); setAiStreaming(false); return }
@@ -993,7 +1258,16 @@ function App({
         if (aiNavLoc) { actions.openFile(aiNavLoc.file, { row: aiNavLoc.row, col: aiNavLoc.col }); setPanel({ type: 'ai', focused: false }) }
         return
       }
-      if (key.return)                                  { sendAiMessage(); return }
+      if (key.return) {
+        if (fixState.status === 'editing') {
+          const request = aiInput.trim() || fixState.context.userRequest
+          setAiInput('')
+          runCodeClawFix(request, fixState.context)
+        } else {
+          sendAiMessage()
+        }
+        return
+      }
       if (key.backspace || key.delete)                 { setAiInput(prev => prev.slice(0, -1)); return }
       if (!key.ctrl && !key.meta && printable(input))  { setAiInput(prev => prev + input); return }
       return
@@ -1085,7 +1359,7 @@ function App({
         if (loc) { actions.openFile(loc.file, { row: loc.row, col: loc.col }); setPanel(null) }
         return
       }
-      if (key.return)                                  { shell.write('\r');    return }
+      if (key.return)                                  { void shell.submitCurrentInput(); return }
       if (key.backspace || key.delete)                 { shell.write('\x7f'); return }
       if (key.upArrow)                                 { shell.write('\x1b[A'); return }
       if (key.downArrow)                               { shell.write('\x1b[B'); return }
@@ -1418,6 +1692,7 @@ function App({
           focused={panel.focused}
           width={aiWidth}
           navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
+          fixState={fixState}
         />
       </Box>
     )

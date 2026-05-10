@@ -1,0 +1,9 @@
+{
+  "name": "broken-counter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "cd ../.. && npm --prefix app exec tsx examples/broken-counter/test/counter.test.ts"
+  }
+}

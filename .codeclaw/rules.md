@@ -1,0 +1,5 @@
+- Make the smallest safe change.
+- Do not refactor unrelated code.
+- Preserve public APIs unless explicitly requested.
+- If changing behavior, add or update a test.
+- Prefer patches that can be verified by one command.

@@ -7,9 +7,9 @@ function buildShellContext(sessions?: ShellSession[], fallbackLines?: ShellLine[
   if (sessions?.length) {
     const recent = sessions.slice(-5)
     const parts = recent.map(s => {
-      const out = s.output.slice(-20).join('\n')
-      const errMark = s.errors.length ? ` [${s.errors.length} error(s)]` : ''
-      return `$ ${s.cmd}${errMark}\n${out}`
+      const out = s.stdout.split('\n').slice(-20).join('\n')
+      const errMark = s.exitCode && s.exitCode !== 0 ? ` [exit ${s.exitCode}]` : ''
+      return `$ ${s.command}${errMark}\n${out}`
     })
     return `\n\nRecent shell sessions:\n${parts.join('\n---\n')}`
   }
