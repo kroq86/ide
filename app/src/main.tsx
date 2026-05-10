@@ -1,6 +1,6 @@
 import React from 'react'
 import { realpathSync } from 'node:fs'
-import { dirname, join, resolve as resolvePath } from 'node:path'
+import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
@@ -48,6 +48,27 @@ import {
 } from './git.js'
 import { readDiredEntries, type DiredEntry } from './dired.js'
 
+
+/** Keep header readable on narrow terminals (avoid path/status/search overlapping). */
+function truncateChars(s: string, max: number): string {
+  if (max <= 0) return ''
+  if (s.length <= max) return s
+  if (max <= 1) return '…'
+  return `${s.slice(0, max - 1)}…`
+}
+
+function editorHeaderPath(title: string, maxChars: number): string {
+  if (title.length <= maxChars) return title
+  const base = basename(title)
+  const tail = `…/${base}`
+  if (tail.length <= maxChars) return tail
+  return truncateChars(base, maxChars)
+}
+
+function editorHeaderMeta(status: string, searchQuery: string, matchCount: number, maxChars: number): string {
+  const tail = searchQuery ? `  /${searchQuery} (${matchCount})` : ''
+  return truncateChars(`${status}${tail}`, maxChars)
+}
 
 type ThemeColor = `#${string}`
 type Theme = {
@@ -1025,11 +1046,16 @@ function EditorPane({
   const title  = snapshot?.filename ?? filename ?? bufferName
   const dirty  = snapshot?.dirty ?? false
   const diagnosticCount = snapshot?.diagnostics?.length ?? 0
+  const matchCount = searchQuery ? findMatches(lines, searchQuery).length : 0
 
   const totalRows = process.stdout.rows ?? 24
   const totalCols = process.stdout.columns ?? 80
   const effectiveCols = paneWidth ?? totalCols
-  const visibleRows = Math.max(1, paneHeight - 4)
+  const headerBarW = Math.max(24, effectiveCols - 4)
+  const titleMax = Math.max(12, headerBarW - 46)
+  const pathShown = editorHeaderPath(title, titleMax)
+  const metaShown = editorHeaderMeta(status, searchQuery, matchCount, headerBarW)
+  const visibleRows = Math.max(1, paneHeight - 5)
   const lineNumWidth = Math.max(2, String(Math.max(1, lines.length)).length)
   const lineGutterCols = lineNumWidth + 1
   const visibleCols = Math.max(20, effectiveCols - 4 - lineGutterCols)
@@ -1056,7 +1082,7 @@ function EditorPane({
   } else if (mode === 'command') {
     hintLine = `:${cmdBuf}_`
   } else if (mode === 'search') {
-    hintLine = `/${searchBuf}_`
+    hintLine = `/${searchBuf}_  Enter=normal  i/a/I/A/o/O=find & insert  Esc=cancel`
   } else if (mode === 'insert') {
     hintLine = 'Tab=complete  Esc=normal'
   } else if (mode === 'visual') {
@@ -1065,7 +1091,6 @@ function EditorPane({
     hintLine = 'SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
   }
 
-  const matchCount = searchQuery ? findMatches(lines, searchQuery).length : 0
   const sortedBuffers = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
   const filteredBuffers = prompt?.type === 'buffer'
     ? filterBuffers(sortedBuffers, prompt.query)
@@ -1074,15 +1099,18 @@ function EditorPane({
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={paneWidth} height={paneHeight}>
-      <Box flexDirection="row" gap={2}>
-        <Text bold color={modeColor}>{`[${modeLabel}]`}</Text>
-        <Text bold color={C.magenta}>qe</Text>
-        <Text color={dirty ? C.orange : C.fg}>{`${title}${dirty ? ' *' : ''}`}</Text>
-        <Text color={C.grey}>{`${bufferIndex + 1}/${bufferCount}`}</Text>
-        <Text color={C.grey}>{`${cursor.row + 1}:${cursor.col + 1}`}</Text>
-        {diagnosticCount > 0 && <Text color={C.orange}>{`diag ${diagnosticCount}`}</Text>}
-        <Text color={C.grey}>{status}</Text>
-        {searchQuery && <Text color={C.yellow}>{`  /${searchQuery} (${matchCount})`}</Text>}
+      <Box flexDirection="column">
+        <Box flexDirection="row" gap={2}>
+          <Text bold color={modeColor}>{`[${modeLabel}]`}</Text>
+          <Text bold color={C.magenta}>qe</Text>
+          <Text color={dirty ? C.orange : C.fg}>{`${pathShown}${dirty ? ' *' : ''}`}</Text>
+          <Text color={C.grey}>{`${bufferIndex + 1}/${bufferCount}`}</Text>
+          <Text color={C.grey}>{`${cursor.row + 1}:${cursor.col + 1}`}</Text>
+          {diagnosticCount > 0 && <Text color={C.orange}>{`diag ${diagnosticCount}`}</Text>}
+        </Box>
+        <Box flexDirection="row">
+          <Text color={searchQuery ? C.yellow : C.grey}>{metaShown}</Text>
+        </Box>
       </Box>
 
       <Box flexDirection="column" marginTop={1}>
@@ -1758,6 +1786,12 @@ function App({
     sidecar.moveTo(m.row, m.col)
   }
 
+  const clearSearchHighlights = React.useCallback(() => {
+    setSearchQuery('')
+    searchQueryRef.current = ''
+    searchIdxRef.current = -1
+  }, [])
+
   useInput((input, key) => {
     if (key.ctrl && input === 'q') { actions.quitAll(); return }
     if (key.ctrl && input === 't') {
@@ -2220,14 +2254,64 @@ function App({
 
     // ── Search mode ───────────────────────────────────────────────────────────
     if (mode === 'search') {
-      if (key.return) {
+      const commitSearchFromPrompt = (keepHighlights: boolean) => {
         const q = searchBuf
-        setSearchQuery(q)
         searchQueryRef.current = q
         searchIdxRef.current = -1
-        setMode('normal')
+        visualExpandHistoryRef.current = []
+        setVisualAnchor(null)
+        setVisualLineMode(false)
         setSearchBuf('')
         jumpToMatch(1)
+        if (keepHighlights) {
+          setSearchQuery(q)
+        } else {
+          setSearchQuery('')
+          searchQueryRef.current = ''
+        }
+      }
+
+      if (key.return) {
+        commitSearchFromPrompt(true)
+        setMode('normal')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'i') {
+        commitSearchFromPrompt(false)
+        setMode('insert')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'a') {
+        commitSearchFromPrompt(false)
+        sidecar.move('right')
+        setMode('insert')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'I') {
+        commitSearchFromPrompt(false)
+        sidecar.move('home')
+        setMode('insert')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'A') {
+        commitSearchFromPrompt(false)
+        sidecar.move('end')
+        setMode('insert')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'o') {
+        commitSearchFromPrompt(false)
+        sidecar.move('end')
+        sidecar.insert('\n')
+        setMode('insert')
+        return
+      }
+      if (!key.ctrl && !key.meta && input === 'O') {
+        commitSearchFromPrompt(false)
+        sidecar.move('home')
+        sidecar.insert('\n')
+        sidecar.move('up')
+        setMode('insert')
         return
       }
       if (key.backspace || key.delete) { setSearchBuf(prev => prev.slice(0, -1)); return }
@@ -2260,6 +2344,16 @@ function App({
 
     // ── Visual mode ───────────────────────────────────────────────────────────
     if (mode === 'visual') {
+      if (input === '/') {
+        visualExpandHistoryRef.current = []
+        setVisualAnchor(null)
+        setVisualLineMode(false)
+        setMode('search')
+        setSearchBuf('')
+        pendingKeyRef.current = null
+        return
+      }
+
       if (input === 'v' && snapshot && visualAnchor) {
         const curSnap: VisualSnap = {
           anchor: { ...visualAnchor },
@@ -2325,7 +2419,7 @@ function App({
         } else {
           sidecar.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
         }
-        if (input === 'c') { setMode('insert') } else { enterNormal() }
+        if (input === 'c') { clearSearchHighlights(); setMode('insert') } else { enterNormal() }
         return
       }
       return
@@ -2362,12 +2456,16 @@ function App({
     // Enter command mode
     if (input === ':') { setMode('command'); setCmdBuf(''); pendingKeyRef.current = null; return }
 
-    // Enter search mode
-    if (input === '/') { setMode('search'); setSearchBuf(''); pendingKeyRef.current = null; return }
-
-    // Search navigation
-    if (input === 'n') { jumpToMatch(1); return }
-    if (input === 'N') { jumpToMatch(-1); return }
+    // Enter search mode (clear any stale visual — should already be empty in normal)
+    if (input === '/') {
+      visualExpandHistoryRef.current = []
+      setVisualAnchor(null)
+      setVisualLineMode(false)
+      setMode('search')
+      setSearchBuf('')
+      pendingKeyRef.current = null
+      return
+    }
 
     // Clear search highlight
     if (key.ctrl && input === 'h') { setSearchQuery(''); searchQueryRef.current = ''; return }
@@ -2383,19 +2481,26 @@ function App({
     const pending = pendingKeyRef.current
     pendingKeyRef.current = null
 
-    if (pending === 'g') { if (input === 'g') sidecar.move('fileStart'); return }
-    if (pending === 'd') {
+    if (pending === 'g') {
+      if (input === 'g') {
+        sidecar.move('fileStart')
+        return
+      }
+      /* incomplete `gg` — fall through so e.g. `n` still runs search-next */
+    } else if (pending === 'd') {
       if (input === 'd' && snapshot) {
         yankRegisterRef.current = snapshot.lines[snapshot.cursor.row] ?? ''
         sidecar.deleteLine()
       }
       return
-    }
-    if (pending === 'y') {
+    } else if (pending === 'y') {
       if (input === 'y' && snapshot)
         yankRegisterRef.current = snapshot.lines[snapshot.cursor.row] ?? ''
       return
     }
+
+    if (input === 'n') { jumpToMatch(1); return }
+    if (input === 'N') { jumpToMatch(-1); return }
 
     // ── Single-key normal mode ────────────────────────────────────────────────
     switch (input) {
@@ -2460,14 +2565,14 @@ function App({
           setMode('visual')
         }
         break
-      case 'i': setMode('insert'); break
-      case 'I': sidecar.move('home'); setMode('insert'); break
-      case 'a': sidecar.move('right'); setMode('insert'); break
-      case 'A': sidecar.move('end');   setMode('insert'); break
+      case 'i': clearSearchHighlights(); setMode('insert'); break
+      case 'I': sidecar.move('home'); clearSearchHighlights(); setMode('insert'); break
+      case 'a': sidecar.move('right'); clearSearchHighlights(); setMode('insert'); break
+      case 'A': sidecar.move('end');   clearSearchHighlights(); setMode('insert'); break
       case 'o':
-        sidecar.move('end'); sidecar.insert('\n'); setMode('insert'); break
+        sidecar.move('end'); sidecar.insert('\n'); clearSearchHighlights(); setMode('insert'); break
       case 'O':
-        sidecar.move('home'); sidecar.insert('\n'); sidecar.move('up'); setMode('insert'); break
+        sidecar.move('home'); sidecar.insert('\n'); sidecar.move('up'); clearSearchHighlights(); setMode('insert'); break
     }
   })
 

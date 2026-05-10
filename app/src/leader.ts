@@ -27,7 +27,7 @@ export function isLeafAction(v: (() => void) | LeaderNode): v is () => void {
 
 export const NODE_LABELS: Record<string, string> = {
   q: 'quit',    b: 'buffer',  f: 'file/fix', t: 'toggle',
-  s: 'save',    k: 'kill',    n: 'next',     p: 'prev',
+  s: 'save',    k: 'kill',    n: 'next',     p: 'parameters',
   N: 'new',     l: 'list',    w: 'save+quit',
   a: 'ai',      c: 'code',   e: 'explain-err',
   g: 'git',     d: 'definition', r: 'refresh',
@@ -60,8 +60,8 @@ export const COMMAND_LABELS: Record<string, string> = {
   'g s': 'git: stage current',
   'c h': 'code: hover (LSP)',
   'c d': 'code: go to definition',
-  'c e': 'config: edit config file',
-  'c r': 'config: reload config',
+  'p e': 'config: edit config file',
+  'p r': 'config: reload config',
   'm t f': 'mode: test current file',
   'm t a': 'mode: test all',
   ':': 'command palette',
@@ -177,6 +177,8 @@ export function buildLeaderMap(
     c: {
       h: lsp.hover,
       d: lsp.definition,
+    },
+    p: {
       e: config.open,
       r: config.reload,
     },

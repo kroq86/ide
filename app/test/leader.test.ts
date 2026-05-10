@@ -138,7 +138,8 @@ describe('buildLeaderMap — specific key presence', () => {
     'SPC f f', 'SPC f s',
     'SPC t t', 'SPC t a',
     'SPC q q', 'SPC q w',
-    'SPC c h', 'SPC c d', 'SPC c e', 'SPC c r',
+    'SPC c h', 'SPC c d',
+    'SPC p e', 'SPC p r',
   ]
 
   for (const key of required) {
@@ -198,6 +199,7 @@ describe('NODE_LABELS', () => {
     assert.equal(NODE_LABELS['g'], 'git')
     assert.equal(NODE_LABELS['m'], 'mode')
     assert.equal(NODE_LABELS['c'], 'code')
+    assert.equal(NODE_LABELS['p'], 'parameters')
   })
 })
 
