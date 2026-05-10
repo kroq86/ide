@@ -1,0 +1,18 @@
+{
+  "id": "2026-05-10T16-39-24-codeclaw-fix",
+  "workflow": "fix",
+  "startedAt": "2026-05-10T16:39:24.425Z",
+  "input": {
+    "command": "npm --prefix examples/broken-counter test",
+    "activeFile": "examples/broken-counter/src/counter.ts",
+    "gitBranch": "main"
+  },
+  "failure": {
+    "exitCode": 254,
+    "startedAt": "2026-05-10T16:37:59.853Z",
+    "endedAt": "2026-05-10T16:38:00.063Z",
+    "locations": []
+  },
+  "accepted": false,
+  "error": "This operation was aborted"
+}

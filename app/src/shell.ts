@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -32,6 +32,7 @@ export type ShellRun = {
 
 export type ShellSession = ShellRun
 export type TrackedShellResult = ShellRun
+export type ShellMode = 'pty' | 'runner'
 
 function parseErrorLine(text: string): { isError: boolean; location: ParsedLocation | null } {
   const tsMatch = text.match(/^(.+?\.tsx?)\((\d+),(\d+)\):\s+(?:error|warning)\s+TS\d+:\s+(.*)$/)
@@ -84,22 +85,31 @@ function parseErrorLine(text: string): { isError: boolean; location: ParsedLocat
 }
 
 export class ShellSidecar extends EventEmitter {
-  #term: ReturnType<typeof pty.spawn>
+  #term: ReturnType<typeof pty.spawn> | null = null
   #cwd: string
   #lines: ShellLine[] = []
   #buf = ''
   #inputLine = ''
   #runs: ShellRun[] = []
+  #mode: ShellMode = 'pty'
+  #spawnError: string | undefined
+  #runnerChild: ReturnType<typeof spawn> | null = null
   #tracked = new Map<string, {
     run: ShellRun
     timer: ReturnType<typeof setTimeout>
     resolve: (result: TrackedShellResult) => void
   }>()
 
-  constructor(cwd: string, cols: number, rows: number) {
+  constructor(cwd: string, cols: number, rows: number, options: { forceRunner?: boolean } = {}) {
     super()
     this.#cwd = cwd
     const shell = process.env['SHELL'] ?? '/bin/sh'
+    if (options.forceRunner) {
+      this.#mode = 'runner'
+      this.#pushLine('shell mode: runner', false)
+      return
+    }
+
     try {
       this.#term = pty.spawn(shell, [], {
         name: 'xterm-256color',
@@ -108,11 +118,15 @@ export class ShellSidecar extends EventEmitter {
         cwd,
         env: process.env as Record<string, string>,
       })
-    } catch {
-      this.#lines.push({ text: '(shell unavailable in this environment)', isError: true })
-      this.#term = null as unknown as ReturnType<typeof pty.spawn>
+    } catch (error) {
+      this.#mode = 'runner'
+      this.#spawnError = error instanceof Error ? error.message : String(error)
+      this.#pushLine(`shell mode: runner (PTY unavailable: ${this.#spawnError})`, true)
       return
     }
+
+    this.#mode = 'pty'
+    this.#pushLine('shell mode: pty', false)
 
     this.#term.onData((data: string) => {
       this.#buf += data
@@ -125,9 +139,7 @@ export class ShellSidecar extends EventEmitter {
         if (this.#handleTrackedExit(text.trim())) continue
 
         const { isError, location } = parseErrorLine(text)
-        const line: ShellLine = { text, isError }
-        this.#lines.push(line)
-        if (this.#lines.length > 500) this.#lines.shift()
+        this.#pushLine(text, isError)
 
         const run = this.#runs[this.#runs.length - 1]
         if (run && !run.endedAt) {
@@ -136,7 +148,6 @@ export class ShellSidecar extends EventEmitter {
           if (location) run.locations.push(location)
         }
 
-        this.emit('line', line)
       }
       this.emit('update')
     })
@@ -147,6 +158,10 @@ export class ShellSidecar extends EventEmitter {
   get lines(): ShellLine[] { return this.#lines }
 
   get currentLine(): string { return stripAnsi(this.#buf) }
+
+  get mode(): ShellMode { return this.#mode }
+
+  get spawnError(): string | undefined { return this.#spawnError }
 
   get sessions(): ShellSession[] { return this.#runs }
 
@@ -188,6 +203,11 @@ export class ShellSidecar extends EventEmitter {
     this.#term?.write(data)
   }
 
+  cancelRunner(): void {
+    this.#runnerChild?.kill('SIGTERM')
+    this.#runnerChild = null
+  }
+
   submitCurrentInput(): Promise<TrackedShellResult | null> {
     const cmd = this.#inputLine.trim()
     this.#inputLine = ''
@@ -209,22 +229,8 @@ export class ShellSidecar extends EventEmitter {
     const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`
     const run = this.#startRun(id, cmd)
 
-    if (!this.#term) {
-      const result = spawnSync(cmd, {
-        cwd: this.#cwd,
-        encoding: 'utf8',
-        shell: true,
-        timeout: 120000,
-      })
-      run.stdout = trimTail(result.stdout ?? '')
-      run.stderr = trimTail(result.stderr ?? '')
-      run.exitCode = result.status ?? undefined
-      run.endedAt = new Date().toISOString()
-      for (const line of `${run.stdout}\n${run.stderr}`.split('\n')) {
-        const parsed = parseErrorLine(line)
-        if (parsed.location) run.locations.push(parsed.location)
-      }
-      return Promise.resolve({ ...run })
+    if (this.#mode === 'runner' || !this.#term) {
+      return this.#runProcess(cmd, run)
     }
 
     return new Promise(resolve => {
@@ -237,6 +243,54 @@ export class ShellSidecar extends EventEmitter {
       this.#tracked.set(id, { run, timer, resolve })
       const sentinel = `__CODECLAW_EXIT_${id}:`
       this.#term?.write(`(${cmd}); __codeclaw_status=$?; printf '\\n${sentinel}%s\\n' "$__codeclaw_status"\r`)
+    })
+  }
+
+  #runProcess(cmd: string, run: ShellRun): Promise<TrackedShellResult> {
+    this.#pushLine(`$ ${cmd}`, false)
+    return new Promise(resolve => {
+      const child = spawn(cmd, {
+        cwd: this.#cwd,
+        env: process.env,
+        shell: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      this.#runnerChild = child
+      const timer = setTimeout(() => {
+        this.#pushLine('command timed out after 120s', true)
+        appendTail(run, 'stderr', 'command timed out after 120s')
+        child.kill('SIGTERM')
+      }, 120000)
+
+      const consume = (chunk: Buffer | string, isError: boolean) => {
+        for (const raw of String(chunk).split('\n')) {
+          const text = stripAnsi(raw).trimEnd()
+          if (!text.trim()) continue
+          const parsed = parseErrorLine(text)
+          const errorLine = isError || parsed.isError
+          this.#pushLine(text, errorLine)
+          appendTail(run, errorLine ? 'stderr' : 'stdout', text)
+          if (parsed.location) run.locations.push(parsed.location)
+        }
+        this.emit('update')
+      }
+
+      child.stdout?.on('data', chunk => consume(chunk, false))
+      child.stderr?.on('data', chunk => consume(chunk, true))
+      child.on('error', error => {
+        const message = error instanceof Error ? error.message : String(error)
+        this.#pushLine(message, true)
+        appendTail(run, 'stderr', message)
+      })
+      child.on('close', code => {
+        clearTimeout(timer)
+        if (this.#runnerChild === child) this.#runnerChild = null
+        run.exitCode = code ?? undefined
+        run.endedAt = new Date().toISOString()
+        this.#pushLine(`exit ${run.exitCode ?? 'unknown'}`, run.exitCode !== 0)
+        this.emit('update')
+        resolve({ ...run })
+      })
     })
   }
 
@@ -270,9 +324,19 @@ export class ShellSidecar extends EventEmitter {
     return true
   }
 
+  #pushLine(text: string, isError: boolean): void {
+    const line: ShellLine = { text, isError }
+    this.#lines.push(line)
+    if (this.#lines.length > 500) this.#lines.shift()
+    this.emit('line', line)
+  }
+
   resize(cols: number, rows: number) { this.#term?.resize(cols, rows) }
 
-  kill() { this.#term?.kill() }
+  kill() {
+    this.cancelRunner()
+    this.#term?.kill()
+  }
 }
 
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[^[\]]/g

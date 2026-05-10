@@ -27,8 +27,8 @@ bash scripts/dev.sh examples/broken-counter/src/counter.ts
 Inside CodeClaw:
 
 ```text
-1. Press Ctrl-T to focus the shell pane.
-2. Run: npm --prefix examples/broken-counter test
+1. Press `SPC t t` to open the shell pane.
+2. Run: `npm --prefix examples/broken-counter test`
 3. The test fails.
 4. Press Esc, then SPC a f.
 5. Review the proposed patch.

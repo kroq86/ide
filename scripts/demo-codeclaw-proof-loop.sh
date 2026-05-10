@@ -47,7 +47,7 @@ pause 1
 say "1. Open the intentionally broken demo file"
 cmd sed -n '1,8p' examples/broken-counter/src/counter.ts
 
-say "2. Run the test in the shell pane"
+say "2. Run the test in the shell pane (SPC t t, then Enter)"
 set +e
 printf "\n\033[1;90m$ npm --prefix examples/broken-counter test\033[0m\n"
 npm --prefix examples/broken-counter test

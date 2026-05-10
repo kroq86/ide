@@ -380,6 +380,10 @@ function printable(input: string): boolean {
   return input.length === 1 && input >= ' ' && input <= '~'
 }
 
+function printableText(input: string): boolean {
+  return input.length > 0 && /^[\x20-\x7e]+$/.test(input)
+}
+
 function bufferName(filename: string | null): string {
   return filename ? basename(filename) : '*scratch*'
 }
@@ -409,18 +413,36 @@ function filterBuffers(buffers: EditorBuffer[], query: string): EditorBuffer[] {
 
 // ── Shell pane ────────────────────────────────────────────────────────────────
 
-function ShellPane({ lines, rows, focused }: { lines: ShellLine[]; rows: number; focused: boolean }) {
+function ShellPane({
+  lines, rows, focused, mode, input, running, height,
+}: {
+  lines: ShellLine[]
+  rows: number
+  focused: boolean
+  mode: 'pty' | 'runner'
+  input: string
+  running: boolean
+  height: number
+}) {
   const borderColor = focused ? C.green : C.grey
-  const visible = lines.slice(-rows)
+  const visible = lines.slice(-Math.max(1, rows - 2))
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
-      <Text bold color={borderColor}>*shell*</Text>
+    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} height={height}>
+      <Text bold color={borderColor}>{`*shell*  mode: ${mode}${running ? '  running...' : ''}`}</Text>
       {visible.length === 0
         ? <Text color={C.grey}>  (no output yet)</Text>
         : visible.map((l, i) => (
             <Text key={i} color={l.isError ? C.red : C.fg} wrap="truncate">{l.text || ' '}</Text>
           ))
       }
+      {mode === 'runner' && (
+        <Box flexDirection="row">
+          <Text color={C.cyan}>{'$ '}</Text>
+          <Text color={C.fg}>{input}</Text>
+          {focused && <Text color={C.grey}>_</Text>}
+        </Box>
+      )}
+      {mode === 'pty' && focused && <Text color={C.grey}>Enter=tracked run  Esc=editor</Text>}
     </Box>
   )
 }
@@ -471,13 +493,14 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
 // ── AI chat panel ─────────────────────────────────────────────────────────────
 
 function AiPanel({
-  messages, input, streaming, focused, width, navHint, fixState,
+  messages, input, streaming, focused, width, height, navHint, fixState,
 }: {
   messages: AiMessage[]
   input: string
   streaming: boolean
   focused: boolean
   width: number
+  height: number
   navHint?: string
   fixState: CodeClawFixState
 }) {
@@ -488,7 +511,7 @@ function AiPanel({
   const fixLines = codeClawFixLines(fixState, msgAreaRows)
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width}>
+    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
       <Text bold color={borderColor}>*AI*  {streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : 'SPC a p=focus'}</Text>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
         {fixLines.length > 0
@@ -646,7 +669,7 @@ function GitPanel({ data, cursor, pendingKey, logEntries, totalRows, totalCols }
     : 'j/k  TAB=expand  s/u=stage  cc=commit  F=pull  P=push  q=close'
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={C.magenta} paddingX={1} width={totalCols}>
+    <Box flexDirection="column" borderStyle="single" borderColor={C.magenta} paddingX={1} width={totalCols} height={totalRows}>
       <Box flexDirection="row" gap={2}>
         <Text bold color={C.magenta}>*git*</Text>
         <Text bold color={C.cyan}>{data.branch}</Text>
@@ -709,6 +732,7 @@ type EditorPaneProps = {
   mode: EditorMode
   scrollOffset: number
   panelRows: number
+  paneHeight: number
   paneWidth?: number
   panel: Panel
   sel: SelBounds | null
@@ -720,7 +744,7 @@ type EditorPaneProps = {
 function EditorPane({
   filename, snapshot, status, bufferName, bufferIndex, bufferCount, buffers, prompt,
   activeBufferId, ghostText, mode, scrollOffset, panelRows, paneWidth, panel,
-  sel, searchQuery, cmdBuf, searchBuf,
+  paneHeight, sel, searchQuery, cmdBuf, searchBuf,
 }: EditorPaneProps) {
   const lines  = snapshot?.lines  ?? ['']
   const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
@@ -731,7 +755,7 @@ function EditorPane({
   const totalRows = process.stdout.rows ?? 24
   const totalCols = process.stdout.columns ?? 80
   const effectiveCols = paneWidth ?? totalCols
-  const visibleRows = Math.max(1, totalRows - 8 - panelRows)
+  const visibleRows = Math.max(1, paneHeight - 4)
   const visibleCols = Math.max(20, effectiveCols - 4)
   const visibleLines = lines.slice(scrollOffset, scrollOffset + visibleRows)
 
@@ -769,7 +793,7 @@ function EditorPane({
   const visibleBuffers = filteredBuffers.slice(0, 8)
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={paneWidth}>
+    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={paneWidth} height={paneHeight}>
       <Box flexDirection="row" gap={2}>
         <Text bold color={modeColor}>{`[${modeLabel}]`}</Text>
         <Text bold color={C.magenta}>qe</Text>
@@ -870,6 +894,8 @@ function App({
   const [aiInput,    setAiInput]    = React.useState('')
   const [aiStreaming, setAiStreaming] = React.useState(false)
   const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
+  const [shellInput, setShellInput] = React.useState('')
+  const [shellRunning, setShellRunning] = React.useState(false)
 
   const pendingKeyRef    = React.useRef<string | null>(null)
   const yankRegisterRef  = React.useRef<string | null>(null)
@@ -899,7 +925,7 @@ function App({
       quit:     actions.quitAll,
       insert:   (text) => sidecar.insert(text),
       move:     (dir) => sidecar.move(dir as Parameters<QeSidecar['move']>[0]),
-      shell:    { run: (cmd) => shell.write(cmd + '\r'), lines: () => shellLines.map(l => l.text) },
+      shell:    { run: (cmd) => { void shell.runTracked(cmd) }, lines: () => shellLines.map(l => l.text) },
       buffers: {
         list: () => bufferInfos,
         current: () => bufferInfos.find(buffer => buffer.active) ?? null,
@@ -1353,6 +1379,20 @@ function App({
     // ── Shell panel ──────────────────────────────────────────────────────────
     if (panel?.type === 'shell') {
       if (key.escape)                                  { setPanel(null); return }
+      if (shell.mode === 'runner') {
+        if (key.return) {
+          const cmd = shellInput.trim()
+          if (!cmd || shellRunning) return
+          setShellInput('')
+          setShellRunning(true)
+          void shell.runTracked(cmd).finally(() => setShellRunning(false))
+          return
+        }
+        if (key.backspace || key.delete) { setShellInput(prev => prev.slice(0, -1)); return }
+        if (key.ctrl && input === 'c') { shell.cancelRunner(); setShellRunning(false); return }
+        if (!key.ctrl && !key.meta && printableText(input)) { setShellInput(prev => prev + input); return }
+        return
+      }
       if (input === 'o') {
         // jump to first parsed error location
         const loc = shell.lastLocation
@@ -1368,7 +1408,7 @@ function App({
       if (key.ctrl && input === 'c')                   { shell.write('\x03'); return }
       if (key.ctrl && input === 'l')                   { shell.write('\x0c'); return }
       if (key.ctrl && input === 'd')                   { shell.write('\x04'); return }
-      if (!key.ctrl && !key.meta && printable(input))  { shell.write(input); return }
+      if (!key.ctrl && !key.meta && printableText(input))  { shell.write(input); return }
       return
     }
 
@@ -1656,6 +1696,7 @@ function App({
     : panel.type === 'shell' ? 3 + shellRows
     : panel.type === 'git'   ? Math.min(20, buildGitDisplayLines(panel.data, panel.logEntries).length + 3)
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
+  const editorHeight = Math.max(1, totalRows - panelRows)
 
   const editorPane = (
     <EditorPane
@@ -1672,6 +1713,7 @@ function App({
       mode={mode}
       scrollOffset={scrollOffset}
       panelRows={panelRows}
+      paneHeight={editorHeight}
       paneWidth={editorWidth}
       panel={panel}
       sel={sel}
@@ -1683,7 +1725,7 @@ function App({
 
   if (panel?.type === 'ai') {
     return (
-      <Box flexDirection="row" width={totalCols}>
+      <Box flexDirection="row" width={totalCols} height={totalRows}>
         {editorPane}
         <AiPanel
           messages={aiMessages}
@@ -1691,6 +1733,7 @@ function App({
           streaming={aiStreaming}
           focused={panel.focused}
           width={aiWidth}
+          height={totalRows}
           navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
           fixState={fixState}
         />
@@ -1699,13 +1742,21 @@ function App({
   }
 
   return (
-    <Box flexDirection="column" width={totalCols}>
+    <Box flexDirection="column" width={totalCols} height={totalRows}>
       {editorPane}
       {panel?.type === 'whichkey' && (
         <WhichKeyPanel node={panel.node} path={panel.path} totalCols={totalCols} />
       )}
       {panel?.type === 'shell' && (
-        <ShellPane lines={shellLines} rows={shellRows} focused={true} />
+        <ShellPane
+          lines={shellLines}
+          rows={shellRows}
+          focused={true}
+          mode={shell.mode}
+          input={shellInput}
+          running={shellRunning}
+          height={panelRows}
+        />
       )}
       {panel?.type === 'git' && (
         <GitPanel
@@ -1738,7 +1789,7 @@ async function main() {
   let activeId = ''
   let buffers: EditorBuffer[] = []
   let activeSidecar: QeSidecar | null = null
-  let shellLines: ShellLine[] = []
+  let shellLines: ShellLine[] = [...shell.lines]
   let instance: Instance | null = null
   let quitting = false
 
@@ -1754,7 +1805,7 @@ async function main() {
     quit:     quitAll,
     insert:   (text) => activeSidecar?.insert(text),
     move:     (dir) => activeSidecar?.move(dir as Parameters<QeSidecar['move']>[0]),
-    shell:    { run: (cmd) => shell.write(cmd + '\r'), lines: () => shellLines.map(l => l.text) },
+    shell:    { run: (cmd) => { void shell.runTracked(cmd) }, lines: () => shellLines.map(l => l.text) },
     buffers:  {
       list: bufferInfos,
       current: () => bufferInfos().find(info => info.active) ?? null,

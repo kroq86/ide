@@ -1,0 +1,18 @@
+{
+  "id": "2026-05-10T16-41-23-codeclaw-fix",
+  "workflow": "fix",
+  "startedAt": "2026-05-10T16:41:23.610Z",
+  "input": {
+    "command": "npm --prefix examples/broken-counter test",
+    "activeFile": "examples/broken-counter/src/counter.ts",
+    "gitBranch": "main"
+  },
+  "failure": {
+    "exitCode": 254,
+    "startedAt": "2026-05-10T16:41:18.488Z",
+    "endedAt": "2026-05-10T16:41:18.853Z",
+    "locations": []
+  },
+  "accepted": false,
+  "error": "proposal summary must be a non-empty string\nRaw response:\n{\n  \"type\": \"lint\",\n  \"rule\": \"small-func\",\n  \"text\": \"Function should have fewer than 10 lines of code. Found function ShellSidecar.run() which has 30 lines.\",\n  \"line\": 14,\n  \"column\": 3,\n  \"severity\": 4,\n  \"code\": {\n    \"value\": \"[16, 34]\",\n    \"start\": {\n      \"line\": 16,\n      \"column\": 3\n    },\n    \"end\": {\n      \"line\": 34,\n      \"column\": 3\n    }\n  }\n}"
+}
