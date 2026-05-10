@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { join, isAbsolute, normalize } from 'node:path'
+import { dirname, join, isAbsolute, normalize, relative } from 'node:path'
 import type { ShellRun } from './shell.js'
 
 export type FixContext = {
@@ -112,6 +112,38 @@ export type TraceSummary = {
   path: string
 }
 
+/** Persisted under `.codeclaw/traces/review/` so fix traces stay in `traces/*.json`. */
+export type CodeClawReviewTrace = {
+  id: string
+  workflow: 'review'
+  startedAt: string
+  endedAt: string
+  gitBranch?: string
+  activeFile: string
+  openBuffers: string[]
+  diffChars: number
+  gitDiffPreview?: string
+  status: 'ok' | 'error'
+  proposal?: {
+    summary: string
+    safeToCommit: boolean
+    findingCount: number
+    findings: Array<{
+      severity: ReviewFinding['severity']
+      file: string
+      line?: number
+      title: string
+      rule?: string
+    }>
+  }
+  error?: string
+}
+
+function dirContainsPath(parent: string, dir: string): boolean {
+  const rel = relative(parent, dir)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
 const DEFAULT_RULES = [
   '- Make the smallest safe change.',
   '- Do not refactor unrelated code.',
@@ -165,6 +197,35 @@ export function loadCodeClawProject(cwd: string): { rules: string; memory: strin
   const rules = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8').trim() : DEFAULT_RULES
   const memory = existsSync(memoryPath) ? readFileSync(memoryPath, 'utf8').trim() : ''
   return { rules, memory }
+}
+
+/** Loads repo rules, then prepends the nearest `.codeclaw/rules.md` walking up from `activeFile` (when under `cwd`). */
+export function loadCodeClawProjectForReview(cwd: string, activeFile: string): { rules: string; memory: string } {
+  const base = loadCodeClawProject(cwd)
+  const trimmed = activeFile.trim()
+  if (!trimmed) return base
+
+  const cwdNorm = normalize(cwd)
+  const abs = isAbsolute(trimmed) ? normalize(trimmed) : normalize(join(cwdNorm, trimmed))
+  const rootRulesPath = normalize(join(codeClawDir(cwdNorm), 'rules.md'))
+
+  let dir = dirname(abs)
+  while (dirContainsPath(cwdNorm, dir)) {
+    const localRules = normalize(join(dir, '.codeclaw', 'rules.md'))
+    if (existsSync(localRules) && localRules !== rootRulesPath) {
+      const extra = readFileSync(localRules, 'utf8').trim()
+      if (extra) {
+        return {
+          ...base,
+          rules: `${extra}\n\n---\n\n${base.rules}`,
+        }
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return base
 }
 
 export function collectGitContext(cwd: string): FixContext['git'] {
@@ -224,31 +285,52 @@ export function parsePatchProposal(raw: string): PatchProposal {
   }
 
   if (!isObject(value)) throw new Error('proposal must be an object')
+  assertPatchProposalTopLevel(value as Record<string, unknown>)
   const summary = readString(value, 'summary')
   const rootCause = readString(value, 'rootCause')
   const verifyTask = readOptionalString(value, 'verifyTask') || readOptionalString(value, 'verifyCommand')
-  const risk = readString(value, 'risk')
-  if (risk !== 'low' && risk !== 'medium' && risk !== 'high') {
-    throw new Error('proposal risk must be low, medium, or high')
-  }
+  const risk = readProposalRisk(value)
   const rawFiles = (value as { files?: unknown }).files
   if (!Array.isArray(rawFiles) || rawFiles.length === 0) {
     throw new Error('proposal files must be a non-empty array')
   }
-  const files = rawFiles.map((file, index) => {
-    if (!isObject(file)) throw new Error(`proposal file ${index} must be an object`)
-    const path = readString(file, 'path')
-    const unifiedDiff = readString(file, 'unifiedDiff')
-    validatePatchPath(path)
-    if (!unifiedDiff.includes('--- ') || !unifiedDiff.includes('+++ ') || !unifiedDiff.includes('@@')) {
-      throw new Error(`proposal file ${path} must contain a unified diff`)
+
+  const skipped: string[] = []
+  const files: PatchProposal['files'] = []
+  for (let index = 0; index < rawFiles.length; index++) {
+    const file = rawFiles[index]
+    if (!isObject(file)) {
+      skipped.push(`#${index}: not an object (${file === null ? 'null' : typeof file})`)
+      continue
     }
-    return { path, unifiedDiff }
-  })
+    try {
+      const path = readString(file, 'path')
+      const unifiedDiffRaw = readString(file, 'unifiedDiff')
+      validatePatchPath(path)
+      const unifiedDiff = normalizeUnifiedDiffForGitApply(path, unifiedDiffRaw)
+      if (!unifiedDiff.includes('--- ') || !unifiedDiff.includes('+++ ') || !unifiedDiff.includes('@@')) {
+        throw new Error('missing unified diff markers')
+      }
+      files.push({ path, unifiedDiff })
+    } catch (err) {
+      skipped.push(`#${index}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  if (files.length === 0) {
+    throw new Error(
+      `no valid proposal files (${rawFiles.length} entr${rawFiles.length !== 1 ? 'ies' : 'y'}; skipped ${skipped.join('; ')})`,
+    )
+  }
+
   const notesValue = (value as { notes?: unknown }).notes
-  const notes = Array.isArray(notesValue)
+  const baseNotes = Array.isArray(notesValue)
     ? notesValue.filter((note): note is string => typeof note === 'string')
-    : undefined
+    : []
+  const skipNote = skipped.length
+    ? [`Skipped invalid files[] entries: ${skipped.slice(0, 6).join('; ')}${skipped.length > 6 ? ' …' : ''}`]
+    : []
+  const notes = [...baseNotes, ...skipNote].length ? [...baseNotes, ...skipNote] : undefined
 
   return { summary, rootCause, files, verifyTask, risk, notes }
 }
@@ -421,6 +503,62 @@ export function makeTraceId(date = new Date()): string {
   return `${date.toISOString().replace(/\.\d{3}Z$/, '').replace(/:/g, '-')}-codeclaw-fix`
 }
 
+export function makeReviewTraceId(date = new Date()): string {
+  return `${date.toISOString().replace(/\.\d{3}Z$/, '').replace(/:/g, '-')}-codeclaw-review`
+}
+
+export function buildReviewTrace(params: {
+  id: string
+  startedAt: string
+  endedAt: string
+  gitBranch?: string
+  activeFile: string
+  openBuffers: string[]
+  diffChars: number
+  gitDiffPreview?: string
+  status: 'ok' | 'error'
+  proposal?: ReviewProposal | null
+  error?: string
+}): CodeClawReviewTrace {
+  const proposal = params.status === 'ok' && params.proposal
+    ? {
+        summary: params.proposal.summary,
+        safeToCommit: params.proposal.safeToCommit,
+        findingCount: params.proposal.findings.length,
+        findings: params.proposal.findings.map(f => ({
+          severity: f.severity,
+          file: f.file,
+          line: f.line,
+          title: f.title,
+          rule: f.rule,
+        })),
+      }
+    : undefined
+
+  return {
+    id: params.id,
+    workflow: 'review',
+    startedAt: params.startedAt,
+    endedAt: params.endedAt,
+    gitBranch: params.gitBranch,
+    activeFile: params.activeFile,
+    openBuffers: params.openBuffers,
+    diffChars: params.diffChars,
+    gitDiffPreview: params.gitDiffPreview,
+    status: params.status,
+    proposal,
+    error: params.error,
+  }
+}
+
+export function writeReviewTrace(cwd: string, trace: CodeClawReviewTrace): string {
+  const dir = join(codeClawDir(cwd), 'traces', 'review')
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, `${trace.id}.json`)
+  writeFileSync(path, `${JSON.stringify(trace, null, 2)}\n`, 'utf8')
+  return path
+}
+
 export function buildTrace(
   id: string,
   startedAt: string,
@@ -523,6 +661,40 @@ function validatePatchPath(path: string): void {
   }
 }
 
+/** Fixes glued tokens small models emit: `--- a/x+++ b/y` or `+++ b/x@@ -1,2`. */
+export function sanitizeUnifiedDiffGlue(unifiedDiff: string): string {
+  let t = unifiedDiff.replace(/\r\n/g, '\n')
+  // Missing newline between --- line and +++ line
+  t = t.replace(/(---[^\n]+?)\+\+\+\s/g, '$1\n+++ ')
+  // Missing newline between +++ line and @@ hunk header
+  t = t.replace(/(\+\+\+[^\n]+?)@@/g, '$1\n@@')
+  return t
+}
+
+/**
+ * Small models often return only `@@` hunks. `git apply` needs `--- a/...` + `+++ b/...` (and usually `diff --git`).
+ */
+export function normalizeUnifiedDiffForGitApply(filePath: string, unifiedDiff: string): string {
+  const t = sanitizeUnifiedDiffGlue(unifiedDiff).replace(/\r\n/g, '\n').trim()
+  if (!t) return t
+
+  const hasGitPaths = /^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)
+  if (hasGitPaths && t.includes('@@')) {
+    return t.endsWith('\n') ? t : `${t}\n`
+  }
+
+  if (!t.includes('@@')) return t.endsWith('\n') ? t : `${t}\n`
+
+  const body = t
+  return [
+    `diff --git a/${filePath} b/${filePath}`,
+    `--- a/${filePath}`,
+    `+++ b/${filePath}`,
+    body,
+    '',
+  ].join('\n')
+}
+
 function buildProposalPrompt(context: FixContext, tasks: CodeClawTask[] = []): string {
   const compact = {
     ...context,
@@ -542,10 +714,15 @@ function buildProposalPrompt(context: FixContext, tasks: CodeClawTask[] = []): s
   return [
     'You are CodeClaw Fix, an AI workflow engine inside a terminal-native developer workspace.',
     'Return ONLY strict JSON. Do not use markdown fences. Do not include prose outside the JSON.',
+    'CRITICAL: Top-level object MUST use keys summary, rootCause, files, verifyTask, risk — never only {"text":"..."}, {"message":"..."}, or {"version":…}.',
+    'Example (replace ellipsis with real patch content; unifiedDiff must be git-apply compatible):',
+    '{"summary":"Fix off-by-one","rootCause":"Wrong operator","files":[{"path":"src/foo.ts","unifiedDiff":"diff --git a/src/foo.ts b/src/foo.ts\\n--- a/src/foo.ts\\n+++ b/src/foo.ts\\n@@ -1 +1 @@\\n-old\\n+new\\n"}],"verifyTask":"npm test","risk":"low"}',
     'Your JSON must match this TypeScript type exactly:',
     '{ "summary": string, "rootCause": string, "files": [{ "path": string, "unifiedDiff": string }], "verifyTask": string, "risk": "low" | "medium" | "high", "notes"?: string[] }',
     '"verifyTask" must be a task ID from the list below, or a shell command if no tasks are defined.',
-    'Each unifiedDiff must be a complete git-apply compatible unified diff for that file.',
+    '"risk" must be "low", "medium", or "high"; if omitted or invalid, it defaults to "medium".',
+    'Each unifiedDiff must be git-apply compatible: prefer a full unified diff (diff --git, --- a/<path>, +++ b/<path>, then @@ hunks). At minimum include @@ hunks; headers will be filled in if omitted.',
+    '"files" must contain only complete { "path", "unifiedDiff" } objects — never null, strings, or truncated entries.',
     'Use the smallest safe change that fixes the observed failure.',
     '',
     tasksList,
@@ -585,6 +762,32 @@ function readOptionalString(value: object, key: string): string {
     throw new Error(`proposal ${key} must be a string`)
   }
   return field
+}
+
+function readProposalRisk(value: object): PatchProposal['risk'] {
+  const field = (value as Record<string, unknown>)['risk']
+  if (typeof field !== 'string') return 'medium'
+  const n = field.trim().toLowerCase()
+  if (n === 'low' || n === 'medium' || n === 'high') return n
+  return 'medium'
+}
+
+/** Models often return `{ "text": "...", "version": N }` instead of patch fields when confused by format=json. */
+function assertPatchProposalTopLevel(rec: Record<string, unknown>): void {
+  const hasSummary = typeof rec['summary'] === 'string' && rec['summary'].trim().length > 0
+  if (hasSummary) return
+
+  const keys = Object.keys(rec).sort().join(', ')
+  const prose =
+    (typeof rec['text'] === 'string' && rec['text'].trim())
+    || (typeof rec['message'] === 'string' && rec['message'].trim())
+    || (typeof rec['content'] === 'string' && rec['content'].trim())
+  if (prose) {
+    throw new Error(
+      `Model returned narrative JSON (keys: ${keys}), not a patch proposal. Required top-level keys: summary, rootCause, files (non-empty array), verifyTask, risk. Do not wrap the answer in "text" only.`,
+    )
+  }
+  throw new Error(`proposal summary missing or empty (keys: ${keys || '(none)'})`)
 }
 
 function isObject(value: unknown): value is object {

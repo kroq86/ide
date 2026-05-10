@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
-import { ShellSidecar, type ShellLine, type ParsedLocation } from './shell.js'
+import { ShellSidecar, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
 import { streamCompletion, streamChat, type AiContext } from './ai.js'
 import {
   REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
@@ -16,15 +16,19 @@ import {
 import {
   applyPatchProposal,
   assessPatchRisk,
+  buildReviewTrace,
   buildTrace,
   collectGitContext,
   generatePatchProposal,
   generateReviewProposal,
   loadCodeClawProject,
+  loadCodeClawProjectForReview,
   loadTasks,
+  makeReviewTraceId,
   makeTraceId,
   readLatestTrace,
   resolveTaskCommand,
+  writeReviewTrace,
   writeTrace,
   type CodeClawTask,
   type FixContext,
@@ -107,8 +111,8 @@ type CodeClawFixState =
 type ReviewState =
   | { status: 'idle' }
   | { status: 'generating' }
-  | { status: 'findings'; proposal: ReviewProposal; cursor: number }
-  | { status: 'error'; message: string }
+  | { status: 'findings'; proposal: ReviewProposal; cursor: number; tracePath: string }
+  | { status: 'error'; message: string; tracePath?: string }
 
 type Panel =
   | null
@@ -451,8 +455,18 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
 
 // ── AI chat panel ─────────────────────────────────────────────────────────────
 
+const THINKING_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
+
+function thinkingSpinnerGlyph(tick: number): string {
+  return THINKING_SPINNER_FRAMES[tick % THINKING_SPINNER_FRAMES.length]!
+}
+
+function thinkingPrefixedLine(tick: number, rest: string): string {
+  return `${thinkingSpinnerGlyph(tick)} ${rest}`
+}
+
 function AiPanel({
-  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, reviewState, scrollOffset,
+  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, reviewState, scrollOffset, thinkingTick,
 }: {
   messages: AiMessage[]
   input: string
@@ -465,6 +479,8 @@ function AiPanel({
   fixState: CodeClawFixState
   reviewState: ReviewState
   scrollOffset: number
+  /** Incremented on an interval while the AI panel is busy (stream / CodeClaw). */
+  thinkingTick: number
 }) {
   const borderColor = focused ? C.green : C.grey
   const msgAreaRows = Math.max(3, height - 8)
@@ -472,13 +488,21 @@ function AiPanel({
   const sliceEnd = clampedOffset === 0 ? undefined : -clampedOffset
   const visible = messages.slice(-msgAreaRows - clampedOffset, sliceEnd)
   const hiddenAbove = Math.max(0, messages.length - msgAreaRows - clampedOffset)
-  const fixLines = codeClawFixLines(fixState, msgAreaRows)
-  const reviewLns = reviewLines(reviewState, msgAreaRows)
-  const overlayLines = reviewLns.length > 0 ? reviewLns : fixLines
+  const fixLines = codeClawFixLines(fixState, msgAreaRows, thinkingTick)
+  const reviewLns = reviewLines(reviewState, msgAreaRows, thinkingTick)
+  /** While a fix is active, show fix overlay so review → `f` is visible (review alone would hide generating/proposal). */
+  const overlayLines = fixState.status !== 'idle' ? fixLines : reviewLns.length > 0 ? reviewLns : fixLines
 
   const scrollHint = clampedOffset > 0 ? `  ↑${clampedOffset} scrolled  j/k=scroll` : !focused && messages.length > msgAreaRows ? '  k=scroll up' : ''
   const overlayActive = fixState.status !== 'idle' || reviewState.status !== 'idle'
-  const hint = streaming ? '...' : focused ? 'Enter=send  Esc=focus editor' : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
+  const aiPanelBusy =
+    streaming
+    || fixState.status === 'generating'
+    || fixState.status === 'applying'
+    || reviewState.status === 'generating'
+  const hint = aiPanelBusy
+    ? `${thinkingSpinnerGlyph(thinkingTick)} …`
+    : focused ? 'Enter=send  Esc=focus editor' : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
@@ -500,7 +524,10 @@ function AiPanel({
                     {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
                   </Text>
                   <Text color={msg.error ? C.red : C.fg} wrap="wrap">
-                    {msg.content || (streaming && i === visible.length - 1 ? '▋' : ' ')}
+                    {msg.content}
+                    {streaming && i === visible.length - 1
+                      ? (msg.content ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`)
+                      : ''}
                   </Text>
                 </Box>
               ))}
@@ -527,18 +554,19 @@ function AiPanel({
 function codeClawFixLines(
   state: CodeClawFixState,
   maxRows: number,
+  thinkingTick: number,
 ): Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> {
   if (state.status === 'idle') return []
   if (state.status === 'generating') {
     return [
-      { text: 'CodeClaw fix', color: C.cyan },
-      { text: 'Building session context and asking AI for a structured patch...', color: C.grey },
+      { text: thinkingPrefixedLine(thinkingTick, 'CodeClaw fix'), color: C.cyan },
+      { text: thinkingPrefixedLine(thinkingTick, 'Building session context and asking AI for a structured patch…'), color: C.grey, wrap: 'wrap' },
     ]
   }
   if (state.status === 'applying') {
     return [
-      { text: 'CodeClaw fix', color: C.cyan },
-      { text: 'Applying patch and rerunning verification...', color: C.grey },
+      { text: thinkingPrefixedLine(thinkingTick, 'CodeClaw fix'), color: C.cyan },
+      { text: thinkingPrefixedLine(thinkingTick, 'Applying patch and rerunning verification…'), color: C.grey, wrap: 'wrap' },
     ]
   }
   if (state.status === 'trace') {
@@ -622,16 +650,19 @@ function codeClawFixLines(
 function reviewLines(
   state: ReviewState,
   maxRows: number,
+  thinkingTick: number,
 ): Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> {
   if (state.status === 'idle') return []
   if (state.status === 'generating') {
-    return [{ text: 'CodeClaw Review — generating…', color: C.cyan }]
+    return [{ text: thinkingPrefixedLine(thinkingTick, 'CodeClaw Review — generating…'), color: C.cyan }]
   }
   if (state.status === 'error') {
-    return [
+    const lines: Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> = [
       { text: 'CodeClaw Review failed', color: C.red },
       { text: state.message, color: C.fg, wrap: 'wrap' },
     ]
+    if (state.tracePath) lines.push({ text: `Trace: ${state.tracePath}`, color: C.grey, wrap: 'truncate' })
+    return lines
   }
 
   const { proposal, cursor } = state
@@ -657,7 +688,12 @@ function reviewLines(
     }
   }
 
-  lines.push({ text: 'j/k=navigate  f=fix  i=ignore  t=trace  x=dismiss', color: C.grey })
+  lines.push({ text: `Trace: ${state.tracePath}`, color: C.grey, wrap: 'truncate' })
+  lines.push({
+    text: 'j/k=navigate  f=CodeClaw fix (uses finding text; suggestedPatch optional)  i=ignore  t=trace  x=dismiss',
+    color: C.grey,
+    wrap: 'wrap',
+  })
   return lines.slice(0, maxRows)
 }
 
@@ -927,8 +963,21 @@ function App({
   const [aiScrollOffset, setAiScrollOffset] = React.useState(0)
   const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
   const [reviewState, setReviewState] = React.useState<ReviewState>({ status: 'idle' })
+  const [thinkingTick, setThinkingTick] = React.useState(0)
   const [shellInput, setShellInput] = React.useState('')
   const [shellRunning, setShellRunning] = React.useState(false)
+
+  const aiPanelBusy =
+    aiStreaming
+    || fixState.status === 'generating'
+    || fixState.status === 'applying'
+    || reviewState.status === 'generating'
+
+  React.useEffect(() => {
+    if (!aiPanelBusy) return
+    const id = setInterval(() => setThinkingTick(t => (t + 1) % 4096), 90)
+    return () => clearInterval(id)
+  }, [aiPanelBusy])
 
   const pendingKeyRef    = React.useRef<string | null>(null)
   const yankRegisterRef  = React.useRef<string | null>(null)
@@ -1184,8 +1233,39 @@ function App({
     sendAiMessage(text)
   }
 
-  function buildFixContext(userRequest: string, previous?: FixContext): FixContext | null {
-    const lastFailedRun = shell.lastFailedRun ?? previous?.lastFailedRun
+  function syntheticReviewFindingRun(finding: ReviewFinding): ShellRun {
+    const now = new Date().toISOString()
+    const cwd = process.cwd()
+    let locPath = finding.file.trim()
+    if (locPath && !locPath.startsWith('/')) {
+      try {
+        locPath = resolvePath(cwd, locPath)
+      } catch {
+        /* keep locPath */
+      }
+    }
+    const locations: ParsedLocation[] =
+      finding.line != null && locPath
+        ? [{ file: locPath, row: Math.max(0, finding.line - 1), col: 0, message: finding.title }]
+        : []
+    const patchNote = finding.suggestedPatch?.trim()
+      ? `\n\nSuggested unified diff:\n${finding.suggestedPatch}`
+      : ''
+    return {
+      id: `codeclaw-review-${now}`,
+      command: 'codeclaw-review',
+      cwd,
+      startedAt: now,
+      endedAt: now,
+      exitCode: 1,
+      stdout: '',
+      stderr: `[${finding.severity.toUpperCase()}] ${finding.title}\n${finding.explanation}${finding.rule ? `\nRule: ${finding.rule}` : ''}${patchNote}`,
+      locations,
+    }
+  }
+
+  function buildFixContext(userRequest: string, previous?: FixContext, syntheticFailure?: ShellRun): FixContext | null {
+    const lastFailedRun = syntheticFailure ?? shell.lastFailedRun ?? previous?.lastFailedRun
     if (!lastFailedRun) return null
 
     const project = loadCodeClawProject(process.cwd())
@@ -1217,10 +1297,17 @@ function App({
   function runCodeClawFix(
     userRequest = 'Fix this failure using current session context.',
     previous?: FixContext,
+    reviewFinding?: ReviewFinding,
   ) {
-    const context = buildFixContext(userRequest, previous)
+    const synthetic = reviewFinding ? syntheticReviewFindingRun(reviewFinding) : undefined
+    const context = buildFixContext(userRequest, previous, synthetic)
     if (!context) {
-      setFixState({ status: 'error', message: 'No failed tracked shell run yet. Run a command from the shell pane first.' })
+      setFixState({
+        status: 'error',
+        message: reviewFinding
+          ? 'Could not build fix context from this finding (internal error).'
+          : 'No failed tracked shell run yet. Run a command from the shell pane first.',
+      })
       setPanel({ type: 'ai', focused: false })
       return
     }
@@ -1252,10 +1339,14 @@ function App({
   }
 
   function runCodeClawReview() {
-    const gitCtx = collectGitContext(process.cwd())
-    const { rules } = loadCodeClawProject(process.cwd())
+    const cwd = process.cwd()
+    const gitCtx = collectGitContext(cwd)
     const activeFile = snapshot?.filename ?? ''
+    const { rules } = loadCodeClawProjectForReview(cwd, activeFile)
     const openBuffers = buffers.map(b => b.filename ?? b.id)
+
+    const traceId = makeReviewTraceId()
+    const startedAt = new Date().toISOString()
 
     setReviewState({ status: 'generating' })
     setPanel({ type: 'ai', focused: false })
@@ -1266,13 +1357,42 @@ function App({
     aiAbortRef.current = ctrl
 
     void (async () => {
+      const diff = [gitCtx.diff, gitCtx.status].filter(Boolean).join('\n')
       try {
-        const diff = [gitCtx.diff, gitCtx.status].filter(Boolean).join('\n')
         const proposal = await generateReviewProposal(diff, rules, activeFile, openBuffers, ctrl.signal)
-        setReviewState({ status: 'findings', proposal, cursor: 0 })
+        const endedAt = new Date().toISOString()
+        const trace = buildReviewTrace({
+          id: traceId,
+          startedAt,
+          endedAt,
+          gitBranch: gitCtx.branch,
+          activeFile,
+          openBuffers,
+          diffChars: diff.length,
+          gitDiffPreview: diff.slice(0, 12000),
+          status: 'ok',
+          proposal,
+        })
+        const tracePath = writeReviewTrace(cwd, trace)
+        setReviewState({ status: 'findings', proposal, cursor: 0, tracePath })
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
-        setReviewState({ status: 'error', message })
+        const endedAt = new Date().toISOString()
+        const trace = buildReviewTrace({
+          id: traceId,
+          startedAt,
+          endedAt,
+          gitBranch: gitCtx.branch,
+          activeFile,
+          openBuffers,
+          diffChars: diff.length,
+          gitDiffPreview: diff.slice(0, 12000),
+          status: 'error',
+          proposal: null,
+          error: message,
+        })
+        const tracePath = writeReviewTrace(cwd, trace)
+        setReviewState({ status: 'error', message, tracePath })
       } finally {
         setAiStreaming(false)
       }
@@ -1469,10 +1589,16 @@ function App({
       }
       if (input === 'f') {
         const finding = reviewState.proposal.findings[reviewState.cursor]
-        if (finding?.suggestedPatch) {
-          const request = `Fix: ${finding.title}\n${finding.explanation}`
-          runCodeClawFix(request)
-        }
+        if (!finding) return
+        const request = [
+          'Fix this CodeClaw review finding using the current buffers and git context.',
+          finding.suggestedPatch?.trim()
+            ? `Prefer applying or refining this suggested unified diff:\n${finding.suggestedPatch}`
+            : `Finding: ${finding.title}`,
+          finding.explanation,
+          finding.rule ? `Rule reference: ${finding.rule}` : '',
+        ].filter(Boolean).join('\n\n')
+        runCodeClawFix(request, undefined, finding)
         return
       }
       if (input === 't') { showLastTrace(); return }
@@ -2011,6 +2137,7 @@ function App({
           fixState={fixState}
           reviewState={reviewState}
           scrollOffset={aiScrollOffset}
+          thinkingTick={thinkingTick}
         />
       </Box>
     )

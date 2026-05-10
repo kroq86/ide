@@ -3,3 +3,4 @@
 - Preserve public APIs unless explicitly requested.
 - If changing behavior, add or update a test.
 - Prefer patches that can be verified by one command.
+- Do not use `eval()`, `new Function(...)`, or other string-based dynamic execution in application source.

@@ -30,6 +30,9 @@ native/qe-core/config.mak
 # local/editor state
 mcp-data/
 
+# CodeClaw traces (fix/review JSON written per run; local artifacts)
+**/.codeclaw/traces/
+
 .claude/settings.local.json
 .env
 .env.*
