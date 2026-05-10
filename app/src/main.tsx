@@ -1,4 +1,5 @@
 import React from 'react'
+import { realpathSync } from 'node:fs'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -45,6 +46,7 @@ import {
   getGitLog, buildGitDisplayLines,
   type GitStatusData, type GitFileEntry, type GitDisplayLine, type GitLogEntry,
 } from './git.js'
+import { readDiredEntries, type DiredEntry } from './dired.js'
 
 
 type ThemeColor = `#${string}`
@@ -122,6 +124,7 @@ type Panel =
   | { type: 'cmdpalette'; query: string; cursor: number; items: CmdItem[] }
   | { type: 'ai'; focused: boolean }
   | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string }
+  | { type: 'dired'; path: string; cursor: number }
 
 type SelBounds = {
   startRow: number; startCol: number
@@ -776,6 +779,44 @@ function GitPanel({ data, cursor, pendingKey, logEntries, gitError, displayLines
   )
 }
 
+// ── Dired panel (Evil `dired-jump` / vim-style h l) ───────────────────────────
+
+function DiredPanel({ path, cursor, totalRows, totalCols, entries }: {
+  path: string
+  cursor: number
+  totalRows: number
+  totalCols: number
+  entries: DiredEntry[]
+}) {
+  const maxIdx = Math.max(0, entries.length - 1)
+  const safeCursor = Math.min(cursor, maxIdx)
+  const contentRows = Math.max(1, totalRows - 4)
+  const idealOffset = Math.max(0, safeCursor - Math.floor(contentRows / 2))
+  const scrollOffset = Math.min(idealOffset, Math.max(0, entries.length - contentRows))
+  const visible = entries.slice(scrollOffset, scrollOffset + contentRows)
+
+  return (
+    <Box flexDirection="column" borderStyle="single" borderColor={C.blue} paddingX={1} width={totalCols} height={totalRows}>
+      <Box flexDirection="row" gap={2}>
+        <Text bold color={C.cyan}>*dired*</Text>
+        <Text color={C.grey} wrap="truncate">{path}</Text>
+      </Box>
+      {visible.map((e, i) => {
+        const idx = scrollOffset + i
+        const isCur = idx === safeCursor
+        const suffix = e.isDir ? '/' : ''
+        return (
+          <Box key={`${e.fullPath}:${idx}`} flexDirection="row">
+            <Text color={isCur ? C.cyan : C.grey}>{isCur ? '>' : ' '}</Text>
+            <Text color={e.isDir ? C.blue : C.fg} bold={e.isDir} wrap="truncate">{`${e.name}${suffix}`}</Text>
+          </Box>
+        )
+      })}
+      <Text color={C.grey}>h=parent  l/Ret=open  j/k=nav  q/Esc=close</Text>
+    </Box>
+  )
+}
+
 // ── Editor pane ───────────────────────────────────────────────────────────────
 
 type EditorPaneProps = {
@@ -816,7 +857,9 @@ function EditorPane({
   const totalCols = process.stdout.columns ?? 80
   const effectiveCols = paneWidth ?? totalCols
   const visibleRows = Math.max(1, paneHeight - 4)
-  const visibleCols = Math.max(20, effectiveCols - 4)
+  const lineNumWidth = Math.max(2, String(Math.max(1, lines.length)).length)
+  const lineGutterCols = lineNumWidth + 1
+  const visibleCols = Math.max(20, effectiveCols - 4 - lineGutterCols)
   const visibleLines = lines.slice(scrollOffset, scrollOffset + visibleRows)
 
   const modeLabel = mode.toUpperCase()
@@ -824,7 +867,9 @@ function EditorPane({
                   : mode === 'visual'  ? C.magenta
                   : mode === 'command' || mode === 'search' ? C.yellow
                   : C.cyan
-  const borderColor = (panel?.type === 'shell' || (panel?.type === 'ai' && !panel.focused)) ? C.grey : C.blue
+  const borderColor = (panel?.type === 'shell' || panel?.type === 'dired' || (panel?.type === 'ai' && !panel.focused))
+    ? C.grey
+    : C.blue
 
   let hintLine: string
   if (prompt?.type === 'file') {
@@ -844,7 +889,7 @@ function EditorPane({
   } else if (mode === 'visual') {
     hintLine = 'y=yank  d=delete  V=line  Esc=normal'
   } else {
-    hintLine = 'SPC=menu  i=insert  /=search  :=cmd  Ctrl-Q=quit'
+    hintLine = 'SPC=menu  -=dired  i=insert  /=search  :=cmd  Ctrl-Q=quit'
   }
 
   const matchCount = searchQuery ? findMatches(lines, searchQuery).length : 0
@@ -890,7 +935,7 @@ function EditorPane({
         {visibleLines.map((line, index) => {
           const actualRow = index + scrollOffset
           const isCursor  = actualRow === cursor.row
-          const marker    = isCursor ? '>' : ' '
+          const lineNum   = String(actualRow + 1).padStart(lineNumWidth, ' ')
           const cropped   = line.slice(0, visibleCols)
           const clippedSel = sel ? {
             ...sel,
@@ -901,7 +946,7 @@ function EditorPane({
 
           return (
             <Box key={index} flexDirection="row">
-              <Text color={isCursor ? modeColor : C.grey}>{`${marker} `}</Text>
+              <Text color={isCursor ? modeColor : C.grey}>{`${lineNum} `}</Text>
               {segs.map((s, si) => (
                 <Text key={si} color={s.fg} backgroundColor={s.bg}>{s.text}</Text>
               ))}
@@ -1785,6 +1830,45 @@ function App({
       return
     }
 
+    // ── Dired panel (directory browser; mirrors Evil dired + h / l) ───────────
+    if (panel?.type === 'dired') {
+      const entries = readDiredEntries(panel.path)
+      const maxIdx = Math.max(0, entries.length - 1)
+      const cur = Math.min(panel.cursor, maxIdx)
+
+      if (key.escape || input === 'q') {
+        setPanel(null)
+        return
+      }
+      if (input === 'h') {
+        const parent = dirname(panel.path)
+        if (parent !== panel.path) {
+          setPanel({ type: 'dired', path: resolvePath(parent), cursor: 0 })
+        }
+        return
+      }
+      if (input === 'j' || key.downArrow) {
+        setPanel({ ...panel, cursor: Math.min(maxIdx, cur + 1) })
+        return
+      }
+      if (input === 'k' || key.upArrow) {
+        setPanel({ ...panel, cursor: Math.max(0, cur - 1) })
+        return
+      }
+      if (input === 'l' || key.return) {
+        const e = entries[cur]
+        if (!e) return
+        if (e.isDir) {
+          setPanel({ type: 'dired', path: resolvePath(e.fullPath), cursor: 0 })
+        } else {
+          actions.openFile(e.fullPath)
+          setPanel(null)
+        }
+        return
+      }
+      return
+    }
+
     // ── Shell panel ──────────────────────────────────────────────────────────
     if (panel?.type === 'shell') {
       if (key.escape)                                  { setPanel(null); return }
@@ -2018,6 +2102,18 @@ function App({
     }
 
     // ── Normal mode ───────────────────────────────────────────────────────────
+    if (input === '-' && !key.ctrl && !key.meta) {
+      const fp = snapshot?.filename ?? activeBuffer.filename ?? null
+      const dir = fp ? dirname(resolvePath(fp)) : process.cwd()
+      let path = resolvePath(dir)
+      try {
+        path = realpathSync(path)
+      } catch {
+        /* stay with resolved path */
+      }
+      setPanel({ type: 'dired', path, cursor: 0 })
+      return
+    }
     if (key.ctrl && input === 's') { saveCurrentBuffer(); return }
     if (key.ctrl && input === 'r') { sidecar.redo(); return }
     if (key.upArrow)    { sidecar.move('up');    return }
@@ -2137,9 +2233,12 @@ function App({
   const gitDisplayLines = panel?.type === 'git'
     ? buildGitDisplayLines(panel.data, panel.logEntries)
     : null
+  const diredEntries = panel?.type === 'dired' ? readDiredEntries(panel.path) : []
   const panelRows = panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell'      ? 3 + shellRows
     : panel.type === 'git'        ? Math.min(Math.floor(totalRows * 0.6), (gitDisplayLines?.length ?? 0) + 3)
+    : panel.type === 'dired'
+      ? Math.min(Math.floor(totalRows * 0.48), Math.max(7, diredEntries.length + 4))
     : panel.type === 'cmdpalette' ? 0
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
   const editorHeight = Math.max(1, totalRows - panelRows)
@@ -2219,6 +2318,15 @@ function App({
           logEntries={panel.logEntries}
           gitError={panel.gitError}
           displayLines={gitDisplayLines!}
+          totalRows={panelRows}
+          totalCols={totalCols}
+        />
+      )}
+      {panel?.type === 'dired' && (
+        <DiredPanel
+          path={panel.path}
+          cursor={panel.cursor}
+          entries={diredEntries}
           totalRows={panelRows}
           totalCols={totalCols}
         />
