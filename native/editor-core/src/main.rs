@@ -114,6 +114,20 @@ fn main() -> Result<()> {
                 }
                 emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
             }
+            Command::SaveAs { filename } => {
+                match buffer.save_as(&filename) {
+                    Ok(()) => {
+                        lsp.refresh_for_file(buffer.filename(), &buffer.text(), buffer.revision());
+                        lsp.did_save(buffer.filename(), &buffer.text());
+                        emit(&OutMessage::Saved {
+                            type_: "saved",
+                            filename: buffer.filename().map(str::to_owned),
+                        })?
+                    }
+                    Err(error) => emit(&OutMessage::error(format!("save as failed: {error}")))?,
+                }
+                emit(&OutMessage::Snapshot(buffer.snapshot(&mut lsp)))?;
+            }
             Command::Undo => {
                 buffer.undo();
                 sync_lsp(&mut lsp, &buffer);

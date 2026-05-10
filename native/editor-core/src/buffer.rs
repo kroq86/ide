@@ -5,6 +5,7 @@ use crate::syntax;
 use anyhow::{Context, Result};
 use ropey::Rope;
 use std::fs;
+use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -109,6 +110,23 @@ impl EditorBuffer {
         let filename = self.filename.as_ref().context("no filename")?;
         let text = self.rope.to_string();
         fs::write(filename, &text).with_context(|| format!("writing {filename}"))?;
+        self.saved_text = text;
+        self.dirty = false;
+        self.status = format!("saved {filename}");
+        Ok(())
+    }
+
+    /// Write buffer to a new path (e.g. scratch → first save). Creates parent directories.
+    pub fn save_as(&mut self, filename: &str) -> Result<()> {
+        let path = Path::new(filename);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+        let text = self.rope.to_string();
+        fs::write(filename, &text).with_context(|| format!("writing {filename}"))?;
+        self.filename = Some(filename.to_owned());
         self.saved_text = text;
         self.dirty = false;
         self.status = format!("saved {filename}");
@@ -582,6 +600,20 @@ mod tests {
         b.insert("!");
         assert!(b.dirty);
         b.undo();
+        assert!(!b.dirty);
+    }
+
+    #[test]
+    fn save_as_sets_filename_and_writes_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_buf = dir.path().join("scratch.txt");
+        let path = path_buf.to_string_lossy().to_string();
+        let mut b = EditorBuffer::new();
+        b.insert("hello");
+        assert!(b.filename().is_none());
+        b.save_as(&path).unwrap();
+        assert_eq!(b.filename().map(str::to_owned), Some(path.clone()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
         assert!(!b.dirty);
     }
 }

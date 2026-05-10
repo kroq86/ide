@@ -80,6 +80,8 @@ pub enum Command {
     MoveTo { row: usize, col: usize },
     #[serde(rename = "save")]
     Save,
+    #[serde(rename = "saveAs")]
+    SaveAs { filename: String },
     #[serde(rename = "undo")]
     Undo,
     #[serde(rename = "redo")]

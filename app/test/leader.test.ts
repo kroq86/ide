@@ -11,7 +11,7 @@ import type { LeaderTree, EditorContext } from '../src/config.ts'
 
 const noop = () => {}
 
-const mockSidecar = { save: noop }
+const mockSidecar = { save: noop, saveAndQuit: noop }
 const mockSetPanel = (_v: unknown) => {}
 const mockBufs = {
   openSwitcher: noop, openFilePrompt: noop,

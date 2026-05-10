@@ -92,6 +92,7 @@ type EditorBuffer = {
 type PromptState =
   | { type: 'buffer'; query: string; selected: number }
   | { type: 'file'; query: string }
+  | { type: 'saveAs'; query: string; thenQuit?: boolean }
   | { type: 'commit'; message: string }
 
 type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
@@ -828,6 +829,8 @@ function EditorPane({
   let hintLine: string
   if (prompt?.type === 'file') {
     hintLine = `Find file: ${prompt.query}_`
+  } else if (prompt?.type === 'saveAs') {
+    hintLine = `Save as: ${prompt.query}_`
   } else if (prompt?.type === 'buffer') {
     hintLine = `Switch buffer: ${prompt.query}_`
   } else if (prompt?.type === 'commit') {
@@ -986,6 +989,41 @@ function App({
   const searchQueryRef   = React.useRef('')
   const searchIdxRef     = React.useRef(0)
 
+  const enterNormal = React.useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    setGhostText(null)
+    setPrompt(null)
+    pendingKeyRef.current = null
+    setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
+    setMode('normal')
+    setVisualAnchor(null)
+    setVisualLineMode(false)
+    setCmdBuf('')
+    setSearchBuf('')
+  }, [])
+
+  const saveCurrentBuffer = React.useCallback(() => {
+    const path = snapshot?.filename ?? activeBuffer.filename ?? null
+    if (path) {
+      sidecar.save()
+      return
+    }
+    enterNormal()
+    setPrompt({ type: 'saveAs', query: '', thenQuit: false })
+  }, [activeBuffer.filename, enterNormal, sidecar, snapshot?.filename])
+
+  const saveBufferAndQuit = React.useCallback(() => {
+    const path = snapshot?.filename ?? activeBuffer.filename ?? null
+    if (path) {
+      sidecar.save()
+      actions.quitAll()
+      return
+    }
+    enterNormal()
+    setPrompt({ type: 'saveAs', query: '', thenQuit: true })
+  }, [actions, activeBuffer.filename, enterNormal, sidecar, snapshot?.filename])
+
   // Reset editor state whenever the active buffer changes
   React.useEffect(() => {
     abortRef.current?.abort()
@@ -1032,7 +1070,7 @@ function App({
       filename: snapshot?.filename ?? null,
       lines:    snapshot?.lines   ?? [],
       cursor:   snapshot?.cursor  ?? { row: 0, col: 0 },
-      save:     () => sidecar.save(),
+      save:     saveCurrentBuffer,
       quit:     actions.quitAll,
       insert:   (text) => sidecar.insert(text),
       move:     (dir) => sidecar.move(dir as Parameters<QeSidecar['move']>[0]),
@@ -1046,10 +1084,10 @@ function App({
         previous: actions.previousBuffer,
       },
       openFile: actions.openFile,
-    }), [actions, bufferInfos, shell, shellLines, sidecar, snapshot])
+    }), [actions, bufferInfos, saveCurrentBuffer, shell, shellLines, sidecar, snapshot])
 
   const leaderMap = React.useMemo(() => buildLeaderMap(
-    sidecar,
+    { save: saveCurrentBuffer, saveAndQuit: saveBufferAndQuit },
     setPanel as (v: unknown) => void,
     {
       openSwitcher: () => {
@@ -1117,7 +1155,7 @@ function App({
     },
     userLeader,
     makeCtx,
-  ), [actions, activeId, buffers, makeCtx, sidecar, shell, snapshot, userLeader])
+  ), [actions, activeId, buffers, makeCtx, saveBufferAndQuit, saveCurrentBuffer, shell, snapshot, userLeader])
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -1133,21 +1171,6 @@ function App({
       return prev
     })
   }, [snapshot, totalRows])
-
-  function enterNormal() {
-    abortRef.current?.abort()
-    abortRef.current = null
-    setGhostText(null)
-    setPrompt(null)
-    pendingKeyRef.current = null
-    // Preserve AI panel (just defocus); close everything else
-    setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
-    setMode('normal')
-    setVisualAnchor(null)
-    setVisualLineMode(false)
-    setCmdBuf('')
-    setSearchBuf('')
-  }
 
   function sendAiMessage(overrideText?: string) {
     const text = (overrideText ?? aiInput).trim()
@@ -1491,9 +1514,9 @@ function App({
 
   function executeCommand(cmd: string) {
     const t = cmd.trim()
-    if (t === 'w' || t === 'write')         { sidecar.save() }
+    if (t === 'w' || t === 'write')         { saveCurrentBuffer() }
     else if (t === 'q' || t === 'quit')     { actions.quitAll() }
-    else if (t === 'wq' || t === 'x')       { sidecar.save(); actions.quitAll() }
+    else if (t === 'wq' || t === 'x')       { saveBufferAndQuit() }
     else if (t === 'q!')                    { actions.quitAll() }
     else if (t.startsWith('e ') && t.length > 2) {
       actions.openFile(t.slice(2).trim())
@@ -1826,6 +1849,31 @@ function App({
       return
     }
 
+    if (prompt?.type === 'saveAs') {
+      if (key.escape) { enterNormal(); return }
+      if (key.return) {
+        const raw = prompt.query.trim()
+        if (!raw) {
+          enterNormal()
+          return
+        }
+        sidecar.saveAs(resolvePath(raw))
+        const thenQuit = Boolean(prompt.thenQuit)
+        enterNormal()
+        if (thenQuit) actions.quitAll()
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'saveAs' ? { ...prev, query: prev.query.slice(0, -1) } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'saveAs' ? { ...prev, query: prev.query + input } : prev)
+        return
+      }
+      return
+    }
+
     if (prompt?.type === 'file') {
       if (key.escape) { enterNormal(); return }
       if (key.return) {
@@ -1917,7 +1965,7 @@ function App({
       if (key.rightArrow)             { sidecar.move('right'); return }
       if (key.backspace || key.delete){ sidecar.deleteBackward(); return }
       if (key.return)                 { sidecar.insert('\n'); return }
-      if (key.ctrl && input === 's')  { sidecar.save(); return }
+      if (key.ctrl && input === 's')  { saveCurrentBuffer(); return }
       if (key.tab || input === '\t') {
         if (ghostText !== null && ghostText.length > 0) {
           sidecar.insert(ghostText)
@@ -1970,7 +2018,7 @@ function App({
     }
 
     // ── Normal mode ───────────────────────────────────────────────────────────
-    if (key.ctrl && input === 's') { sidecar.save(); return }
+    if (key.ctrl && input === 's') { saveCurrentBuffer(); return }
     if (key.ctrl && input === 'r') { sidecar.redo(); return }
     if (key.upArrow)    { sidecar.move('up');    return }
     if (key.downArrow)  { sidecar.move('down');  return }
@@ -2268,9 +2316,6 @@ async function main() {
             const result = message.result as { available?: boolean; items?: Array<{ label: string; insertText: string; detail: string }> } | undefined
             const items = result?.items ?? []
             if (items.length > 0) {
-              // Show top completion item as ghost text; user presses Tab to accept
-              const top = items[0]!
-              setGhostText(top.insertText)
               buffer.status = `completion: ${items.length} item${items.length === 1 ? '' : 's'} — Tab to accept`
             } else {
               buffer.status = message.status

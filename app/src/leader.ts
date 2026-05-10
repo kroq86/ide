@@ -97,7 +97,7 @@ export function flattenLeader(node: LeaderNode, prefix = ''): CmdItem[] {
 // setPanel is typed as (v: unknown) => void so that leader.ts has no dependency
 // on the Panel union type (which references git types in main.tsx).
 export function buildLeaderMap(
-  sidecar: { save(): void },
+  sidecar: { save(): void; saveAndQuit(): void },
   setPanel: (v: unknown) => void,
   buffers: {
     openSwitcher: () => void
@@ -139,7 +139,7 @@ export function buildLeaderMap(
   const builtin: LeaderNode = {
     q: {
       q: buffers.quitAll,
-      w: () => { sidecar.save(); buffers.quitAll() },
+      w: () => { sidecar.saveAndQuit() },
     },
     b: {
       b: buffers.openSwitcher,

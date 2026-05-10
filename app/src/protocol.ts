@@ -69,6 +69,7 @@ type Command =
   | { type: 'move'; direction: 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'wordForward' | 'wordBackward' | 'fileStart' | 'fileEnd' }
   | { type: 'moveTo'; row: number; col: number }
   | { type: 'save' }
+  | { type: 'saveAs'; filename: string }
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'resize'; width: number; height: number }
@@ -172,6 +173,10 @@ export class QeSidecar extends EventEmitter {
 
   save(): void {
     this.send({ type: 'save' })
+  }
+
+  saveAs(filename: string): void {
+    this.send({ type: 'saveAs', filename })
   }
 
   undo(): void {
