@@ -369,7 +369,8 @@ function isTestPath(path: string): boolean {
 }
 
 function isConfigPath(path: string): boolean {
-  return /(^|\/)(tsconfig|vite\.config|webpack\.config|rollup\.config|eslint\.config|package)\./.test(path)
+  return /(^|\/)(tsconfig|vite\.config|webpack\.config|rollup\.config|eslint\.config)\./.test(path)
+    || /(^|\/)package\.json$/.test(path)
     || /\.(ya?ml|toml|json)$/.test(path) && /(^|\/)(\.github|config|configs)\//.test(path)
 }
 

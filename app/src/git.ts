@@ -136,16 +136,19 @@ export function unstageEntry(cwd: string, entry: GitFileEntry, hunk?: GitHunk): 
   }
 }
 
-export function commitGit(cwd: string, message: string): void {
-  spawnSync('git', ['commit', '-m', message], { cwd, encoding: 'utf8', timeout: 10000 })
+export function commitGit(cwd: string, message: string): { ok: boolean; error?: string } {
+  const r = spawnSync('git', ['commit', '-m', message], { cwd, encoding: 'utf8', timeout: 10000 })
+  return r.status === 0 ? { ok: true } : { ok: false, error: (r.stderr || r.stdout).trim() }
 }
 
-export function pullGit(cwd: string): void {
-  spawnSync('git', ['pull'], { cwd, encoding: 'utf8', timeout: 30000 })
+export function pullGit(cwd: string): { ok: boolean; error?: string } {
+  const r = spawnSync('git', ['pull'], { cwd, encoding: 'utf8', timeout: 30000 })
+  return r.status === 0 ? { ok: true } : { ok: false, error: (r.stderr || r.stdout).trim() }
 }
 
-export function pushGit(cwd: string): void {
-  spawnSync('git', ['push'], { cwd, encoding: 'utf8', timeout: 30000 })
+export function pushGit(cwd: string): { ok: boolean; error?: string } {
+  const r = spawnSync('git', ['push'], { cwd, encoding: 'utf8', timeout: 30000 })
+  return r.status === 0 ? { ok: true } : { ok: false, error: (r.stderr || r.stdout).trim() }
 }
 
 export function getGitLog(cwd: string, n = 20): GitLogEntry[] {

@@ -259,6 +259,7 @@ export class ShellSidecar extends EventEmitter {
       const timer = setTimeout(() => {
         this.#pushLine('command timed out after 120s', true)
         appendTail(run, 'stderr', 'command timed out after 120s')
+        run.exitCode = 124
         child.kill('SIGTERM')
       }, 120000)
 
@@ -285,7 +286,8 @@ export class ShellSidecar extends EventEmitter {
       child.on('close', code => {
         clearTimeout(timer)
         if (this.#runnerChild === child) this.#runnerChild = null
-        run.exitCode = code ?? undefined
+        // Preserve exitCode = 124 set by the timeout handler; only overwrite if not already set
+        if (run.exitCode === undefined) run.exitCode = code ?? undefined
         run.endedAt = new Date().toISOString()
         this.#pushLine(`exit ${run.exitCode ?? 'unknown'}`, run.exitCode !== 0)
         this.emit('update')
@@ -339,7 +341,7 @@ export class ShellSidecar extends EventEmitter {
   }
 }
 
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[^[\]]/g
+const ANSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\][^\x07]*\x07|\x1b[^[\]]/g
 function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '').replace(/\r/g, '')
 }

@@ -111,9 +111,17 @@ export class QeSidecar extends EventEmitter {
       } satisfies SidecarMessage)
     })
     this.#child.on('error', error => {
+      const msg = `failed to start editor sidecar: ${error.message}`
+      this.emit('message', { type: 'error', message: msg } satisfies SidecarMessage)
+      // Emit a stub snapshot so the editor pane renders the error instead of staying blank
       this.emit('message', {
-        type: 'error',
-        message: `failed to start editor sidecar: ${error.message}`,
+        type: 'snapshot',
+        width: 80, height: 24,
+        cursor: { row: 0, col: 0 },
+        lines: [`[ERROR] ${msg}`, 'Run: npm run build:native'],
+        dirty: false,
+        filename: null,
+        status: msg,
       } satisfies SidecarMessage)
     })
     this.#child.on('exit', () => {

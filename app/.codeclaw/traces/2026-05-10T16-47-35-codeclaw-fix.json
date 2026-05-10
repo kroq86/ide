@@ -1,0 +1,18 @@
+{
+  "id": "2026-05-10T16-47-35-codeclaw-fix",
+  "workflow": "fix",
+  "startedAt": "2026-05-10T16:47:35.792Z",
+  "input": {
+    "command": "npm --prefix examples/broken-counter test",
+    "activeFile": "examples/broken-counter/src/counter.ts",
+    "gitBranch": "main"
+  },
+  "failure": {
+    "exitCode": 254,
+    "startedAt": "2026-05-10T16:47:32.552Z",
+    "endedAt": "2026-05-10T16:47:32.938Z",
+    "locations": []
+  },
+  "accepted": false,
+  "error": "proposal file examples/broken-counter/src/counter.ts must contain a unified diff\nRaw response:\n{\n  \"summary\": \"Fix broken counter test suite\",\n  \"rootCause\": \"package.json not found in project root\",\n  \"files\": [\n    {\n      \"path\": \"examples/broken-counter/src/counter.ts\",\n      \"unifiedDiff\": \"@@ -5,6 +5,6 @@\\nexport function add(a: number, b: number): number {\\n-   return a - b\\n+   return a + b\\n}\\n\"\n    }\n  ],\n  \"verifyCommand\": \"npm --prefix examples/broken-counter test\",\n  \"risk\": \"low\",\n  \"notes\": []\n}"
+}

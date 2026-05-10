@@ -28,6 +28,8 @@ native/qe-core/config.mak
 .DS_Store
 
 # local/editor state
+mcp-data/
+
 .claude/settings.local.json
 .env
 .env.*

@@ -101,7 +101,7 @@ type Panel =
   | { type: 'shell' }
   | { type: 'whichkey'; node: LeaderNode; path: string }
   | { type: 'ai'; focused: boolean }
-  | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null }
+  | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string }
 
 type SelBounds = {
   startRow: number; startCol: number
@@ -191,7 +191,7 @@ function lineSegs(
   const isCursor = row === cursor.row
 
   // Ghost text (insert mode only)
-  if (isCursor && ghostText !== null) {
+  if (isCursor && ghostText !== null && ghostText.length > 0) {
     const pre = line.slice(0, cursor.col)
     const post = line.slice(cursor.col)
     return [
@@ -643,15 +643,16 @@ function codeClawFixLines(
 
 // ── Git panel ─────────────────────────────────────────────────────────────────
 
-function GitPanel({ data, cursor, pendingKey, logEntries, totalRows, totalCols }: {
+function GitPanel({ data, cursor, pendingKey, logEntries, gitError, displayLines, totalRows, totalCols }: {
   data: GitStatusData
   cursor: number
   pendingKey: string | null
   logEntries: GitLogEntry[] | null
+  gitError?: string
+  displayLines: GitDisplayLine[]
   totalRows: number
   totalCols: number
 }) {
-  const displayLines = buildGitDisplayLines(data, logEntries)
   const selectableIdxs: number[] = []
   for (let i = 0; i < displayLines.length; i++) {
     if (displayLines[i]!.selectable) selectableIdxs.push(i)
@@ -664,16 +665,18 @@ function GitPanel({ data, cursor, pendingKey, logEntries, totalRows, totalCols }
   const scrollOffset = Math.min(idealOffset, Math.max(0, displayLines.length - contentRows))
   const visible = displayLines.slice(scrollOffset, scrollOffset + contentRows)
 
-  const hint = pendingKey === 'c' ? 'c=commit  Esc=cancel'
+  const hint = gitError ? `ERROR: ${gitError}`
+    : pendingKey === 'c' ? 'c=commit  Esc=cancel'
     : pendingKey === 'l' ? 'l=log  Esc=cancel'
     : 'j/k  TAB=expand  s/u=stage  cc=commit  F=pull  P=push  q=close'
+  const hintColor: ThemeColor = gitError ? C.red : C.grey
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={C.magenta} paddingX={1} width={totalCols} height={totalRows}>
       <Box flexDirection="row" gap={2}>
         <Text bold color={C.magenta}>*git*</Text>
         <Text bold color={C.cyan}>{data.branch}</Text>
-        <Text color={C.grey}>{hint}</Text>
+        <Text color={hintColor}>{hint}</Text>
       </Box>
       {visible.map((line, i) => {
         const actualIdx = i + scrollOffset
@@ -830,7 +833,12 @@ function EditorPane({
           const isCursor  = actualRow === cursor.row
           const marker    = isCursor ? '>' : ' '
           const cropped   = line.slice(0, visibleCols)
-          const segs = lineSegs(cropped, actualRow, cursor, mode, sel, searchQuery, ghostText, snapshot?.tokens)
+          const clippedSel = sel ? {
+            ...sel,
+            startCol: Math.min(sel.startCol, visibleCols),
+            endCol:   Math.min(sel.endCol,   visibleCols),
+          } : null
+          const segs = lineSegs(cropped, actualRow, cursor, mode, clippedSel, searchQuery, ghostText, snapshot?.tokens)
 
           return (
             <Box key={index} flexDirection="row">
@@ -855,10 +863,11 @@ function EditorPane({
 // ── Main app component ────────────────────────────────────────────────────────
 
 function App({
-  buffers, activeId, sidecar, shell, shellLines, userLeader, actions,
+  buffers, activeId, bufferKey, sidecar, shell, shellLines, userLeader, actions,
 }: {
   buffers: EditorBuffer[]
   activeId: string
+  bufferKey: number
   sidecar: QeSidecar
   shell: ShellSidecar
   shellLines: ShellLine[]
@@ -903,6 +912,23 @@ function App({
   const aiAbortRef       = React.useRef<AbortController | null>(null)
   const searchQueryRef   = React.useRef('')
   const searchIdxRef     = React.useRef(0)
+
+  // Reset editor state whenever the active buffer changes
+  React.useEffect(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    setGhostText(null)
+    setPrompt(null)
+    pendingKeyRef.current = null
+    setMode('normal')
+    setVisualAnchor(null)
+    setVisualLineMode(false)
+    setCmdBuf('')
+    setSearchBuf('')
+    setScrollOffset(0)
+    setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bufferKey])
 
   // Parse first navigable location from last AI response (recomputed when streaming ends)
   const aiNavLoc = React.useMemo<ParsedLocation | null>(() => {
@@ -1053,7 +1079,7 @@ function App({
   }
 
   function explainLastError() {
-    const lastErr = shell.lastError
+    const lastErr = shell.lastError ?? shell.lastFailedRun
     const text = lastErr
       ? [
           `Explain and fix this shell error:`,
@@ -1193,7 +1219,7 @@ function App({
 
   function openGitPanel() {
     const data = loadGitStatus(process.cwd())
-    setPanel({ type: 'git', data, cursor: 0, pendingKey: null, logEntries: null })
+    setPanel({ type: 'git', data, cursor: 0, pendingKey: null, logEntries: null, gitError: undefined })
   }
 
   function stageCurrentFile() {
@@ -1371,8 +1397,16 @@ function App({
       }
       if (input === 'c') { setPanel(prev => prev?.type === 'git' ? { ...prev, pendingKey: 'c' } : prev); return }
       if (input === 'l') { setPanel(prev => prev?.type === 'git' ? { ...prev, pendingKey: 'l' } : prev); return }
-      if (input === 'F') { pullGit(process.cwd()); openGitPanel(); return }
-      if (input === 'P') { pushGit(process.cwd()); return }
+      if (input === 'F') {
+        const result = pullGit(process.cwd())
+        if (result.ok) { openGitPanel() } else { setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev) }
+        return
+      }
+      if (input === 'P') {
+        const result = pushGit(process.cwd())
+        if (!result.ok) { setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev) }
+        return
+      }
       return
     }
 
@@ -1417,8 +1451,16 @@ function App({
       if (key.escape) { setPrompt(null); return }
       if (key.return) {
         const msg = prompt.message.trim()
-        if (msg) commitGit(process.cwd(), msg)
-        setPrompt(null)
+        if (msg) {
+          const result = commitGit(process.cwd(), msg)
+          setPrompt(null)
+          if (!result.ok) {
+            openGitPanel()
+            setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev)
+          }
+        } else {
+          setPrompt(null)
+        }
         return
       }
       if (key.backspace || key.delete) {
@@ -1692,9 +1734,12 @@ function App({
   const aiWidth = panel?.type === 'ai' ? Math.floor(totalCols * 0.42) : 0
   const editorWidth = panel?.type === 'ai' ? totalCols - aiWidth : undefined
 
+  const gitDisplayLines = panel?.type === 'git'
+    ? buildGitDisplayLines(panel.data, panel.logEntries)
+    : null
   const panelRows = panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell' ? 3 + shellRows
-    : panel.type === 'git'   ? Math.min(20, buildGitDisplayLines(panel.data, panel.logEntries).length + 3)
+    : panel.type === 'git'   ? Math.min(Math.floor(totalRows * 0.6), (gitDisplayLines?.length ?? 0) + 3)
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
   const editorHeight = Math.max(1, totalRows - panelRows)
 
@@ -1764,6 +1809,8 @@ function App({
           cursor={panel.cursor}
           pendingKey={panel.pendingKey}
           logEntries={panel.logEntries}
+          gitError={panel.gitError}
+          displayLines={gitDisplayLines!}
           totalRows={panelRows}
           totalCols={totalCols}
         />
@@ -1789,6 +1836,8 @@ async function main() {
   let activeId = ''
   let buffers: EditorBuffer[] = []
   let activeSidecar: QeSidecar | null = null
+  let bufferSwitchCount = 0
+  const sidecarMap = new Map<string, QeSidecar>()
   let shellLines: ShellLine[] = [...shell.lines]
   let instance: Instance | null = null
   let quitting = false
@@ -1819,6 +1868,7 @@ async function main() {
 
   function createSidecarForBuffer(buffer: EditorBuffer): QeSidecar {
     const sc = new QeSidecar(buffer.filename ?? undefined)
+    sidecarMap.set(buffer.id, sc)
 
     sc.on('message', message => {
       if (activeSidecar !== sc) return  // stale, ignore
@@ -1868,6 +1918,7 @@ async function main() {
 
     sc.on('exit', () => {
       if (activeSidecar === sc) activeSidecar = null
+      sidecarMap.delete(buffer.id)
       // Don't auto-remove; the buffer record stays, user can re-open
     })
 
@@ -1895,6 +1946,7 @@ async function main() {
     if (activeSidecar) { activeSidecar.kill(); activeSidecar = null }
     activeId = buffer.id
     buffer.lastUsedAt = Date.now()
+    bufferSwitchCount++
     activeSidecar = createSidecarForBuffer(buffer)
   }
 
@@ -1967,11 +2019,6 @@ async function main() {
     if (existing) {
       if (jump) existing.jumpTo = jump
       switchBuffer(existing.id)
-      // If it's already the active buffer, jump immediately
-      if (existing.id === activeId && activeSidecar && jump) {
-        activeSidecar.moveTo(jump.row, jump.col)
-        existing.jumpTo = undefined
-      }
       return
     }
     const buffer = createBuffer(resolved)
@@ -1993,7 +2040,7 @@ async function main() {
   process.stdout.on('resize', () => {
     const c = process.stdout.columns || 80
     const r = process.stdout.rows    || 24
-    activeSidecar?.resize(c, r)
+    for (const sc of sidecarMap.values()) sc.resize(c, r)
     shell.resize(c, Math.floor(r * 0.3))
     refresh()
   })
@@ -2013,6 +2060,7 @@ async function main() {
         <App
           buffers={buffers}
           activeId={current.id}
+          bufferKey={bufferSwitchCount}
           sidecar={activeSidecar!}
           shell={shell}
           shellLines={displayLines}
