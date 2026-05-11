@@ -147,8 +147,6 @@ npm --prefix examples/broken-counter test
 | [`native/editor-core/`](native/editor-core/) | Rust editor core |
 | [`native/qe-core/`](native/qe-core/) | Legacy C protocol binary / QEmacs-derived sources |
 
-More design notes: [`docs/design.md`](docs/design.md), [`docs/plan.md`](docs/plan.md), AI/trace details: [`docs/ai_settings.md`](docs/ai_settings.md).
-
 ---
 
 ## License
