@@ -39,14 +39,8 @@ In the app: `SPC t t` → run `npm --prefix examples/broken-counter test` (fails
 - **Node.js** 22+
 - **npm**
 - **Rust / Cargo** for `native/editor-core`
-- Sibling **`terminal-react-core`** next to this repo (see layout below)
+- Sibling **`terminal-react-core`** checkout: same **parent directory** as this repo so `app/package.json`
 - **Ollama** (optional) for AI — e.g. `OLLAMA_URL`, `OLLAMA_MODEL`
-
-```text
-~/Documents/
-  terminal-react-core/
-  qe-react-editor/
-```
 
 ---
 
