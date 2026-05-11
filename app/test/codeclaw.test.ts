@@ -9,6 +9,7 @@ import {
   buildReviewDiffSnippet,
   buildReviewTrace,
   buildTrace,
+  collectGitDiffForReview,
   extractGitDiffForPath,
   filterReviewFindingsAgainstActiveBuffer,
   splitGitDiffIntoChunks,
@@ -18,9 +19,13 @@ import {
   loadCodeClawProjectForReview,
   makeReviewTraceId,
   makeTraceId,
+  isReviewNoiseDiffPath,
   normalizeProposalPath,
   normalizeUnifiedDiffForGitApply,
   parsePatchProposal,
+  parseReviewProposal,
+  prepareReviewGitInput,
+  filterReviewGitStatusLines,
   repairUnifiedDiffHunkHeaders,
   sanitizeUnifiedDiffBareHunkLines,
   sanitizeUnifiedDiffBracketHunks,
@@ -74,6 +79,18 @@ const bogusImport = filterReviewFindingsAgainstActiveBuffer(
 )
 assert.equal(bogusImport.length, 0)
 
+const bogusTwoNamedProse = filterReviewFindingsAgainstActiveBuffer(
+  'src/counter.ts',
+  'export function add() {}\nexport function sum() {}\n',
+  [{
+    severity: 'blocker',
+    file: 'src/counter.ts',
+    title: 'Duplicate',
+    explanation: 'The file exports two functions named sum with the same parameters.',
+  }],
+)
+assert.equal(bogusTwoNamedProse.length, 0)
+
 const counterChunk = extractGitDiffForPath(multiFileDiff, 'examples/broken-counter/src/counter.ts')
 assert.match(counterChunk, /counter\.ts/)
 assert.match(counterChunk, /^diff --git/)
@@ -91,6 +108,46 @@ const hintSnippet = buildReviewDiffSnippet(noCounterHunk, 'examples/broken-count
 assert.match(hintSnippet, /No unstaged git diff entry/)
 assert.ok(hintSnippet.includes('z.ts'))
 assert.equal(project.memory, '')
+
+assert.ok(isReviewNoiseDiffPath('app/package-lock.json'))
+assert.ok(isReviewNoiseDiffPath('native/editor-core/Cargo.lock'))
+assert.ok(isReviewNoiseDiffPath('api/go.sum'))
+assert.ok(!isReviewNoiseDiffPath('app/src/main.tsx'))
+assert.ok(isReviewNoiseDiffPath('.codeclaw/traces/2026-05-11T00-00-00-codeclaw-fix.json'))
+assert.equal(
+  filterReviewGitStatusLines('M app/src/x.ts\n?? .codeclaw/traces/foo.json'),
+  'M app/src/x.ts',
+)
+assert.equal(
+  filterReviewGitStatusLines(' M Cargo.lock\nM app/src/lib.rs'),
+  'M app/src/lib.rs',
+  'lockfile status lines dropped like trace dirs',
+)
+
+const lockNoiseDiff = [
+  'diff --git a/app/package-lock.json b/app/package-lock.json',
+  '--- a/app/package-lock.json',
+  '+++ b/app/package-lock.json',
+  '@@ -1 +1 @@',
+  '-LOCK_OLD',
+  '+LOCK_NEW',
+  'diff --git a/examples/broken-counter/src/counter.ts b/examples/broken-counter/src/counter.ts',
+  '--- a/examples/broken-counter/src/counter.ts',
+  '+++ b/examples/broken-counter/src/counter.ts',
+  '@@ -1 +1 @@',
+  '-onlyCounter',
+  '+counterFixed',
+  '',
+].join('\n')
+const snippetNoLock = buildReviewDiffSnippet(lockNoiseDiff, 'examples/broken-counter/src/counter.ts', 20000)
+assert.ok(!snippetNoLock.includes('LOCK_NEW'), 'package-lock chunk omitted when not focused')
+assert.ok(snippetNoLock.includes('counterFixed'))
+
+assert.match(
+  prepareReviewGitInput('diff --git a/x b/x\n', '?? app/.codeclaw/traces/x.json\nM y.ts'),
+  /diff --git/,
+)
+assert.equal(prepareReviewGitInput('', '?? .codeclaw/traces/x'), '')
 
 const proposal = parsePatchProposal(JSON.stringify({
   summary: 'Fix greeting',
@@ -186,6 +243,7 @@ delete rawNoRisk['risk']
 assert.equal(parsePatchProposal(JSON.stringify(rawNoRisk)).risk, 'medium')
 assert.equal(parsePatchProposal(JSON.stringify({ ...rawNoRisk, risk: 'LOW' })).risk, 'low')
 assert.equal(parsePatchProposal(JSON.stringify({ ...rawNoRisk, risk: 'nonsense' })).risk, 'medium')
+assert.equal(parsePatchProposal(JSON.stringify({ ...rawNoRisk, risk: 99 })).risk, 'medium')
 
 assert.ok(sanitizeUnifiedDiffGlue('+++ b/foo@@ -1,2 +1,2 @@\n-x').includes('+++ b/foo\n@@'))
 
@@ -345,6 +403,69 @@ assert.throws(
   })),
   /echoed session-shaped JSON/,
 )
+
+assert.throws(
+  () =>
+    parsePatchProposal(
+      JSON.stringify({ summary: 'x', rootCause: 'y', verifyTask: 'npm test', risk: 'low' }),
+    ),
+  /files/,
+)
+
+assert.throws(
+  () =>
+    parsePatchProposal(
+      JSON.stringify({
+        summary: 'x',
+        rootCause: 'y',
+        files: [],
+        verifyTask: 'npm test',
+        risk: 'low',
+      }),
+    ),
+  /files/,
+)
+
+assert.throws(
+  () =>
+    parsePatchProposal(
+      JSON.stringify({
+        summary: 'x',
+        rootCause: 'y',
+        files: [{
+          path: 'sample.txt',
+          unifiedDiff: [
+            'diff --git a/sample.txt b/sample.txt',
+            '--- a/sample.txt',
+            '+++ b/sample.txt',
+            '@@ -1 +1 @@',
+            '-old',
+            '+new',
+            '',
+          ].join('\n'),
+        }],
+        verifyTask: 123,
+        risk: 'low',
+      }),
+    ),
+  /verifyTask|validation/i,
+)
+
+const reviewOk = parseReviewProposal(JSON.stringify({
+  summary: 'Looks good',
+  safeToCommit: true,
+  findings: [{ severity: 'note', file: 'a.ts', title: 'Nit', explanation: 'Minor' }],
+}))
+assert.equal(reviewOk.summary, 'Looks good')
+assert.equal(reviewOk.safeToCommit, true)
+assert.equal(reviewOk.findings.length, 1)
+
+const reviewBadFindingsShape = parseReviewProposal(JSON.stringify({
+  summary: 'x',
+  findings: 'not-an-array',
+}))
+assert.equal(reviewBadFindingsShape.summary, 'Invalid response shape')
+assert.equal(reviewBadFindingsShape.findings.length, 0)
 
 const context = createFixContext({
   activeFile: { path: 'sample.txt', content: 'hello\nworld\n', cursor: { line: 1, column: 1 } },
@@ -506,5 +627,8 @@ assert.match(shell.lines.map(line => line.text).join('\n'), /TS1234/)
 assert.equal(run.locations[0]?.file, 'src/foo.ts')
 assert.equal(shell.lastFailedRun?.id, run.id)
 shell.kill()
+
+const repoRootForGit = join(new URL('../..', import.meta.url).pathname)
+assert.equal(typeof collectGitDiffForReview(repoRootForGit), 'string')
 
 console.log('codeclaw tests passed')

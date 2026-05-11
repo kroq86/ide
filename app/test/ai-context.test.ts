@@ -18,6 +18,7 @@ import {
   lineLooksLikeCodeLine,
   ollamaModelBase,
 } from '../src/ai.ts'
+import { readOllamaNdjsonLines } from '../src/ollama-ndjson.js'
 import type { ShellSession } from '../src/shell.ts'
 
 // ── findProjectContext ────────────────────────────────────────────────────────
@@ -337,6 +338,22 @@ describe('parseOllamaGenerateLine', () => {
       delta: 'foo',
       done: false,
     })
+  })
+})
+
+describe('readOllamaNdjsonLines', () => {
+  it('rejoins lines split across chunk boundaries', async () => {
+    const encoder = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"x":1}\n{"y'))
+        controller.enqueue(encoder.encode('":2}\n'))
+        controller.close()
+      },
+    })
+    const lines: string[] = []
+    for await (const line of readOllamaNdjsonLines(body)) lines.push(line)
+    assert.deepEqual(lines, ['{"x":1}', '{"y":2}'])
   })
 })
 

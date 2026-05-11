@@ -2,7 +2,17 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, isAbsolute, normalize, relative, resolve } from 'node:path'
 import { formatEditorVsDiskMyersSnippet } from './git.js'
+import { debugLog } from './debug-log.js'
 import type { ShellRun } from './shell.js'
+import {
+  PatchProposalInputSchema,
+  ReviewProposalInputSchema,
+  formatPatchProposalZodError,
+} from './codeclaw-schemas.js'
+import {
+  appendCodeClawTraceEvent,
+  writeCodeClawTracePayload,
+} from './codeclaw-trace-recorder.js'
 
 /** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
 const FIX_PROMPT_MAX_RULES = 8000
@@ -275,6 +285,35 @@ export function collectGitContext(cwd: string): FixContext['git'] {
   return { branch, status, diff }
 }
 
+/**
+ * Unstaged diff for **CodeClaw review only**: `git diff` with pathspec excludes so lockfile churn and
+ * `.codeclaw/traces/` never enter the raw diff (Codex-style: keep tooling/session trees out of the
+ * model-facing diff; `buildReviewDiffSnippet` still drops any stragglers). Fix flow keeps full `collectGitContext().diff`.
+ */
+const GIT_DIFF_REVIEW_PATHSPEC_EXCLUDES = [
+  ':(exclude,glob)**/package-lock.json',
+  ':(exclude,glob)**/npm-shrinkwrap.json',
+  ':(exclude,glob)**/yarn.lock',
+  ':(exclude,glob)**/pnpm-lock.yaml',
+  ':(exclude,glob)**/pnpm-workspace.yaml',
+  ':(exclude,glob)**/bun.lock',
+  ':(exclude,glob)**/bun.lockb',
+  ':(exclude,glob)**/poetry.lock',
+  ':(exclude,glob)**/Pipfile.lock',
+  ':(exclude,glob)**/Gemfile.lock',
+  ':(exclude,glob)**/Cargo.lock',
+  ':(exclude,glob)**/go.sum',
+  ':(exclude,glob)**/composer.lock',
+  ':(exclude,glob)**/uv.lock',
+  ':(exclude,glob)**/flake.lock',
+  ':(exclude,glob)**/mix.lock',
+  ':(exclude,glob)**/.codeclaw/traces/**',
+] as const
+
+export function collectGitDiffForReview(cwd: string): string {
+  return run(['diff', '--', '.', ...GIT_DIFF_REVIEW_PATHSPEC_EXCLUDES], cwd).stdout.trim()
+}
+
 export function createFixContext(input: FixContextInput): FixContext {
   return {
     activeFile: input.activeFile,
@@ -287,14 +326,23 @@ export function createFixContext(input: FixContextInput): FixContext {
   }
 }
 
+/** Optional `traceId` ties Ollama raw I/O to `.codeclaw/traces/events/*.jsonl` when `CODECLAW_TRACE_RAW=1`. */
+export type CodeClawOllamaRecording = { traceId: string }
+
 export async function generatePatchProposal(
   context: FixContext,
   signal: AbortSignal,
   tasks: CodeClawTask[] = [],
   cwd: string = process.cwd(),
+  recording?: CodeClawOllamaRecording,
 ): Promise<PatchProposal> {
   const system = buildProposalSystemPrompt(context, tasks)
   const user = buildProposalUserMessage(context, cwd)
+  if (recording?.traceId) {
+    appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'ollama_request', {
+      detail: { model: OLLAMA_MODEL, endpoint: 'chat', url: `${OLLAMA_URL}/api/chat` },
+    })
+  }
   const response = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -322,14 +370,42 @@ export async function generatePatchProposal(
   })
 
   if (!response.ok) {
-    throw new Error(`ollama ${response.status}: ${await response.text()}`)
+    const errBody = await response.text()
+    if (recording?.traceId) {
+      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'fix', 'ollama_error', errBody)
+      appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'ollama_http_error', {
+        payloadRef: ref ?? undefined,
+        detail: { status: response.status },
+      })
+    }
+    throw new Error(`ollama ${response.status}: ${errBody}`)
   }
 
   const payload = await response.json() as { message?: { content?: string } }
   const raw = payload.message?.content ?? ''
+  let rawPayloadRef: string | null = null
+  if (recording?.traceId) {
+    rawPayloadRef = writeCodeClawTracePayload(cwd, recording.traceId, 'fix', 'ollama_raw', raw)
+    appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'ollama_response', {
+      payloadRef: rawPayloadRef ?? undefined,
+      detail: { rawChars: raw.length },
+    })
+  }
   try {
-    return parsePatchProposal(raw, cwd)
+    const proposal = parsePatchProposal(raw, cwd)
+    if (recording?.traceId) {
+      appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'parse_ok', {
+        detail: { fileCount: proposal.files.length, risk: proposal.risk },
+      })
+    }
+    return proposal
   } catch (error) {
+    if (recording?.traceId) {
+      appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'parse_error', {
+        payloadRef: rawPayloadRef ?? undefined,
+        detail: { message: error instanceof Error ? error.message : String(error) },
+      })
+    }
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`${message}\nRaw response:\n${raw.slice(0, 2000)}`)
   }
@@ -346,14 +422,16 @@ export function parsePatchProposal(raw: string, cwd: string = process.cwd()): Pa
 
   if (!isObject(value)) throw new Error('proposal must be an object')
   assertPatchProposalTopLevel(value as Record<string, unknown>)
-  const summary = readString(value, 'summary')
-  const rootCause = readString(value, 'rootCause')
-  const verifyTask = readOptionalString(value, 'verifyTask') || readOptionalString(value, 'verifyCommand')
-  const risk = readProposalRisk(value)
-  const rawFiles = (value as { files?: unknown }).files
-  if (!Array.isArray(rawFiles) || rawFiles.length === 0) {
-    throw new Error('proposal files must be a non-empty array')
+  const validated = PatchProposalInputSchema.safeParse(value)
+  if (!validated.success) {
+    throw new Error(`proposal failed validation: ${formatPatchProposalZodError(validated.error)}`)
   }
+  const v = validated.data
+  const summary = v.summary.trim()
+  const rootCause = v.rootCause.trim()
+  const verifyTask = (v.verifyTask?.trim() ?? '') || (v.verifyCommand?.trim() ?? '')
+  const risk = readProposalRisk({ risk: v.risk } as Record<string, unknown>)
+  const rawFiles = v.files
 
   const skipped: string[] = []
   const files: PatchProposal['files'] = []
@@ -383,7 +461,7 @@ export function parsePatchProposal(raw: string, cwd: string = process.cwd()): Pa
     )
   }
 
-  const notesValue = (value as { notes?: unknown }).notes
+  const notesValue = v.notes
   const baseNotes = Array.isArray(notesValue)
     ? notesValue.filter((note): note is string => typeof note === 'string')
     : []
@@ -449,6 +527,71 @@ export function extractGitDiffForPath(fullDiff: string, repoRelativePath: string
   return ''
 }
 
+/** Lockfiles / session artifacts: huge, high-churn, and they steal model attention in review (same class of problem Codex avoids by keeping tooling dirs out of workspace diff context). */
+const REVIEW_DIFF_NOISE_BASENAMES = new Set(
+  [
+    'package-lock.json',
+    'npm-shrinkwrap.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'pnpm-workspace.yaml',
+    'bun.lock',
+    'bun.lockb',
+    'poetry.lock',
+    'pipfile.lock',
+    'gemfile.lock',
+    'cargo.lock',
+    'go.sum',
+    'composer.lock',
+    'uv.lock',
+    'flake.lock',
+    'mix.lock',
+  ].map(s => s.toLowerCase()),
+)
+
+/** True if this diff chunk path should not appear in review except when it is the focused file. */
+export function isReviewNoiseDiffPath(pathA: string): boolean {
+  const p = pathA.replace(/\\/g, '/')
+  const lower = p.toLowerCase()
+  if (lower.includes('/.codeclaw/traces/') || lower.startsWith('.codeclaw/traces/')) return true
+  const seg = lower.includes('/') ? lower.slice(lower.lastIndexOf('/') + 1) : lower
+  return REVIEW_DIFF_NOISE_BASENAMES.has(seg)
+}
+
+function reviewGitStatusLineShowsNoisePath(line: string): boolean {
+  const t = line.replace(/\r\n/g, '')
+  const m = t.match(/^(.{2})\s+(.+)$/)
+  const rest = (m?.[2] ?? t).trim().replace(/\\/g, '/')
+  if (!rest) return false
+  const low = rest.toLowerCase()
+  if (low.includes('/.codeclaw/traces/') || low.startsWith('.codeclaw/traces/')) return true
+  for (const p of low.split(/\s+->\s+/)) {
+    const seg = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p
+    if (REVIEW_DIFF_NOISE_BASENAMES.has(seg)) return true
+  }
+  return false
+}
+
+/**
+ * Strip git status lines that mirror review diff excludes: CodeClaw trace dirs (self-tracking) and
+ * known lockfiles so `prepareReviewGitInput` is not noisy when only `git status` still lists them.
+ */
+export function filterReviewGitStatusLines(status: string): string {
+  if (!status.trim()) return ''
+  return status
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter(line => !reviewGitStatusLineShowsNoisePath(line))
+    .join('\n')
+    .trim()
+}
+
+/** `git diff` + filtered `git status --short` for review prompts and traces (noise removed before join). */
+export function prepareReviewGitInput(diff: string, status: string): string {
+  const s = filterReviewGitStatusLines(status)
+  return [diff.trim(), s].filter(Boolean).join('\n')
+}
+
 function reviewChunkSortKey(pathA: string, activePath: string): number {
   const want = activePath.trim().replace(/^\.?\//, '').replace(/\\/g, '/')
   if (!want || want === 'unknown') return 0
@@ -484,6 +627,10 @@ export function buildReviewDiffSnippet(gitDiff: string, activePath: string, maxC
     (a, b) => reviewChunkSortKey(a.pathA, want) - reviewChunkSortKey(b.pathA, want) || a.pathA.localeCompare(b.pathA),
   )
 
+  const wantNorm = want.replace(/\\/g, '/')
+  const isFocusedPath = (pathA: string) =>
+    want !== 'unknown' && (pathA === wantNorm || pathA.endsWith(`/${wantNorm}`))
+
   let parts: string[] = []
   if (!focused && want !== 'unknown') {
     parts.push(
@@ -493,7 +640,8 @@ export function buildReviewDiffSnippet(gitDiff: string, activePath: string, maxC
   if (focused) parts.push(focused)
 
   for (const ch of sorted) {
-    if (want !== 'unknown' && (ch.pathA === want || ch.pathA.endsWith(`/${want}`))) continue
+    if (isFocusedPath(ch.pathA)) continue
+    if (isReviewNoiseDiffPath(ch.pathA)) continue
     parts.push(ch.body)
   }
 
@@ -511,6 +659,7 @@ export async function generateReviewProposal(
   activeEditorBody?: string,
   /** Repo cwd for disk-vs-editor Myers diff (defaults to `process.cwd()`). */
   cwd: string = process.cwd(),
+  recording?: CodeClawOllamaRecording,
 ): Promise<ReviewProposal> {
   // Keep the prompt short — small models (1.5b) fail on long structured prompts
   const rulesSnippet = rules ? rules.slice(0, 500) : 'none'
@@ -554,6 +703,22 @@ ${bufferSnippet}${diskVsEditorSection}
 --- Git diff excerpt (focused file first when it has changes; then other paths) ---
 ${diffSnippet}`
 
+  debugLog('codeclaw', 'review_ollama_begin', {
+    activePath,
+    model: OLLAMA_MODEL,
+    url: OLLAMA_URL,
+    gitDiffChars: gitDiff.length,
+    bufferChars: trimmedBuf.length,
+    promptChars: prompt.length,
+    hasDiskVsEditorMyers: diskVsEditorSection.length > 0,
+  })
+
+  if (recording?.traceId) {
+    appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'ollama_request', {
+      detail: { model: OLLAMA_MODEL, endpoint: 'generate', url: `${OLLAMA_URL}/api/generate`, activePath },
+    })
+  }
+
   const response = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -568,14 +733,51 @@ ${diffSnippet}`
   })
 
   if (!response.ok) {
-    throw new Error(`ollama ${response.status}: ${await response.text()}`)
+    const errBody = await response.text()
+    if (recording?.traceId) {
+      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'review', 'ollama_error', errBody)
+      appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'ollama_http_error', {
+        payloadRef: ref ?? undefined,
+        detail: { status: response.status },
+      })
+    }
+    throw new Error(`ollama ${response.status}: ${errBody}`)
   }
 
   const payload = await response.json() as { response?: string }
   const raw = payload.response ?? ''
+  let rawPayloadRef: string | null = null
+  if (recording?.traceId) {
+    rawPayloadRef = writeCodeClawTracePayload(cwd, recording.traceId, 'review', 'ollama_raw', raw)
+    appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'ollama_response', {
+      payloadRef: rawPayloadRef ?? undefined,
+      detail: { rawChars: raw.length },
+    })
+  }
   const proposal = parseReviewProposal(raw)
+  const rawFindingCount = proposal.findings.length
   if (trimmedBuf)
     proposal.findings = filterReviewFindingsAgainstActiveBuffer(activePath, trimmedBuf, proposal.findings)
+  debugLog('codeclaw', 'review_ollama_end', {
+    activePath,
+    model: OLLAMA_MODEL,
+    rawResponseChars: raw.length,
+    rawFindingCount,
+    filteredFindingCount: proposal.findings.length,
+    findingsDropped: rawFindingCount - proposal.findings.length,
+    safeToCommit: proposal.safeToCommit,
+  })
+  if (recording?.traceId) {
+    appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'parse_done', {
+      payloadRef: rawPayloadRef ?? undefined,
+      detail: {
+        rawFindingCount,
+        filteredFindingCount: proposal.findings.length,
+        safeToCommit: proposal.safeToCommit,
+        summaryHead: proposal.summary.slice(0, 120),
+      },
+    })
+  }
   return proposal
 }
 
@@ -606,6 +808,9 @@ function bufferHasImportStatement(buffer: string): boolean {
 
 /**
  * Drop obvious LLM hallucinations for the focused file when we have the real buffer (small models invent duplicate exports / imports).
+ * Uses **counts of real `export function <name>` lines** in the buffer — not a phrase whitelist. The only prose hook is a short
+ * `two functions named <id>` match (covers "…exports two functions named sum…" etc.); anything else duplicate-ish still goes
+ * through the backtick-near-duplicate heuristic below.
  */
 export function filterReviewFindingsAgainstActiveBuffer(
   activePath: string,
@@ -667,13 +872,18 @@ export function parseReviewProposal(raw: string): ReviewProposal {
     return { summary: 'Invalid response shape', safeToCommit: false, findings: [] }
   }
 
-  const rec = value as Record<string, unknown>
-  const summary = typeof rec['summary'] === 'string' && rec['summary'].trim()
-    ? rec['summary']
-    : 'Review complete'
-  const safeToCommit = typeof rec['safeToCommit'] === 'boolean' ? rec['safeToCommit'] : false
+  const validated = ReviewProposalInputSchema.safeParse(value)
+  if (!validated.success) {
+    return { summary: 'Invalid response shape', safeToCommit: false, findings: [] }
+  }
 
-  const rawFindings = Array.isArray(rec['findings']) ? rec['findings'] : []
+  const rec = validated.data
+  const summary = typeof rec.summary === 'string' && rec.summary.trim()
+    ? rec.summary
+    : 'Review complete'
+  const safeToCommit = typeof rec.safeToCommit === 'boolean' ? rec.safeToCommit : false
+
+  const rawFindings = rec.findings ?? []
   const findings: ReviewFinding[] = rawFindings.flatMap((f, i) => {
     if (!isObject(f)) return []
     const fRec = f as Record<string, unknown>
@@ -1520,15 +1730,6 @@ function readString(value: object, key: string): string {
   const field = (value as Record<string, unknown>)[key]
   if (typeof field !== 'string' || field.trim() === '') {
     throw new Error(`proposal ${key} must be a non-empty string`)
-  }
-  return field
-}
-
-function readOptionalString(value: object, key: string): string {
-  const field = (value as Record<string, unknown>)[key]
-  if (field === undefined) return ''
-  if (typeof field !== 'string') {
-    throw new Error(`proposal ${key} must be a string`)
   }
   return field
 }

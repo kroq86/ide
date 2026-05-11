@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { ShellLine, ShellSession } from './shell.js'
 import { debugLog } from './debug-log.js'
+import { readOllamaNdjsonLines } from './ollama-ndjson.js'
 
 /** Prefer loopback IP — on some hosts `localhost` resolves to ::1 while Ollama listens on IPv4 only. */
 const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://127.0.0.1:11434'
@@ -203,41 +204,19 @@ export async function* streamChat(
     throw new Error(`ollama ${response.status}: ${text}`)
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
   let deltaChunks = 0
   let deltaChars = 0
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buf += decoder.decode(value, { stream: true })
-      const lines_buf = buf.split('\n')
-      buf = lines_buf.pop() ?? ''
-
-      for (const line of lines_buf) {
-        const parsed = parseOllamaChatLine(line)
-        if (!parsed) continue
-        if (parsed.delta) {
-          deltaChunks++
-          deltaChars += parsed.delta.length
-          yield parsed.delta
-        }
-        if (parsed.done) return
-      }
-    }
-    buf += decoder.decode()
-    const tail = parseOllamaChatLine(buf)
-    if (tail) {
-      if (tail.delta) {
+    for await (const line of readOllamaNdjsonLines(response.body)) {
+      const parsed = parseOllamaChatLine(line)
+      if (!parsed) continue
+      if (parsed.delta) {
         deltaChunks++
-        deltaChars += tail.delta.length
-        yield tail.delta
+        deltaChars += parsed.delta.length
+        yield parsed.delta
       }
-      if (tail.done) return
+      if (parsed.done) return
     }
   } finally {
     debugLog('ollama', 'ai_chat_stream_end', { deltaChunks, deltaChars })
@@ -514,41 +493,19 @@ async function* streamOllamaGenerate(
     throw new Error(`ollama ${response.status}: ${text}`)
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
   let deltaChunks = 0
   let deltaChars = 0
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buf += decoder.decode(value, { stream: true })
-      const lines_buf = buf.split('\n')
-      buf = lines_buf.pop() ?? ''
-
-      for (const line of lines_buf) {
-        const parsed = parseOllamaGenerateLine(line)
-        if (!parsed) continue
-        if (parsed.delta) {
-          deltaChunks++
-          deltaChars += parsed.delta.length
-          yield parsed.delta
-        }
-        if (parsed.done) return
-      }
-    }
-    buf += decoder.decode()
-    const tail = parseOllamaGenerateLine(buf)
-    if (tail) {
-      if (tail.delta) {
+    for await (const line of readOllamaNdjsonLines(response.body)) {
+      const parsed = parseOllamaGenerateLine(line)
+      if (!parsed) continue
+      if (parsed.delta) {
         deltaChunks++
-        deltaChars += tail.delta.length
-        yield tail.delta
+        deltaChars += parsed.delta.length
+        yield parsed.delta
       }
-      if (tail.done) return
+      if (parsed.done) return
     }
   } finally {
     debugLog('ollama', 'generate_stream_end', { deltaChunks, deltaChars })
@@ -600,44 +557,22 @@ async function* streamOllamaChatCompletionInline(
     throw new Error(`ollama ${response.status}: ${text}`)
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
   let deltaChunks = 0
   let deltaChars = 0
   const rawLineSamples: string[] = []
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buf += decoder.decode(value, { stream: true })
-      const lines_buf = buf.split('\n')
-      buf = lines_buf.pop() ?? ''
-
-      for (const line of lines_buf) {
-        const tr = line.trim()
-        if (tr && rawLineSamples.length < 3) rawLineSamples.push(tr.slice(0, 1200))
-        const parsed = parseOllamaChatLine(line)
-        if (!parsed) continue
-        if (parsed.delta) {
-          deltaChunks++
-          deltaChars += parsed.delta.length
-          yield parsed.delta
-        }
-        if (parsed.done) return
-      }
-    }
-    buf += decoder.decode()
-    const tail = parseOllamaChatLine(buf)
-    if (tail) {
-      if (tail.delta) {
+    for await (const line of readOllamaNdjsonLines(response.body)) {
+      const tr = line.trim()
+      if (tr && rawLineSamples.length < 3) rawLineSamples.push(tr.slice(0, 1200))
+      const parsed = parseOllamaChatLine(line)
+      if (!parsed) continue
+      if (parsed.delta) {
         deltaChunks++
-        deltaChars += tail.delta.length
-        yield tail.delta
+        deltaChars += parsed.delta.length
+        yield parsed.delta
       }
-      if (tail.done) return
+      if (parsed.done) return
     }
   } finally {
     debugLog('ollama', 'inline_chat_stream_end', {

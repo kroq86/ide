@@ -17,10 +17,12 @@ import {
 import {
   applyPatchProposal,
   assessPatchRisk,
+  buildReviewDiffSnippet,
   buildReviewTrace,
   buildTrace,
   codeClawDir,
   collectGitContext,
+  collectGitDiffForReview,
   generatePatchProposal,
   generateReviewProposal,
   loadCodeClawProject,
@@ -28,6 +30,7 @@ import {
   loadTasks,
   makeReviewTraceId,
   makeTraceId,
+  prepareReviewGitInput,
   readLatestTrace,
   writeReviewTrace,
   writeTrace,
@@ -1823,7 +1826,7 @@ function App({
     void (async () => {
       try {
         const tasks = loadTasks(process.cwd())
-        const proposal = await generatePatchProposal(context, ctrl.signal, tasks, process.cwd())
+        const proposal = await generatePatchProposal(context, ctrl.signal, tasks, process.cwd(), { traceId })
         setFixState({ status: 'proposal', traceId, startedAt, context, proposal, risk: assessPatchRisk(proposal), mediumConfirm: false })
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
@@ -1864,10 +1867,10 @@ function App({
     aiAbortRef.current = ctrl
 
     void (async () => {
-      const diff = [gitCtx.diff, gitCtx.status].filter(Boolean).join('\n')
+      const reviewGitBlob = prepareReviewGitInput(collectGitDiffForReview(cwd), gitCtx.status)
       try {
         const activeEditorBody = (snapshot?.lines ?? []).join('\n')
-        const proposal = await generateReviewProposal(diff, rules, activeFile, openBuffers, ctrl.signal, activeEditorBody, cwd)
+        const proposal = await generateReviewProposal(reviewGitBlob, rules, activeFile, openBuffers, ctrl.signal, activeEditorBody, cwd, { traceId })
         const endedAt = new Date().toISOString()
         const trace = buildReviewTrace({
           id: traceId,
@@ -1876,8 +1879,8 @@ function App({
           gitBranch: gitCtx.branch,
           activeFile,
           openBuffers,
-          diffChars: diff.length,
-          gitDiffPreview: diff.slice(0, 12000),
+          diffChars: reviewGitBlob.length,
+          gitDiffPreview: buildReviewDiffSnippet(reviewGitBlob, activeFile, 12000),
           status: 'ok',
           proposal,
         })
@@ -1893,8 +1896,8 @@ function App({
           gitBranch: gitCtx.branch,
           activeFile,
           openBuffers,
-          diffChars: diff.length,
-          gitDiffPreview: diff.slice(0, 12000),
+          diffChars: reviewGitBlob.length,
+          gitDiffPreview: buildReviewDiffSnippet(reviewGitBlob, activeFile, 12000),
           status: 'error',
           proposal: null,
           error: message,
