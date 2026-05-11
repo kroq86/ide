@@ -19,6 +19,7 @@ import {
   assessPatchRisk,
   buildReviewTrace,
   buildTrace,
+  codeClawDir,
   collectGitContext,
   generatePatchProposal,
   generateReviewProposal,
@@ -28,17 +29,14 @@ import {
   makeReviewTraceId,
   makeTraceId,
   readLatestTrace,
-  resolveTaskCommand,
   writeReviewTrace,
   writeTrace,
-  type CodeClawTask,
   type FixContext,
   type PatchProposal,
   type PatchRiskAssessment,
   type ReviewFinding,
   type ReviewProposal,
   type TraceSummary,
-  type VerifyResult,
 } from './codeclaw.js'
 import { loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
 import {
@@ -47,6 +45,7 @@ import {
   type GitStatusData, type GitFileEntry, type GitDisplayLine, type GitLogEntry,
 } from './git.js'
 import { readDiredEntries, type DiredEntry } from './dired.js'
+import { debugLog, getDebugLogPath } from './debug-log.js'
 
 
 /** Keep header readable on narrow terminals (avoid path/status/search overlapping). */
@@ -129,7 +128,7 @@ type CodeClawFixState =
   | { status: 'editing'; traceId: string; startedAt: string; context: FixContext; proposal: PatchProposal }
   | { status: 'applying'; traceId: string; startedAt: string; context: FixContext; proposal: PatchProposal; risk: PatchRiskAssessment }
   | { status: 'trace'; latest: TraceSummary | null }
-  | { status: 'done'; message: string; tracePath: string; verify?: VerifyResult }
+  | { status: 'done'; message: string; tracePath: string }
   | { status: 'error'; message: string; tracePath?: string }
 
 type ReviewState =
@@ -667,6 +666,12 @@ function thinkingPrefixedLine(tick: number, rest: string): string {
   return `${thinkingSpinnerGlyph(tick)} ${rest}`
 }
 
+/** When true, CodeClaw fix UI replaces the chat transcript area. `done` stays off so chat stays visible; `error` must stay on or failed fixes look like “nothing happened” behind the review overlay. */
+function fixOverlayCoversMessages(fixState: CodeClawFixState): boolean {
+  const s = fixState.status
+  return s === 'generating' || s === 'proposal' || s === 'editing' || s === 'applying' || s === 'trace' || s === 'error'
+}
+
 function AiPanel({
   messages, input, streaming, focused, width, height, navHint, shellHint, fixState, reviewState, scrollOffset, thinkingTick,
 }: {
@@ -692,26 +697,32 @@ function AiPanel({
   const hiddenAbove = Math.max(0, messages.length - msgAreaRows - clampedOffset)
   const fixLines = codeClawFixLines(fixState, msgAreaRows, thinkingTick)
   const reviewLns = reviewLines(reviewState, msgAreaRows, thinkingTick)
-  /** While a fix is active, show fix overlay so review → `f` is visible (review alone would hide generating/proposal). */
-  const overlayLines = fixState.status !== 'idle' ? fixLines : reviewLns.length > 0 ? reviewLns : fixLines
+  const fixOverlay = fixOverlayCoversMessages(fixState)
+  /** Active fix/review overlays beat chat; terminal success (`done`) does not — `error` uses fix overlay so it isn’t hidden by stale review. */
+  const overlayLines = fixOverlay ? fixLines : reviewLns.length > 0 ? reviewLns : []
+  /** Focused prompt = composing a chat message — don't bury it under CodeClaw review/fix UI (user expects “hi” to be a normal chat turn). */
+  const overlayLinesForDisplay = focused ? [] : overlayLines
 
   const scrollHint = clampedOffset > 0 ? `  ↑${clampedOffset} scrolled  j/k=scroll` : !focused && messages.length > msgAreaRows ? '  k=scroll up' : ''
-  const overlayActive = fixState.status !== 'idle' || reviewState.status !== 'idle'
+  const overlayActive = fixOverlay || reviewState.status !== 'idle'
   const aiPanelBusy =
     streaming
     || fixState.status === 'generating'
     || fixState.status === 'applying'
     || reviewState.status === 'generating'
+  const clearHint = focused && messages.length > 0 ? '  Ctrl+L=clear' : ''
   const hint = aiPanelBusy
     ? `${thinkingSpinnerGlyph(thinkingTick)} …`
-    : focused ? 'Enter=send  Esc=focus editor' : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
+    : focused
+      ? `Enter=send  Esc=focus editor${clearHint}`
+      : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
       <Text bold color={borderColor}>*AI*  {hint}{scrollHint}</Text>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
-        {overlayLines.length > 0
-          ? overlayLines.map((line, i) => (
+        {overlayLinesForDisplay.length > 0
+          ? overlayLinesForDisplay.map((line, i) => (
               <Text key={i} color={line.color} wrap={line.wrap ?? 'truncate'}>{line.text || ' '}</Text>
             ))
           : visible.length === 0
@@ -720,19 +731,28 @@ function AiPanel({
               {hiddenAbove > 0 && (
                 <Text color={C.grey}>{`  ↑ ${hiddenAbove} more message${hiddenAbove === 1 ? '' : 's'}`}</Text>
               )}
-              {visible.map((msg, i) => (
-                <Box key={i} flexDirection="column" marginBottom={1}>
-                  <Text bold color={msg.role === 'user' ? C.cyan : msg.error ? C.red : C.green}>
-                    {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
-                  </Text>
-                  <Text color={msg.error ? C.red : C.fg} wrap="wrap">
-                    {msg.content}
-                    {streaming && i === visible.length - 1
-                      ? (msg.content ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`)
-                      : ''}
-                  </Text>
-                </Box>
-              ))}
+              {(() => {
+                const sepLen = Math.max(12, Math.min(Math.max(4, width - 6), 72))
+                const sepLine = '─'.repeat(sepLen)
+                return visible.map((msg, i) => (
+                  <React.Fragment key={i}>
+                    <Box flexDirection="column" marginBottom={1}>
+                      <Text bold color={msg.role === 'user' ? C.cyan : msg.error ? C.red : C.green}>
+                        {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
+                      </Text>
+                      <Text color={msg.error ? C.red : C.fg} wrap="wrap">
+                        {msg.content}
+                        {streaming && i === visible.length - 1
+                          ? (msg.content ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`)
+                          : ''}
+                      </Text>
+                    </Box>
+                    {msg.role === 'assistant' && visible[i + 1] !== undefined && (
+                      <Text color={C.grey}>{sepLine}</Text>
+                    )}
+                  </React.Fragment>
+                ))
+              })()}
             </>
         }
       </Box>
@@ -1094,7 +1114,7 @@ function EditorPane({
   } else if (mode === 'visual') {
     hintLine = 'y=yank  d=delete  o=swap  v=expand  V=contract  hjkl/arrows=extend  Esc=normal'
   } else {
-    hintLine = 'SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
+    hintLine = 'SPC/C-SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
   }
 
   const sortedBuffers = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
@@ -1196,6 +1216,8 @@ function App({
     quitAll: () => void
     reloadConfig: () => Promise<void>
     openConfig: () => void
+    /** Mutates active buffer status + triggers rerender (for completion errors etc.). */
+    setActiveBufferStatus: (status: string) => void
   }
 }) {
   const activeIndex = Math.max(0, buffers.findIndex(buffer => buffer.id === activeId))
@@ -1206,6 +1228,12 @@ function App({
 
   const [mode,           setMode]           = React.useState<EditorMode>('normal')
   const [ghostText,          setGhostText]          = React.useState<string | null>(null)
+  /** Mirrors ghostText for input handlers — streaming updates must not lag one render behind Tab. */
+  const ghostTextRef = React.useRef<string | null>(null)
+  const setGhostTextSync = React.useCallback((value: string | null) => {
+    ghostTextRef.current = value
+    setGhostText(value)
+  }, [])
   const [completionStreaming, setCompletionStreaming] = React.useState(false)
   const [scrollOffset,   setScrollOffset]   = React.useState(0)
   const [panel,          setPanel]          = React.useState<Panel>(null)
@@ -1252,7 +1280,7 @@ function App({
     abortRef.current?.abort()
     abortRef.current = null
     setCompletionStreaming(false)
-    setGhostText(null)
+    setGhostTextSync(null)
     setPrompt(null)
     pendingKeyRef.current = null
     setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
@@ -1262,7 +1290,7 @@ function App({
     visualExpandHistoryRef.current = []
     setCmdBuf('')
     setSearchBuf('')
-  }, [])
+  }, [setGhostTextSync])
 
   const saveCurrentBuffer = React.useCallback(() => {
     const path = snapshot?.filename ?? activeBuffer.filename ?? null
@@ -1290,7 +1318,7 @@ function App({
     abortRef.current?.abort()
     abortRef.current = null
     setCompletionStreaming(false)
-    setGhostText(null)
+    setGhostTextSync(null)
     setPrompt(null)
     pendingKeyRef.current = null
     setMode('normal')
@@ -1382,6 +1410,7 @@ function App({
         setPanel({ type: 'shell' })
       },
       review: () => runCodeClawReview(),
+      clearChat: () => clearAiChat(),
     },
     {
       open: openGitPanel,
@@ -1439,6 +1468,13 @@ function App({
     const text = (overrideText ?? aiInput).trim()
     if (!text || aiStreaming) return
     if (!overrideText) setAiInput('')
+
+    setFixState(prev => {
+      const t = prev.status
+      if (t === 'done' || t === 'error' || t === 'trace') return { status: 'idle' }
+      return prev
+    })
+    setReviewState({ status: 'idle' })
 
     const userMsg: AiMessage = { role: 'user', content: text }
     setAiMessages(prev => [...prev, userMsg, { role: 'assistant', content: '' }])
@@ -1500,6 +1536,15 @@ function App({
     })()
   }
 
+  function clearAiChat() {
+    aiAbortRef.current?.abort()
+    aiAbortRef.current = null
+    setAiStreaming(false)
+    setAiMessages([])
+    setAiScrollOffset(0)
+    setAiInput('')
+  }
+
   function explainLastError() {
     const lastErr = shell.lastError ?? shell.lastFailedRun
     const text = lastErr
@@ -1534,9 +1579,9 @@ function App({
       finding.line != null && locPath
         ? [{ file: locPath, row: Math.max(0, finding.line - 1), col: 0, message: finding.title }]
         : []
-    const patchNote = finding.suggestedPatch?.trim()
-      ? `\n\nSuggested unified diff:\n${finding.suggestedPatch}`
-      : ''
+    const rawPatch = finding.suggestedPatch?.trim() ?? ''
+    const patchChunk = rawPatch.length > 12000 ? `${rawPatch.slice(0, 12000)}\n… [truncated ${rawPatch.length - 12000} chars]` : rawPatch
+    const patchNote = patchChunk ? `\n\nSuggested unified diff:\n${patchChunk}` : ''
     return {
       id: `codeclaw-review-${now}`,
       command: 'codeclaw-review',
@@ -1611,7 +1656,7 @@ function App({
     void (async () => {
       try {
         const tasks = loadTasks(process.cwd())
-        const proposal = await generatePatchProposal(context, ctrl.signal, tasks)
+        const proposal = await generatePatchProposal(context, ctrl.signal, tasks, process.cwd())
         setFixState({ status: 'proposal', traceId, startedAt, context, proposal, risk: assessPatchRisk(proposal), mediumConfirm: false })
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
@@ -1624,7 +1669,8 @@ function App({
     })()
   }
 
-  function runCodeClawReview() {
+  function runCodeClawReview(opts?: { clearFixState?: boolean }) {
+    const clearFixState = opts?.clearFixState ?? true
     const cwd = process.cwd()
     const gitCtx = collectGitContext(cwd)
     const activeFile = snapshot?.filename ?? ''
@@ -1633,6 +1679,14 @@ function App({
 
     const traceId = makeReviewTraceId()
     const startedAt = new Date().toISOString()
+
+    if (clearFixState) {
+      setFixState(prev => {
+        const t = prev.status
+        if (t === 'done' || t === 'error' || t === 'trace') return { status: 'idle' }
+        return prev
+      })
+    }
 
     setReviewState({ status: 'generating' })
     setPanel({ type: 'ai', focused: false })
@@ -1645,7 +1699,8 @@ function App({
     void (async () => {
       const diff = [gitCtx.diff, gitCtx.status].filter(Boolean).join('\n')
       try {
-        const proposal = await generateReviewProposal(diff, rules, activeFile, openBuffers, ctrl.signal)
+        const activeEditorBody = (snapshot?.lines ?? []).join('\n')
+        const proposal = await generateReviewProposal(diff, rules, activeFile, openBuffers, ctrl.signal, activeEditorBody)
         const endedAt = new Date().toISOString()
         const trace = buildReviewTrace({
           id: traceId,
@@ -1716,24 +1771,14 @@ function App({
         sidecar.open(activePath)
       }
 
-      const tasks = loadTasks(process.cwd())
-      const verifyCommand = resolveTaskCommand(proposal.verifyTask, tasks)
-        ?? (proposal.verifyTask.includes(' ') ? proposal.verifyTask : null)
-        ?? context.lastFailedRun.command
-      const verify = await shell.runTracked(verifyCommand)
-      const result: VerifyResult = { run: verify }
-      const trace = buildTrace(traceId, startedAt, context, proposal, true, result)
+      const trace = buildTrace(traceId, startedAt, context, proposal, true, undefined, undefined, 'codeclaw_review')
       const tracePath = writeTrace(process.cwd(), trace)
-      const passed = result.run.exitCode === 0
       setFixState({
         status: 'done',
-        message: passed
-          ? `Verification passed: ${result.run.command}`
-          : `Verification failed${result.run.exitCode === undefined ? '' : ` with exit ${result.run.exitCode}`}: ${result.run.command}`,
+        message: 'Patch applied. Running CodeClaw review (same as SPC a r)…',
         tracePath,
-        verify: result,
       })
-      setPanel({ type: 'shell' })
+      runCodeClawReview({ clearFixState: false })
     })()
   }
 
@@ -1757,24 +1802,51 @@ function App({
   }
 
   function triggerCompletion() {
-    if (!snapshot) return
+    // Native sidecar may not have sent snapshot yet — still offer completion on empty/scratch.
+    const lines = snapshot?.lines ?? ['']
+    const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+    const fname = snapshot?.filename ?? activeBuffer.filename ?? null
     abortRef.current?.abort()
     const controller = new AbortController()
     abortRef.current = controller
     setCompletionStreaming(true)
-    setGhostText('')
+    setGhostTextSync('')
+    debugLog('completion', 'trigger_begin', {
+      logFile: getDebugLogPath(),
+      filename: fname,
+      cursor,
+      lineCount: lines.length,
+      bufferChars: lines.join('\n').length,
+    })
     void (async () => {
       try {
         let acc = ''
         for await (const chunk of streamCompletion(
-          snapshot.filename, snapshot.lines, snapshot.cursor, controller.signal, shellLines,
+          fname, lines, cursor, controller.signal, shellLines,
         )) {
           acc += chunk
           const cleaned = sanitizeInlineCompletion(acc)
-          setGhostText(cleaned.length > 0 ? cleaned : '')
+          setGhostTextSync(cleaned.length > 0 ? cleaned : '')
         }
-      } catch {
-        setGhostText(null)
+        const finalClean = sanitizeInlineCompletion(acc)
+        debugLog('completion', 'trigger_finish', {
+          aborted: controller.signal.aborted,
+          rawChars: acc.length,
+          cleanedChars: finalClean.length,
+          rawPreview: acc.slice(0, 500),
+          cleanedPreview: finalClean.slice(0, 240),
+        })
+      } catch (err) {
+        setGhostTextSync(null)
+        const msg = err instanceof Error ? err.message : String(err)
+        debugLog('completion', 'trigger_error', {
+          aborted: controller.signal.aborted,
+          error: msg,
+          stack: err instanceof Error ? err.stack?.slice(0, 1200) : undefined,
+        })
+        if (!/abort/i.test(msg)) {
+          actions.setActiveBufferStatus(`completion failed: ${msg.slice(0, 80)}`)
+        }
       } finally {
         setCompletionStreaming(false)
       }
@@ -1813,6 +1885,12 @@ function App({
 
   useInput((input, key) => {
     if (key.ctrl && input === 'q') { actions.quitAll(); return }
+    // Space opens the leader menu in the editor, but Space is also typed into the AI chat — use Ctrl+Space anytime.
+    if (key.ctrl && input === ' ') {
+      pendingKeyRef.current = null
+      setPanel({ type: 'whichkey', node: leaderMap, path: '' })
+      return
+    }
     if (key.ctrl && input === 't') {
       setPanel(prev => prev?.type === 'shell' ? null : { type: 'shell' })
       return
@@ -1946,6 +2024,7 @@ function App({
     if (panel?.type === 'ai' && panel.focused) {
       if (key.escape)                                  { setPanel({ type: 'ai', focused: false }); return }
       if (key.ctrl && input === 'c')                   { aiAbortRef.current?.abort(); setAiStreaming(false); return }
+      if (key.ctrl && input === 'l')                   { clearAiChat(); return }
       if (input === '!' && !aiInput && aiShellCmd) {
         if (shell.mode === 'runner') {
           setShellInput(aiShellCmd)
@@ -1955,8 +2034,9 @@ function App({
         setPanel({ type: 'shell' })
         return
       }
-      if (key.tab) {
-        if (aiNavLoc) { actions.openFile(aiNavLoc.file, { row: aiNavLoc.row, col: aiNavLoc.col }); setPanel({ type: 'ai', focused: false }) }
+      if (key.tab && aiNavLoc) {
+        actions.openFile(aiNavLoc.file, { row: aiNavLoc.row, col: aiNavLoc.col })
+        setPanel({ type: 'ai', focused: false })
         return
       }
       if (key.return) {
@@ -2348,9 +2428,11 @@ function App({
       if (key.return)                 { sidecar.insert('\n'); return }
       if (key.ctrl && input === 's')  { saveCurrentBuffer(); return }
       if (key.tab || input === '\t') {
-        if (ghostText !== null && ghostText.length > 0) {
-          sidecar.insert(ghostText)
-          setGhostText(null)
+        const g = ghostTextRef.current
+        if (g !== null && g.length > 0) {
+          // Already sanitized each chunk while streaming — second full pass was stripping valid gaps to ''.
+          sidecar.insert(g)
+          setGhostTextSync(null)
           abortRef.current = null
         } else {
           triggerCompletion()
@@ -2471,6 +2553,19 @@ function App({
     if (key.downArrow)  { sidecar.move('down');  return }
     if (key.leftArrow)  { sidecar.move('left');  return }
     if (key.rightArrow) { sidecar.move('right'); return }
+
+    // Inline completion (same as insert mode — works after SPC a c while still in normal)
+    if (key.tab || input === '\t') {
+      const g = ghostTextRef.current
+      if (g !== null && g.length > 0) {
+        sidecar.insert(g)
+        setGhostTextSync(null)
+        abortRef.current = null
+      } else {
+        triggerCompletion()
+      }
+      return
+    }
 
     // Enter command mode
     if (input === ':') { setMode('command'); setCmdBuf(''); pendingKeyRef.current = null; return }
@@ -2717,6 +2812,21 @@ function App({
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function main() {
+  const codeclawTracesDir = join(codeClawDir(process.cwd()), 'traces')
+  const logPath = getDebugLogPath()
+  if (logPath) {
+    console.error(`[qe-debug] logging to ${logPath}`)
+    console.error(`[qe-debug] CodeClaw traces: ${codeclawTracesDir} | review: ${join(codeclawTracesDir, 'review')}`)
+  }
+  debugLog('process', 'boot', {
+    argv: process.argv.slice(2),
+    cwd: process.cwd(),
+    gitRoot: getGitRepoRoot(process.cwd()),
+    logFile: logPath,
+    codeclawTracesDir,
+    codeclawReviewTracesDir: join(codeclawTracesDir, 'review'),
+    node: process.version,
+  })
   const filename = process.argv[2]
   const cwd  = process.cwd()
   const cols = process.stdout.columns || 80
@@ -3009,6 +3119,13 @@ async function main() {
             quitAll,
             reloadConfig: reloadCfg,
             openConfig,
+            setActiveBufferStatus: (status: string) => {
+              const b = activeBuffer()
+              if (!b) return
+              b.status = status
+              buffers = [...buffers]
+              refresh()
+            },
           }}
         />
       </AlternateScreen>

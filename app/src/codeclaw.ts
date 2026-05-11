@@ -1,7 +1,31 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join, isAbsolute, normalize, relative } from 'node:path'
+import { dirname, join, isAbsolute, normalize, relative, resolve } from 'node:path'
 import type { ShellRun } from './shell.js'
+
+/** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
+const FIX_PROMPT_MAX_RULES = 8000
+const FIX_PROMPT_MAX_GIT_STATUS = 4000
+const FIX_PROMPT_MAX_USER_REQUEST = 4000
+const FIX_PROMPT_MAX_MEMORY = 4000
+const FIX_PROMPT_MAX_GIT_DIFF = 12000
+const FIX_PROMPT_MAX_FILE_SNIPPET = 12000
+const FIX_PROMPT_MAX_OPEN_BUFFERS = 8
+const FIX_PROMPT_MAX_SHELL_STDOUT = 6000
+const FIX_PROMPT_MAX_SHELL_STDERR = 6000
+
+function sliceWithTruncNote(s: string, max: number): string {
+  if (s.length <= max) return s
+  return `${s.slice(0, max)}\n… [truncated ${String(s.length - max)} chars]`
+}
+
+function trimShellRunForPrompt(run: ShellRun): ShellRun {
+  return {
+    ...run,
+    stdout: sliceWithTruncNote(run.stdout, FIX_PROMPT_MAX_SHELL_STDOUT),
+    stderr: sliceWithTruncNote(run.stderr, FIX_PROMPT_MAX_SHELL_STDERR),
+  }
+}
 
 export type FixContext = {
   activeFile: {
@@ -81,7 +105,11 @@ export type CodeClawTrace = {
     startedAt?: string
     endedAt?: string
   }
+  /** Patch applied; verification was delegated to CodeClaw review instead of running a shell command. */
+  verifyDelegation?: 'codeclaw_review'
   error?: string
+  /** Present when `error` is set — normalized diff heads so traces are debuggable without stderr only. */
+  patchPreview?: Array<{ path: string; unifiedDiffHead: string }>
 }
 
 export type PatchRiskAssessment = {
@@ -152,8 +180,19 @@ const DEFAULT_RULES = [
   '- Prefer patches that can be verified by one command.',
 ].join('\n')
 
-const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://localhost:11434'
+const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://127.0.0.1:11434'
 const OLLAMA_MODEL = process.env['OLLAMA_MODEL'] ?? 'llama3.2:latest'
+
+/**
+ * CodeClaw uses large `/api/generate` prompts; Ollama keeps models + KV cache resident by default.
+ * Default `keep_alive: "0"` unloads after each CodeClaw request (same effect as restarting Ollama for RAM).
+ * Set `OLLAMA_CODECLAW_KEEP_ALIVE=` (empty) to omit and use server default, or `5m` etc. to tune.
+ */
+function codeClawOllamaKeepAliveField(): { keep_alive?: string } {
+  const v = process.env['OLLAMA_CODECLAW_KEEP_ALIVE']
+  if (v === '') return {}
+  return { keep_alive: v ?? '0' }
+}
 
 export function codeClawDir(cwd: string): string {
   return join(cwd, '.codeclaw')
@@ -247,16 +286,36 @@ export function createFixContext(input: FixContextInput): FixContext {
   }
 }
 
-export async function generatePatchProposal(context: FixContext, signal: AbortSignal, tasks: CodeClawTask[] = []): Promise<PatchProposal> {
-  const prompt = buildProposalPrompt(context, tasks)
-  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+export async function generatePatchProposal(
+  context: FixContext,
+  signal: AbortSignal,
+  tasks: CodeClawTask[] = [],
+  cwd: string = process.cwd(),
+): Promise<PatchProposal> {
+  const system = buildProposalSystemPrompt(context, tasks)
+  const user = buildProposalUserMessage(context)
+  const response = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: OLLAMA_MODEL,
-      prompt,
       stream: false,
       format: 'json',
+      // Low temperature + bounded output. num_predict must fit whole JSON; models often emit huge
+      // unifiedDiff strings — truncation yields "Unterminated string in JSON". Cap via env on weak HW.
+      options: {
+        temperature: 0.05,
+        num_predict: (() => {
+          const v = process.env['OLLAMA_CODECLAW_NUM_PREDICT']?.trim()
+          if (v && /^\d+$/.test(v)) return Math.min(8192, Math.max(512, parseInt(v, 10)))
+          return 2560
+        })(),
+      },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user',   content: user   },
+      ],
+      ...codeClawOllamaKeepAliveField(),
     }),
     signal,
   })
@@ -265,17 +324,17 @@ export async function generatePatchProposal(context: FixContext, signal: AbortSi
     throw new Error(`ollama ${response.status}: ${await response.text()}`)
   }
 
-  const payload = await response.json() as { response?: string }
-  const raw = payload.response ?? ''
+  const payload = await response.json() as { message?: { content?: string } }
+  const raw = payload.message?.content ?? ''
   try {
-    return parsePatchProposal(raw)
+    return parsePatchProposal(raw, cwd)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`${message}\nRaw response:\n${raw.slice(0, 2000)}`)
   }
 }
 
-export function parsePatchProposal(raw: string): PatchProposal {
+export function parsePatchProposal(raw: string, cwd: string = process.cwd()): PatchProposal {
   const json = extractJson(raw)
   let value: unknown
   try {
@@ -304,9 +363,9 @@ export function parsePatchProposal(raw: string): PatchProposal {
       continue
     }
     try {
-      const path = readString(file, 'path')
-      const unifiedDiffRaw = readString(file, 'unifiedDiff')
-      validatePatchPath(path)
+      const rawPath = readString(file, 'path')
+      const path = normalizeProposalPath(cwd, rawPath)
+      const unifiedDiffRaw = readUnifiedDiffField(file)
       const unifiedDiff = normalizeUnifiedDiffForGitApply(path, unifiedDiffRaw)
       if (!unifiedDiff.includes('--- ') || !unifiedDiff.includes('+++ ') || !unifiedDiff.includes('@@')) {
         throw new Error('missing unified diff markers')
@@ -335,24 +394,142 @@ export function parsePatchProposal(raw: string): PatchProposal {
   return { summary, rootCause, files, verifyTask, risk, notes }
 }
 
+/** Cap for unsaved buffer text in review prompt — keep total prompt small for 1.5B models. */
+const REVIEW_PROMPT_ACTIVE_BUFFER_MAX = 1800
+/** Git diff slice for review — whole-repo diffs are huge; leading slice often omits the focused file entirely. */
+const REVIEW_PROMPT_DIFF_MAX = 1200
+
+/**
+ * Returns the unified-diff chunk for one repo-relative path, or '' if that file does not appear in `fullDiff`.
+ */
+export type GitDiffChunk = { pathA: string; body: string }
+
+/** Split a combined `git diff` into one string per file hunk (paths from the `a/` side). */
+export function splitGitDiffIntoChunks(fullDiff: string): GitDiffChunk[] {
+  const text = fullDiff.replace(/\r\n/g, '\n')
+  const rx = /^diff --git a\/(.+?) b\/(.+?)$/gm
+  const hits: { idx: number; pathA: string }[] = []
+  let m: RegExpExecArray | null
+  while ((m = rx.exec(text)) !== null) {
+    hits.push({ idx: m.index, pathA: (m[1] ?? '').replace(/\\/g, '/') })
+  }
+  const out: GitDiffChunk[] = []
+  for (let i = 0; i < hits.length; i++) {
+    const { idx, pathA } = hits[i]!
+    const end = i + 1 < hits.length ? hits[i + 1]!.idx : text.length
+    out.push({ pathA, body: text.slice(idx, end).trimEnd() })
+  }
+  return out
+}
+
+export function extractGitDiffForPath(fullDiff: string, repoRelativePath: string): string {
+  const want = repoRelativePath.trim().replace(/^\.?\//, '').replace(/\\/g, '/')
+  if (!want) return ''
+  const text = fullDiff.replace(/\r\n/g, '\n')
+  const rx = /^diff --git a\/(.+?) b\/(.+?)$/gm
+  const hits: { idx: number; pathA: string }[] = []
+  let m: RegExpExecArray | null
+  while ((m = rx.exec(text)) !== null) {
+    hits.push({ idx: m.index, pathA: (m[1] ?? '').replace(/\\/g, '/') })
+  }
+  for (let i = 0; i < hits.length; i++) {
+    const { idx, pathA } = hits[i]!
+    if (pathA !== want && !pathA.endsWith(`/${want}`)) continue
+    const end = i + 1 < hits.length ? hits[i + 1]!.idx : text.length
+    return text.slice(idx, end).trimEnd()
+  }
+  return ''
+}
+
+function reviewChunkSortKey(pathA: string, activePath: string): number {
+  const want = activePath.trim().replace(/^\.?\//, '').replace(/\\/g, '/')
+  if (!want || want === 'unknown') return 0
+  const topSeg = want.includes('/') ? want.slice(0, want.indexOf('/')) : want
+  const chunkTop = pathA.includes('/') ? pathA.slice(0, pathA.indexOf('/')) : pathA
+
+  let key = 300
+  if (pathA === want || pathA.endsWith(`/${want}`)) key = 0
+  else if (pathA.startsWith(`${topSeg}/`) || pathA === topSeg) key = 40
+  else if (chunkTop !== topSeg) key += 80
+
+  if (/\/test\/|\.test\.ts$|\.test\.tsx$/i.test(pathA)) key += 60
+  return key
+}
+
+/**
+ * Build a short diff excerpt for the review model.
+ * - Always prefers hunks for the focused path when present.
+ * - If the focused file has no hunk, avoids implying unrelated leading hunks describe that file (small models hallucinate).
+ * - Deprioritizes hunks under paths like app/test/ (fixtures may embed fake diff --git string literals).
+ */
+export function buildReviewDiffSnippet(gitDiff: string, activePath: string, maxChars: number): string {
+  const text = gitDiff.replace(/\r\n/g, '\n')
+  if (!text.trim()) return '(no changes)'
+  const want = activePath.trim().replace(/^\.?\//, '').replace(/\\/g, '/')
+  const trunc = (s: string) =>
+    s.length <= maxChars ? s : `${s.slice(0, maxChars)}\n… [truncated ${String(s.length - maxChars)} chars]`
+
+  const chunks = splitGitDiffIntoChunks(text)
+  const focused = want && want !== 'unknown' ? extractGitDiffForPath(text, want) : ''
+
+  const sorted = [...chunks].sort(
+    (a, b) => reviewChunkSortKey(a.pathA, want) - reviewChunkSortKey(b.pathA, want) || a.pathA.localeCompare(b.pathA),
+  )
+
+  let parts: string[] = []
+  if (!focused && want !== 'unknown') {
+    parts.push(
+      `(No unstaged git diff entry for ${want} — treat the active buffer above as the source of truth for that path.)`,
+    )
+  }
+  if (focused) parts.push(focused)
+
+  for (const ch of sorted) {
+    if (want !== 'unknown' && (ch.pathA === want || ch.pathA.endsWith(`/${want}`))) continue
+    parts.push(ch.body)
+  }
+
+  const joined = parts.join('\n')
+  return trunc(joined)
+}
+
 export async function generateReviewProposal(
   gitDiff: string,
   rules: string,
   activeFile: string,
   _openBuffers: string[],
   signal: AbortSignal,
+  /** Live editor text for the active buffer (optional). Git diff alone misses unsaved duplicates etc. */
+  activeEditorBody?: string,
 ): Promise<ReviewProposal> {
   // Keep the prompt short — small models (1.5b) fail on long structured prompts
   const rulesSnippet = rules ? rules.slice(0, 500) : 'none'
-  const diffSnippet  = gitDiff ? gitDiff.slice(0, 1200) : '(no changes)'
-  const prompt = `Review this git diff for bugs, style issues, and rule violations.
+  const activePath = activeFile.trim() || 'unknown'
+  const diffSnippet = buildReviewDiffSnippet(gitDiff, activePath, REVIEW_PROMPT_DIFF_MAX)
+  const trimmedBuf = typeof activeEditorBody === 'string' ? activeEditorBody.trim() : ''
+  const bufferSnippet =
+    trimmedBuf.length === 0
+      ? ''
+      : `\n--- Active buffer content (${activePath}) — editor state; may be missing from git diff ---\n${
+          trimmedBuf.length > REVIEW_PROMPT_ACTIVE_BUFFER_MAX
+            ? `${trimmedBuf.slice(0, REVIEW_PROMPT_ACTIVE_BUFFER_MAX)}\n…[truncated]`
+            : trimmedBuf
+        }\n`
+  const prompt = `The user ran review while focused on file: ${activePath}
+You MUST review that buffer content first (below if present). Report findings for "${activePath}" when you see duplicates, dead imports, merge junk, wrong exports, or syntax issues there — even if the git diff excerpt does not mention this path (diff is truncated; unsaved edits never appear in git).
+Then also scan the git diff excerpt for other repo issues.
+
+Hard constraints:
+- Do NOT report "unused import" unless the active buffer actually contains an import line (e.g. starts with import). If add/sum are defined with export function in the same file, they are not imports.
+- Findings must match the active buffer text above; do not repeat stale issues that are already fixed in that buffer.
+- Duplicate export means the **same identifier** exported twice (e.g. two \`export function sum\`). Two different names (add vs sum) are never duplicates. Do not invent duplicates.
+- Git excerpt may include test files whose **string literals** look like unified diffs — those lines are **not** the focused source file; ignore them when judging ${activePath}.
+
 Return JSON only: {"summary":"<one sentence>","safeToCommit":true|false,"findings":[{"severity":"blocker|warning|note","file":"<path>","title":"<short>","explanation":"<detail>"}]}
 
 Rules: ${rulesSnippet}
-
-Active file: ${activeFile || 'unknown'}
-
-Diff:
+${bufferSnippet}
+--- Git diff excerpt (focused file first when it has changes; then other paths) ---
 ${diffSnippet}`
 
   const response = await fetch(`${OLLAMA_URL}/api/generate`, {
@@ -363,6 +540,7 @@ ${diffSnippet}`
       prompt,
       stream: false,
       format: 'json',
+      ...codeClawOllamaKeepAliveField(),
     }),
     signal,
   })
@@ -373,7 +551,80 @@ ${diffSnippet}`
 
   const payload = await response.json() as { response?: string }
   const raw = payload.response ?? ''
-  return parseReviewProposal(raw)
+  const proposal = parseReviewProposal(raw)
+  if (trimmedBuf)
+    proposal.findings = filterReviewFindingsAgainstActiveBuffer(activePath, trimmedBuf, proposal.findings)
+  return proposal
+}
+
+function normReviewPath(p: string): string {
+  return p.trim().replace(/\\/g, '/').replace(/^\.?\//, '')
+}
+
+function reviewPathsMatch(findingFile: string, activePath: string): boolean {
+  const f = normReviewPath(findingFile)
+  const a = normReviewPath(activePath)
+  if (!f || !a || a === 'unknown') return false
+  return f === a || f.endsWith(`/${a}`) || a.endsWith(`/${f}`)
+}
+
+function escapeRegExpIdent(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Count top-level `export function name` / `export async function name` declarations. */
+function countExportedFunctionDeclarations(buffer: string, name: string): number {
+  const re = new RegExp(`^\\s*export\\s+(?:async\\s+)?function\\s+${escapeRegExpIdent(name)}\\b`, 'gm')
+  return (buffer.match(re) ?? []).length
+}
+
+function bufferHasImportStatement(buffer: string): boolean {
+  return /^\s*import\s+/m.test(buffer)
+}
+
+/**
+ * Drop obvious LLM hallucinations for the focused file when we have the real buffer (small models invent duplicate exports / imports).
+ */
+export function filterReviewFindingsAgainstActiveBuffer(
+  activePath: string,
+  buffer: string,
+  findings: ReviewFinding[],
+): ReviewFinding[] {
+  const want = normReviewPath(activePath)
+  if (!want || want === 'unknown' || !buffer.trim()) return findings
+
+  return findings.filter(f => {
+    if (!reviewPathsMatch(f.file, want)) return true
+
+    const blob = `${f.title}\n${f.explanation}`
+
+    const dupTitle = f.title.match(/\bDuplicate\s+export\s*:\s*(\w+)/i)
+    if (dupTitle) {
+      const n = dupTitle[1]!
+      if (countExportedFunctionDeclarations(buffer, n) < 2) return false
+    }
+
+    const twoNamed = blob.match(/\btwo\s+functions\s+named\s+[`']?(\w+)[`']?/i)
+    if (twoNamed && countExportedFunctionDeclarations(buffer, twoNamed[1]!) < 2) return false
+
+    if (/\bduplicate\b/i.test(blob)) {
+      for (const m of blob.matchAll(/`(\w+)`/g)) {
+        const n = m[1]!
+        if (!/^[A-Za-z_$][\w$]*$/.test(n)) continue
+        const idx = m.index ?? 0
+        const near = blob.slice(Math.max(0, idx - 56), Math.min(blob.length, idx + 56))
+        if (/\bduplicate|two\s+functions\b/i.test(near) && countExportedFunctionDeclarations(buffer, n) < 2) return false
+      }
+    }
+
+    if (
+      /\b(unused\s+import|from\s+an\s+import|imported\s+from)\b/i.test(blob) &&
+      !bufferHasImportStatement(buffer)
+    )
+      return false
+
+    return true
+  })
 }
 
 export function parseReviewProposal(raw: string): ReviewProposal {
@@ -426,13 +677,18 @@ export function applyPatchProposal(cwd: string, proposal: PatchProposal): { ok: 
     return { ok: false, error: `patch is ${risk.level} risk: ${risk.reasons.join('; ')}` }
   }
 
+  const filesNorm = proposal.files.map(file => ({
+    path: file.path,
+    unifiedDiff: normalizeUnifiedDiffForGitApply(file.path, file.unifiedDiff),
+  }))
+
   try {
-    validatePatchProposal(proposal)
+    validatePatchProposalFiles(filesNorm)
   } catch (error) {
     return { ok: false, error: String(error instanceof Error ? error.message : error) }
   }
 
-  const patch = proposal.files.map(file => file.unifiedDiff.trimEnd()).join('\n') + '\n'
+  const patch = filesNorm.map(file => file.unifiedDiff.trimEnd()).join('\n') + '\n'
   const check = spawnSync('git', ['apply', '--check', '--whitespace=nowarn', '--'], {
     cwd,
     input: patch,
@@ -567,7 +823,16 @@ export function buildTrace(
   accepted: boolean,
   verify?: VerifyResult,
   error?: string,
+  verifyDelegation?: 'codeclaw_review',
 ): CodeClawTrace {
+  const patchPreview =
+    error && proposal && proposal.files.length > 0
+      ? proposal.files.slice(0, 8).map(file => ({
+          path: file.path,
+          unifiedDiffHead: normalizeUnifiedDiffForGitApply(file.path, file.unifiedDiff).slice(0, 4000),
+        }))
+      : undefined
+
   return {
     id,
     workflow: 'fix',
@@ -598,7 +863,9 @@ export function buildTrace(
       startedAt: verify.run.startedAt,
       endedAt: verify.run.endedAt,
     } : undefined,
+    ...(verifyDelegation && !verify ? { verifyDelegation } : {}),
     error,
+    ...(patchPreview ? { patchPreview } : {}),
   }
 }
 
@@ -626,13 +893,82 @@ export function readLatestTrace(cwd: string): TraceSummary | null {
   return { trace, path: latest.path }
 }
 
-function validatePatchProposal(proposal: PatchProposal): void {
-  for (const file of proposal.files) {
+function validatePatchProposalFiles(files: PatchProposal['files']): void {
+  for (const file of files) {
     validatePatchPath(file.path)
     if (!file.unifiedDiff.includes('--- ') || !file.unifiedDiff.includes('+++ ') || !file.unifiedDiff.includes('@@')) {
       throw new Error(`invalid unified diff for ${file.path}`)
     }
+    validateUnifiedDiffBody(file.path, file.unifiedDiff)
   }
+}
+
+function validatePatchProposal(proposal: PatchProposal): void {
+  validatePatchProposalFiles(proposal.files)
+}
+
+/**
+ * Walk the diff body once we're inside a hunk (after `@@`). Every line must start with
+ * ` `, `+`, `-`, or `\` (no-newline marker). Anything else is prose the model wrote
+ * between hunks — `git apply` rejects it as "patch with only garbage at line N",
+ * which is opaque to users. Surface the offending line ourselves.
+ */
+export function validateUnifiedDiffBody(path: string, unifiedDiff: string): void {
+  const lines = unifiedDiff.replace(/\r\n/g, '\n').split('\n')
+  let inHunk = false
+  /** Lines consuming old-file side of the hunk (` ` + `-`). */
+  let remainingOld = 0
+  /** Lines consuming new-file side (` ` + `+`). `Math.max(old,new)` is wrong when context lines exist. */
+  let remainingNew = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (line.startsWith('@@')) {
+      inHunk = true
+      const match = line.match(/^@@ -\d+(?:,(\d+))? \+\s*\d+(?:,(\d+))? @@/)
+      if (match) {
+        remainingOld = match[1] ? parseInt(match[1], 10) : 1
+        remainingNew = match[2] ? parseInt(match[2], 10) : 1
+      } else {
+        remainingOld = Number.POSITIVE_INFINITY
+        remainingNew = Number.POSITIVE_INFINITY
+      }
+      continue
+    }
+    if (line.startsWith('diff --git') || line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('index ')) {
+      inHunk = false
+      remainingOld = 0
+      remainingNew = 0
+      continue
+    }
+    if (!inHunk) continue
+
+    const hunkEnded = remainingOld <= 0 && remainingNew <= 0
+    if (hunkEnded) {
+      // Hunk is closed — only blanks or `\ No newline…` may appear before the next `@@`.
+      // Do NOT accept `+`/`-`/space lines here: git treats them as a corrupt patch (no fresh @@ header).
+      if (line === '') continue
+      if (line.startsWith('\\')) continue
+      throw new Error(`invalid unified diff for ${path}: extra content after hunk on line ${i + 1}: ${shortLine(line)}`)
+    }
+
+    if (line === '' || /^[ +\-\\]/.test(line)) {
+      if (line.startsWith('\\')) {
+        /* `\ No newline at end of file` — no line-count debit */
+      } else if (line.startsWith(' ') || line.startsWith('-')) {
+        if (remainingOld > 0) remainingOld--
+      }
+      if (line.startsWith(' ') || line.startsWith('+')) {
+        if (remainingNew > 0) remainingNew--
+      }
+      continue
+    }
+    throw new Error(`invalid unified diff for ${path}: line ${i + 1} must start with ' ', '+', '-' or '\\' but got: ${shortLine(line)}`)
+  }
+}
+
+function shortLine(s: string): string {
+  const t = s.length > 80 ? `${s.slice(0, 80)}…` : s
+  return JSON.stringify(t)
 }
 
 function isTestPath(path: string): boolean {
@@ -661,6 +997,76 @@ function validatePatchPath(path: string): void {
   }
 }
 
+/** Walk up from `startDir` until a `.git` entry exists (file or directory). */
+function findGitRoot(startDir: string): string | null {
+  let dir = resolve(startDir)
+  for (let i = 0; i < 48; i++) {
+    if (existsSync(join(dir, '.git'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+  return null
+}
+
+/**
+ * Models often return paths like `../other/pkg/foo.ts` when cwd is a subfolder — valid on disk but
+ * rejected by validatePatchPath. Resolve against cwd + git root and return a safe repo-relative path.
+ */
+export function normalizeProposalPath(cwd: string, rawPath: string): string {
+  const trimmed = rawPath.trim().replace(/\\/g, '/')
+  if (!trimmed) throw new Error('empty patch path')
+
+  const normTrim = normalize(trimmed).replace(/\\/g, '/')
+  try {
+    validatePatchPath(normTrim)
+    return normTrim
+  } catch {
+    /* Path escapes cwd — resolve via git root below */
+  }
+
+  const repoRoot = findGitRoot(cwd)
+  const absFromCwd = resolve(cwd, trimmed)
+
+  const tryUnderRoot = (root: string, absolute: string): string | null => {
+    const rel = normalize(relative(root, absolute)).replace(/\\/g, '/')
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null
+    validatePatchPath(rel)
+    return rel
+  }
+
+  if (repoRoot) {
+    const hit = tryUnderRoot(repoRoot, absFromCwd)
+    if (hit !== null) return hit
+  }
+
+  const hitCwd = tryUnderRoot(cwd, absFromCwd)
+  if (hitCwd !== null) return hitCwd
+
+  // Model assumed cwd one level deeper: strip leading ../ and re-resolve within repo
+  const collapsed = trimmed.replace(/^(\.\.[\\/])+/, '')
+  const normCollapsed = normalize(collapsed.replace(/\\/g, '/')).replace(/\\/g, '/')
+  if (!normCollapsed || normCollapsed.startsWith('..') || isAbsolute(normCollapsed)) {
+    throw new Error(`unsafe patch path: ${rawPath}`)
+  }
+
+  const absCollapsed = resolve(cwd, normCollapsed)
+  if (repoRoot) {
+    const hit = tryUnderRoot(repoRoot, absCollapsed)
+    if (hit !== null) return hit
+  }
+
+  const hit2 = tryUnderRoot(cwd, absCollapsed)
+  if (hit2 !== null) return hit2
+
+  throw new Error(`unsafe patch path: ${rawPath}`)
+}
+
+/** Models sometimes wrap hunk headers as `[@@ -1,3 +1,3 @@]` inside JSON strings — git rejects that. */
+export function sanitizeUnifiedDiffBracketHunks(unifiedDiff: string): string {
+  return unifiedDiff.replace(/\[(@@[^\]\r\n]+)\]/g, '$1')
+}
+
 /** Fixes glued tokens small models emit: `--- a/x+++ b/y` or `+++ b/x@@ -1,2`. */
 export function sanitizeUnifiedDiffGlue(unifiedDiff: string): string {
   let t = unifiedDiff.replace(/\r\n/g, '\n')
@@ -672,11 +1078,220 @@ export function sanitizeUnifiedDiffGlue(unifiedDiff: string): string {
 }
 
 /**
+ * Models often emit prose or duplicate source lines between `---`/`+++` and the first `@@`.
+ * Our hunk validator skips those lines when not yet `inHunk`, so they slip through — then
+ * `git apply` fails with "patch with only garbage at line N". Drop those lines.
+ */
+export function sanitizeUnifiedDiffInterstitial(unifiedDiff: string): string {
+  const lines = unifiedDiff.replace(/\r\n/g, '\n').split('\n')
+  const out: string[] = []
+  let gap: 'none' | 'after_minus' | 'after_plus' = 'none'
+
+  for (const line of lines) {
+    if (gap === 'after_minus') {
+      if (line.startsWith('+++ ')) {
+        out.push(line)
+        gap = 'after_plus'
+        continue
+      }
+      if (line === '') {
+        out.push(line)
+        continue
+      }
+      if (line.startsWith('diff --git')) {
+        gap = 'none'
+        out.push(line)
+        continue
+      }
+      continue
+    }
+    if (gap === 'after_plus') {
+      if (line.startsWith('@@')) {
+        out.push(line)
+        gap = 'none'
+        continue
+      }
+      if (line === '') {
+        out.push(line)
+        continue
+      }
+      if (line.startsWith('diff --git')) {
+        gap = 'none'
+        out.push(line)
+        continue
+      }
+      if (line.startsWith('--- ')) {
+        gap = 'after_minus'
+        out.push(line)
+        continue
+      }
+      continue
+    }
+
+    out.push(line)
+    if (line.startsWith('--- ')) {
+      gap = 'after_minus'
+    }
+  }
+  return out.join('\n')
+}
+
+/**
+ * Inside `@@` hunks, every content line must start with ` `, `+`, `-`, or `\`.
+ * Small models often paste `}` / `export …` without the leading space — git apply rejects that.
+ * Only rewrite lines that look like code fragments (avoid turning prose into fake context).
+ */
+export function sanitizeUnifiedDiffBareHunkLines(unifiedDiff: string): string {
+  const lines = unifiedDiff.replace(/\r\n/g, '\n').split('\n')
+  let inHunk = false
+  const out: string[] = []
+  for (const line of lines) {
+    if (line.startsWith('@@')) {
+      inHunk = true
+      out.push(line)
+      continue
+    }
+    if (line.startsWith('diff --git') || line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('index ')) {
+      inHunk = false
+      out.push(line)
+      continue
+    }
+    if (!inHunk || line === '' || /^[ +\-\\]/.test(line)) {
+      out.push(line)
+      continue
+    }
+    const trimmed = line.trim()
+    const looksLikeCodeContin =
+      trimmed === '}' ||
+      trimmed === '};' ||
+      trimmed === ');' ||
+      /^[\}\]\);,]\s*;?\s*$/.test(trimmed) ||
+      /^[\{\(]\s*$/.test(trimmed) ||
+      /^(export|import|return|const|let|var|function|type|interface|enum|namespace|async|await)\b/.test(trimmed)
+    out.push(looksLikeCodeContin ? ` ${line}` : line)
+  }
+  return out.join('\n')
+}
+
+/** Allow `+ 9,5` typo (space after `+`) — git rejects it as corrupt patch. */
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+\s*(\d+)(?:,(\d+))? @@(.*)$/
+
+/**
+ * Rewrite each `@@ -ls,lc +rs,rc @@` so `lc`/`rc` match the following hunk body.
+ * Models often emit random counts (e.g. `7,7` for four lines) → `git apply`: corrupt patch.
+ */
+export function repairUnifiedDiffHunkHeaders(unifiedDiff: string): string {
+  const lines = unifiedDiff.replace(/\r\n/g, '\n').split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i] ?? ''
+    const hm = line.match(HUNK_HEADER_RE)
+    if (!hm) {
+      out.push(line)
+      i++
+      continue
+    }
+    const oldStart = hm[1]!
+    const newStart = hm[3]!
+    const rest = hm[5] ?? ''
+    i++
+    const bodyStart = i
+    while (i < lines.length) {
+      const L = lines[i] ?? ''
+      if (L.startsWith('@@') && /^@@ -\d+/.test(L)) break
+      if (L.startsWith('diff --git ')) break
+      i++
+    }
+    const body = lines.slice(bodyStart, i)
+    let oldCnt = 0
+    let newCnt = 0
+    for (const L of body) {
+      if (L.startsWith('\\')) continue
+      if (L === '') continue
+      const ch = L[0]
+      if (ch === ' ') {
+        oldCnt++
+        newCnt++
+      } else if (ch === '-') {
+        oldCnt++
+      } else if (ch === '+') {
+        newCnt++
+      }
+    }
+    out.push(`@@ -${oldStart},${oldCnt} +${newStart},${newCnt} @@${rest}`)
+    out.push(...body)
+  }
+  return out.join('\n')
+}
+
+/** Collapse `+ 9,5` / `- 9,5` style typos inside `@@ ... @@` lines (models emit spaces after +/- before line numbers). */
+function sanitizeUnifiedDiffSpacedHunkHeaders(unifiedDiff: string): string {
+  return unifiedDiff.replace(/^@@ -[^\n]*$/gm, line =>
+    line.replace(/-\s+(?=\d)/g, '-').replace(/\+\s+(?=\d)/g, '+'),
+  )
+}
+
+/**
+ * Models sometimes emit only `+`/`-`/` ` lines with no `@@` hunk header — git apply and our validator require `@@`.
+ */
+function prependSyntheticHunkIfBarePlusMinusLines(t: string): string {
+  const s = t.trim()
+  if (!s || s.includes('@@')) return t
+
+  const lines = s.split('\n')
+  const diffLines: string[] = []
+  for (const L of lines) {
+    if (L === '') continue
+    if (L.startsWith('\\')) {
+      diffLines.push(L)
+      continue
+    }
+    if (/^[ +-]/.test(L)) diffLines.push(L)
+  }
+  if (diffLines.length === 0) return t
+
+  let oldCnt = 0
+  let newCnt = 0
+  for (const L of diffLines) {
+    if (L.startsWith('\\')) continue
+    const ch = L[0]
+    if (ch === ' ') {
+      oldCnt++
+      newCnt++
+    } else if (ch === '-') {
+      oldCnt++
+    } else if (ch === '+') {
+      newCnt++
+    }
+  }
+  if (oldCnt === 0 && newCnt === 0) return t
+
+  const header =
+    oldCnt === 0 && newCnt > 0
+      ? `@@ -0,0 +1,${newCnt} @@`
+      : newCnt === 0 && oldCnt > 0
+        ? `@@ -1,${oldCnt} +0,0 @@`
+        : `@@ -1,${oldCnt} +1,${newCnt} @@`
+
+  return `${header}\n${diffLines.join('\n')}`
+}
+
+/**
  * Small models often return only `@@` hunks. `git apply` needs `--- a/...` + `+++ b/...` (and usually `diff --git`).
  */
 export function normalizeUnifiedDiffForGitApply(filePath: string, unifiedDiff: string): string {
-  const t = sanitizeUnifiedDiffGlue(unifiedDiff).replace(/\r\n/g, '\n').trim()
+  let t = sanitizeUnifiedDiffInterstitial(
+    sanitizeUnifiedDiffGlue(sanitizeUnifiedDiffBracketHunks(sanitizeUnifiedDiffBareHunkLines(unifiedDiff))),
+  ).replace(/\r\n/g, '\n').trim()
   if (!t) return t
+
+  t = sanitizeUnifiedDiffSpacedHunkHeaders(t)
+  t = prependSyntheticHunkIfBarePlusMinusLines(t)
+
+  if (t.includes('@@')) {
+    t = repairUnifiedDiffHunkHeaders(t)
+  }
 
   const hasGitPaths = /^---\s+a\//m.test(t) && /^\+\+\+\s+b\//m.test(t)
   if (hasGitPaths && t.includes('@@')) {
@@ -695,45 +1310,143 @@ export function normalizeUnifiedDiffForGitApply(filePath: string, unifiedDiff: s
   ].join('\n')
 }
 
-function buildProposalPrompt(context: FixContext, tasks: CodeClawTask[] = []): string {
-  const compact = {
-    ...context,
+/** Shrink context for the fix-model prompt (smaller payload + lower Ollama RAM). Full context remains in React until dismissed. */
+export function compactFixContextForPrompt(context: FixContext): FixContext {
+  return {
     activeFile: trimFile(context.activeFile),
-    openBuffers: context.openBuffers.map(trimFile).slice(0, 8),
+    openBuffers: context.openBuffers.map(trimFile).slice(0, FIX_PROMPT_MAX_OPEN_BUFFERS),
+    lastFailedRun: trimShellRunForPrompt(context.lastFailedRun),
     git: {
-      ...context.git,
-      diff: context.git.diff.slice(0, 12000),
+      branch: context.git.branch,
+      status: sliceWithTruncNote(context.git.status, FIX_PROMPT_MAX_GIT_STATUS),
+      diff: sliceWithTruncNote(context.git.diff, FIX_PROMPT_MAX_GIT_DIFF),
     },
-    memory: context.memory?.slice(0, 4000),
+    rules: sliceWithTruncNote(context.rules, FIX_PROMPT_MAX_RULES),
+    memory: context.memory !== undefined
+      ? sliceWithTruncNote(context.memory, FIX_PROMPT_MAX_MEMORY)
+      : undefined,
+    userRequest: sliceWithTruncNote(context.userRequest, FIX_PROMPT_MAX_USER_REQUEST),
   }
+}
 
-  const tasksList = tasks.length > 0
-    ? `Available verify tasks (use one of these IDs for "verifyTask"):\n${tasks.map(t => `  ${t.id}: ${t.cmd}${t.description ? ` — ${t.description}` : ''}`).join('\n')}`
-    : 'No tasks.json found — use a shell command string as verifyTask.'
+/** Top-level keys models wrongly echo instead of emitting a patch proposal (matches FixContext / review wording). */
+const FIX_PROMPT_FORBIDDEN_TOP_KEYS = [
+  'finding',
+  'findings',
+  'rules',
+  'memory',
+  'userRequest',
+  'activeFile',
+  'openBuffers',
+  'git',
+  'lastFailedRun',
+] as const
+
+/** Maximum chars for each section of the *user* message — small models echo big blobs, so per-section caps are tighter than the trace-saved FixContext caps above. */
+const USER_MSG_MAX_FILE = 4000
+const USER_MSG_MAX_OPEN_BUFFER = 800
+const USER_MSG_MAX_OPEN_BUFFERS = 4
+const USER_MSG_MAX_STDERR = 2000
+const USER_MSG_MAX_STDOUT = 1000
+const USER_MSG_MAX_GIT_DIFF = 4000
+const USER_MSG_MAX_GIT_STATUS = 1000
+const USER_MSG_MAX_USER_REQUEST = 2000
+
+function buildProposalSystemPrompt(context: FixContext, tasks: CodeClawTask[] = []): string {
+  const tasksLine = tasks.length > 0
+    ? `Verify tasks (pick one id for "verifyTask"): ${tasks.map(t => t.id).join(', ')}`
+    : 'No tasks.json — use a shell command string for "verifyTask".'
+
+  const rules = sliceWithTruncNote(context.rules, 1500)
 
   return [
-    'You are CodeClaw Fix, an AI workflow engine inside a terminal-native developer workspace.',
-    'Return ONLY strict JSON. Do not use markdown fences. Do not include prose outside the JSON.',
-    'CRITICAL: Top-level object MUST use keys summary, rootCause, files, verifyTask, risk — never only {"text":"..."}, {"message":"..."}, or {"version":…}.',
-    'Example (replace ellipsis with real patch content; unifiedDiff must be git-apply compatible):',
-    '{"summary":"Fix off-by-one","rootCause":"Wrong operator","files":[{"path":"src/foo.ts","unifiedDiff":"diff --git a/src/foo.ts b/src/foo.ts\\n--- a/src/foo.ts\\n+++ b/src/foo.ts\\n@@ -1 +1 @@\\n-old\\n+new\\n"}],"verifyTask":"npm test","risk":"low"}',
-    'Your JSON must match this TypeScript type exactly:',
-    '{ "summary": string, "rootCause": string, "files": [{ "path": string, "unifiedDiff": string }], "verifyTask": string, "risk": "low" | "medium" | "high", "notes"?: string[] }',
-    '"verifyTask" must be a task ID from the list below, or a shell command if no tasks are defined.',
-    '"risk" must be "low", "medium", or "high"; if omitted or invalid, it defaults to "medium".',
-    'Each unifiedDiff must be git-apply compatible: prefer a full unified diff (diff --git, --- a/<path>, +++ b/<path>, then @@ hunks). At minimum include @@ hunks; headers will be filled in if omitted.',
-    '"files" must contain only complete { "path", "unifiedDiff" } objects — never null, strings, or truncated entries.',
-    'Use the smallest safe change that fixes the observed failure.',
+    'You produce JSON patch proposals for a code editor.',
+    'Output exactly ONE JSON object. No markdown. No prose. No extra keys.',
     '',
-    tasksList,
+    'Schema:',
+    '{',
+    '  "summary":   "<one sentence>",',
+    '  "rootCause": "<one sentence>",',
+    '  "files":     [ { "path": "<repo path>", "unifiedDiff": ["<diff line 1>","<diff line 2>", "..."] } ],',
+    '  "verifyTask":"<task id or shell command>",',
+    '  "risk":      "low" | "medium" | "high"',
+    '}',
     '',
-    'FixContext:',
-    JSON.stringify(compact, null, 2),
+    'Rules:',
+    '- "files" MUST be a non-empty array of objects each with both "path" and "unifiedDiff".',
+    '- "path" MUST be repo-relative from git root. Never ../ or absolute paths.',
+    '- **unifiedDiff MUST be valid JSON:** PREFERRED: array of strings — ONE git-diff line per element (no embedded raw newlines inside a string). Alternative: a single string where every newline is the two chars backslash-n `\\n`, never an actual line break inside the quotes.',
+    '- Raw line breaks inside a quoted unifiedDiff string INVALIDATE the whole response (parser error).',
+    '- Put ONLY the minimal diff — never paste an entire large file unless the failure requires it.',
+    '- "unifiedDiff" MUST include @@ hunks; full git headers (diff --git, --- a/, +++ b/) preferred.',
+    '- **Hunk header syntax (git apply is strict):** each hunk starts with exactly `@@ -OLDSTART,OLDCOUNT +NEWSTART,NEWCOUNT @@` — there must be **no space** between `+` and NEWSTART (invalid: `+ 9,5`; valid: `+9,5`). Same for OLDSTART after `-`.',
+    '- After each `@@` line, every body line must begin with exactly one character: space (unchanged context), `-` (removed), or `+` (added). Do not emit empty lines inside the hunk unless they are real blank context lines.',
+    '- Patch the code that caused the failure: when the user message names an **Active file**, use that exact repo-relative path as `files[0].path` for edits to that buffer (do not substitute another path like package.json unless the failure is only there).',
+    '- Make the smallest safe change that fixes the failure.',
+    '',
+    tasksLine,
+    '',
+    'Project rules:',
+    rules,
+  ].join('\n')
+}
+
+function buildProposalUserMessage(context: FixContext): string {
+  const file = context.activeFile
+  const fileBody = sliceWithTruncNote(file.content, USER_MSG_MAX_FILE)
+  const cursor = file.cursor ? `${file.cursor.line}:${file.cursor.column}` : '(none)'
+
+  const failure = context.lastFailedRun
+  const stderr = sliceWithTruncNote(failure.stderr, USER_MSG_MAX_STDERR)
+  const stdout = sliceWithTruncNote(failure.stdout, USER_MSG_MAX_STDOUT)
+
+  const otherBuffers = context.openBuffers
+    .filter(b => b.path !== file.path)
+    .slice(0, USER_MSG_MAX_OPEN_BUFFERS)
+    .map(b => `- ${b.path}:\n${sliceWithTruncNote(b.content, USER_MSG_MAX_OPEN_BUFFER)}`)
+    .join('\n')
+
+  const gitDiff = sliceWithTruncNote(context.git.diff, USER_MSG_MAX_GIT_DIFF)
+  const gitStatus = sliceWithTruncNote(context.git.status, USER_MSG_MAX_GIT_STATUS)
+  const branch = context.git.branch ?? '(unknown)'
+
+  const request = sliceWithTruncNote(context.userRequest, USER_MSG_MAX_USER_REQUEST)
+
+  return [
+    'Fix this failure. Reply with ONLY the JSON patch proposal.',
+    '',
+    '== Failure ==',
+    `Command: ${failure.command}`,
+    `Exit:    ${failure.exitCode ?? '(none)'}`,
+    'Stderr:',
+    stderr || '(empty)',
+    'Stdout:',
+    stdout || '(empty)',
+    '',
+    '== Active file ==',
+    `Path:    ${file.path}`,
+    `Use this exact string as files[0].path when patching this buffer (repo-relative, no ../).`,
+    `Cursor:  ${cursor}`,
+    'Content:',
+    fileBody,
+    ...(otherBuffers ? ['', '== Other open files ==', otherBuffers] : []),
+    '',
+    '== Git ==',
+    `Branch: ${branch}`,
+    'Status:',
+    gitStatus || '(clean)',
+    'Diff:',
+    gitDiff || '(no changes)',
+    '',
+    '== Request ==',
+    request || '(none)',
+    '',
+    'Emit unifiedDiff as a JSON array of strings (one diff line per array element). Do not put raw newlines inside JSON string values.',
   ].join('\n')
 }
 
 function trimFile<T extends { content: string }>(file: T): T {
-  return { ...file, content: file.content.slice(0, 12000) }
+  return { ...file, content: file.content.slice(0, FIX_PROMPT_MAX_FILE_SNIPPET) }
 }
 
 function extractJson(raw: string): string {
@@ -745,6 +1458,22 @@ function extractJson(raw: string): string {
   const end = trimmed.lastIndexOf('}')
   if (start !== -1 && end > start) return trimmed.slice(start, end + 1)
   return trimmed
+}
+
+/** Models sometimes emit `unifiedDiff` as `["line1", "line2"]` or one multi-line string — normalize to one diff text. */
+function readUnifiedDiffField(file: object): string {
+  const field = (file as Record<string, unknown>)['unifiedDiff']
+  if (typeof field === 'string' && field.trim() !== '') return field.trim()
+  if (Array.isArray(field)) {
+    const parts = field.flatMap((x): string[] => {
+      if (typeof x !== 'string' || x.trim() === '') return []
+      // One array element may contain several diff lines — split so +/- headers apply per line.
+      return x.replace(/\r\n/g, '\n').split('\n')
+    })
+    const joined = parts.join('\n').trim()
+    if (joined !== '') return joined
+  }
+  throw new Error('proposal unifiedDiff must be a non-empty string')
 }
 
 function readString(value: object, key: string): string {
@@ -778,6 +1507,13 @@ function assertPatchProposalTopLevel(rec: Record<string, unknown>): void {
   if (hasSummary) return
 
   const keys = Object.keys(rec).sort().join(', ')
+  const echoed = FIX_PROMPT_FORBIDDEN_TOP_KEYS.filter(k => Object.prototype.hasOwnProperty.call(rec, k))
+  if (echoed.length > 0) {
+    throw new Error(
+      `Model echoed session-shaped JSON (${echoed.join(', ')}) instead of a patch proposal. ` +
+        `Reply must have ONLY: summary, rootCause, files[], verifyTask, risk — see CodeClaw Fix prompt.`,
+    )
+  }
   const prose =
     (typeof rec['text'] === 'string' && rec['text'].trim())
     || (typeof rec['message'] === 'string' && rec['message'].trim())

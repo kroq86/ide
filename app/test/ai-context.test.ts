@@ -8,6 +8,15 @@ import {
   buildShellContext,
   buildProjectMemoryPart,
   sanitizeInlineCompletion,
+  buildFimPrompt,
+  isFimCapableModel,
+  shouldUseOllamaFimPrompt,
+  parseOllamaChatLine,
+  parseOllamaGenerateLine,
+  buildCompletionAffixes,
+  tightenCompletionAffixes,
+  lineLooksLikeCodeLine,
+  ollamaModelBase,
 } from '../src/ai.ts'
 import type { ShellSession } from '../src/shell.ts'
 
@@ -173,6 +182,20 @@ describe('buildProjectMemoryPart', () => {
   })
 })
 
+describe('lineLooksLikeCodeLine', () => {
+  it('accepts common TS and tiny gap fragments', () => {
+    assert.equal(lineLooksLikeCodeLine('export function x() {}'), true)
+    assert.equal(lineLooksLikeCodeLine('  return a + b'), true)
+    assert.equal(lineLooksLikeCodeLine('+ b'), true)
+    assert.equal(lineLooksLikeCodeLine('b'), true)
+  })
+
+  it('rejects pasted tutorial sentences', () => {
+    assert.equal(lineLooksLikeCodeLine('The code you provided is a simple function that subtracts x'), false)
+    assert.equal(lineLooksLikeCodeLine('It looks The code you provided'), false)
+  })
+})
+
 describe('sanitizeInlineCompletion', () => {
   it('passes through plain code', () => {
     assert.equal(sanitizeInlineCompletion('const n = 1'), 'const n = 1')
@@ -198,5 +221,163 @@ describe('sanitizeInlineCompletion', () => {
   it('strips trailing fence', () => {
     assert.equal(sanitizeInlineCompletion('ok\n```'), 'ok')
     assert.equal(sanitizeInlineCompletion('line```'), 'line')
+  })
+
+  it('keeps only first fenced block when model wraps tutorial prose', () => {
+    const raw =
+      'It looks like you have two functions.\n\n```typescript\nexport function add(a: number, b: number): number {\n  return a + b;\n}\n```\n\nThese functions are straightforward.'
+    assert.equal(
+      sanitizeInlineCompletion(raw),
+      'export function add(a: number, b: number): number {\n  return a + b;\n}',
+    )
+  })
+
+  it('strips leading tutorial lines before code when no fence', () => {
+    assert.equal(
+      sanitizeInlineCompletion('Here is the fix:\n\nreturn a + b'),
+      'return a + b',
+    )
+  })
+
+  it('truncates mid-stream tutorial markdown (numbered **Function bullets)', () => {
+    const junk =
+      '\nexport function sum(a: number, b: number): number {\n return a + b\n}\n\n1. **Function `add`:**\n   - Subtracts.\n'
+    assert.ok(!sanitizeInlineCompletion(junk).includes('**Function'))
+    assert.ok(sanitizeInlineCompletion(junk).includes('export function sum'))
+  })
+
+  it('caps oversized completions', () => {
+    const long = `${'// x\n'.repeat(40)}done()`
+    assert.ok(sanitizeInlineCompletion(long).split('\n').length <= 19)
+    assert.ok(sanitizeInlineCompletion(long).length <= 820)
+  })
+
+  it('drops essay wall before a trailing export (LLM repetition glitch)', () => {
+    const blob = [
+      ' It looks The code you provided is a simple function.',
+      'The code you provided is a simple function that subtracts the second argument from the first. However, there are a few issues with it:',
+      '1. The function name `add` should be `subtract`.',
+      '',
+      'Here\'s the corrected version of your code:',
+      '',
+      'export function sum(a: number, b: number): number {',
+      '  return a + b',
+      '}',
+    ].join('\n')
+    const out = sanitizeInlineCompletion(blob)
+    assert.match(out, /^export function sum/)
+    assert.ok(!out.includes('The code you provided'))
+  })
+})
+
+describe('ollamaModelBase', () => {
+  it('strips tag after colon', () => {
+    assert.equal(ollamaModelBase('qwen2.5-coder:1.5b'), 'qwen2.5-coder')
+    assert.equal(ollamaModelBase('llama3.2:latest'), 'llama3.2')
+  })
+})
+
+describe('isFimCapableModel', () => {
+  it('detects qwen coder and deepseek-coder', () => {
+    assert.equal(isFimCapableModel('qwen2.5-coder:1.5b'), true)
+    assert.equal(isFimCapableModel('deepseek-coder:6.7b'), true)
+  })
+
+  it('returns false for general chat models', () => {
+    assert.equal(isFimCapableModel('llama3.2:latest'), false)
+    assert.equal(isFimCapableModel('mistral:latest'), false)
+  })
+})
+
+describe('shouldUseOllamaFimPrompt', () => {
+  it('skips FIM for qwen2.5-coder:1.5b (tutorial-only middle)', () => {
+    assert.equal(shouldUseOllamaFimPrompt('qwen2.5-coder:1.5b'), false)
+  })
+
+  it('uses FIM for larger qwen coder tags and other code families', () => {
+    assert.equal(shouldUseOllamaFimPrompt('qwen2.5-coder:7b'), true)
+    assert.equal(shouldUseOllamaFimPrompt('deepseek-coder:6.7b'), true)
+  })
+})
+
+describe('buildFimPrompt', () => {
+  it('wraps prefix and suffix with FIM tokens', () => {
+    assert.equal(
+      buildFimPrompt('const x = ', '\nconsole.log(x)'),
+      '<|fim_prefix|>const x = <|fim_suffix|>\nconsole.log(x)<|fim_middle|>',
+    )
+  })
+})
+
+describe('parseOllamaChatLine', () => {
+  it('parses done:true with empty content (qwen 1.5b does this for minimal CURSOR prompts)', () => {
+    const line =
+      '{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":""},"done":true}'
+    assert.deepEqual(parseOllamaChatLine(line), { delta: '', done: true })
+  })
+
+  it('parses streamed deltas', () => {
+    assert.deepEqual(parseOllamaChatLine('{"message":{"content":"+"},"done":false}'), {
+      delta: '+',
+      done: false,
+    })
+  })
+
+  it('strips optional data: prefix', () => {
+    assert.deepEqual(parseOllamaChatLine('data: {"message":{"content":"z"},"done":false}'), {
+      delta: 'z',
+      done: false,
+    })
+  })
+})
+
+describe('parseOllamaGenerateLine', () => {
+  it('parses generate stream chunks', () => {
+    assert.deepEqual(parseOllamaGenerateLine('{"response":"foo","done":false}'), {
+      delta: 'foo',
+      done: false,
+    })
+  })
+})
+
+describe('buildCompletionAffixes', () => {
+  it('collapses blank runs so CURSOR sits between previous and next code (broken-counter gap)', () => {
+    const lines = [
+      'export function add(a: number, b: number): number {',
+      '  return a - b',
+      '}',
+      '',
+      '',
+      'export function sum(a: number, b:number): number {',
+      ' return a + b',
+      '}',
+    ]
+    const { prefix, suffix, gapCollapsed } = buildCompletionAffixes(lines, { row: 4, col: 0 })
+    assert.equal(gapCollapsed, true)
+    assert.ok(prefix.endsWith('}'), `prefix should end with brace: ${JSON.stringify(prefix.slice(-20))}`)
+    assert.ok(suffix.startsWith('export function sum'), `suffix head: ${JSON.stringify(suffix.slice(0, 24))}`)
+  })
+
+  it('does not collapse when cursor is on a code line', () => {
+    const lines = ['const x = 1', '']
+    const r = buildCompletionAffixes(lines, { row: 0, col: 11 })
+    assert.equal(r.gapCollapsed, false)
+    assert.ok(r.prefix.includes('const x ='))
+  })
+})
+
+describe('tightenCompletionAffixes', () => {
+  it('strips leading newlines between brace and next declaration (cursor after })', () => {
+    const prefix = 'export function add(a: number, b: number): number {\n  return a - b\n}'
+    const suffix = '\n\n\n\n\nexport function sum(a: number, b:number): number {\n return a + b\n}'
+    const r = tightenCompletionAffixes(prefix, suffix)
+    assert.equal(r.tightened, true)
+    assert.ok(r.suffix.startsWith('export function sum'), r.suffix.slice(0, 40))
+  })
+
+  it('no-op when suffix does not start with newline', () => {
+    const r = tightenCompletionAffixes('foo', 'bar')
+    assert.equal(r.tightened, false)
+    assert.equal(r.suffix, 'bar')
   })
 })

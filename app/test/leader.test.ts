@@ -19,7 +19,7 @@ const mockBufs = {
 }
 const mockAi = {
   openChat: noop, triggerCompletion: noop, explainError: noop,
-  fixFailure: noop, showTrace: noop, rerunLast: noop, review: noop,
+  fixFailure: noop, showTrace: noop, rerunLast: noop, review: noop, clearChat: noop,
 }
 const mockGit   = { open: noop, stage: noop }
 const mockLsp   = { hover: noop, definition: noop }
@@ -131,7 +131,7 @@ describe('buildLeaderMap — specific key presence', () => {
   const keySet = new Set(items.map(i => i.keys))
 
   const required = [
-    'SPC a p', 'SPC a c', 'SPC a e', 'SPC a f', 'SPC a t', 'SPC a l', 'SPC a r',
+    'SPC a p', 'SPC a c', 'SPC a e', 'SPC a f', 'SPC a t', 'SPC a l', 'SPC a r', 'SPC a k',
     'SPC m t f', 'SPC m t a',
     'SPC g g', 'SPC g s',
     'SPC b b', 'SPC b k', 'SPC b n', 'SPC b p', 'SPC b s', 'SPC b N',
@@ -185,6 +185,7 @@ describe('whichKeyDesc', () => {
     assert.equal(whichKeyDesc('a ', 'r', aiBranch['r']!), 'ai: review git diff (CodeClaw)')
     assert.equal(whichKeyDesc('a ', 'p', aiBranch['p']!), 'ai: open chat')
     assert.equal(whichKeyDesc('a ', 'c', aiBranch['c']!), 'ai: trigger completion')
+    assert.equal(whichKeyDesc('a ', 'k', aiBranch['k']!), 'ai: clear chat')
   })
 
   it('uses +group for submenu roots', () => {
