@@ -57,7 +57,7 @@ export const COMMAND_LABELS: Record<string, string> = {
   'a l': 'ai: rerun last shell command',
   'a r': 'ai: review git diff (CodeClaw)',
   'a k': 'ai: clear chat',
-  'g g': 'git: status (fullscreen)',
+  'g g': 'git: status — ll commit log (Magit)',
   'g s': 'git: stage current',
   'c h': 'code: hover (LSP)',
   'c d': 'code: go to definition',

@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, isAbsolute, normalize, relative, resolve } from 'node:path'
+import { formatEditorVsDiskMyersSnippet } from './git.js'
 import type { ShellRun } from './shell.js'
 
 /** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
@@ -293,7 +294,7 @@ export async function generatePatchProposal(
   cwd: string = process.cwd(),
 ): Promise<PatchProposal> {
   const system = buildProposalSystemPrompt(context, tasks)
-  const user = buildProposalUserMessage(context)
+  const user = buildProposalUserMessage(context, cwd)
   const response = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -398,6 +399,13 @@ export function parsePatchProposal(raw: string, cwd: string = process.cwd()): Pa
 const REVIEW_PROMPT_ACTIVE_BUFFER_MAX = 1800
 /** Git diff slice for review — whole-repo diffs are huge; leading slice often omits the focused file entirely. */
 const REVIEW_PROMPT_DIFF_MAX = 1200
+/** Myers `-`/`+` lines: disk vs editor for the focused file (git diff omits unsaved buffer). */
+const REVIEW_PROMPT_DISK_MYERS_MAX_LINES = 80
+const REVIEW_PROMPT_DISK_MYERS_MAX_CHARS = 2800
+
+/** Fix user message: Myers snippet cap (lines then char slice). */
+const USER_MSG_DISK_MYERS_MAX_LINES = 100
+const USER_MSG_DISK_MYERS_MAX_CHARS = 3200
 
 /**
  * Returns the unified-diff chunk for one repo-relative path, or '' if that file does not appear in `fullDiff`.
@@ -501,12 +509,15 @@ export async function generateReviewProposal(
   signal: AbortSignal,
   /** Live editor text for the active buffer (optional). Git diff alone misses unsaved duplicates etc. */
   activeEditorBody?: string,
+  /** Repo cwd for disk-vs-editor Myers diff (defaults to `process.cwd()`). */
+  cwd: string = process.cwd(),
 ): Promise<ReviewProposal> {
   // Keep the prompt short — small models (1.5b) fail on long structured prompts
   const rulesSnippet = rules ? rules.slice(0, 500) : 'none'
   const activePath = activeFile.trim() || 'unknown'
   const diffSnippet = buildReviewDiffSnippet(gitDiff, activePath, REVIEW_PROMPT_DIFF_MAX)
-  const trimmedBuf = typeof activeEditorBody === 'string' ? activeEditorBody.trim() : ''
+  const editorRaw = typeof activeEditorBody === 'string' ? activeEditorBody : null
+  const trimmedBuf = editorRaw !== null ? editorRaw.trim() : ''
   const bufferSnippet =
     trimmedBuf.length === 0
       ? ''
@@ -515,6 +526,17 @@ export async function generateReviewProposal(
             ? `${trimmedBuf.slice(0, REVIEW_PROMPT_ACTIVE_BUFFER_MAX)}\n…[truncated]`
             : trimmedBuf
         }\n`
+  const diskVsEditorMyers =
+    editorRaw === null || activePath === 'unknown'
+      ? ''
+      : formatEditorVsDiskMyersSnippet(cwd, activePath, editorRaw, REVIEW_PROMPT_DISK_MYERS_MAX_LINES)
+  const diskVsEditorSection =
+    diskVsEditorMyers.length === 0
+      ? ''
+      : `\n--- Myers line diff: saved file on disk vs full editor buffer (${activePath}) — git diff does not include unsaved edits ---\n${sliceWithTruncNote(
+          diskVsEditorMyers,
+          REVIEW_PROMPT_DISK_MYERS_MAX_CHARS,
+        )}\n`
   const prompt = `The user ran review while focused on file: ${activePath}
 You MUST review that buffer content first (below if present). Report findings for "${activePath}" when you see duplicates, dead imports, merge junk, wrong exports, or syntax issues there — even if the git diff excerpt does not mention this path (diff is truncated; unsaved edits never appear in git).
 Then also scan the git diff excerpt for other repo issues.
@@ -528,7 +550,7 @@ Hard constraints:
 Return JSON only: {"summary":"<one sentence>","safeToCommit":true|false,"findings":[{"severity":"blocker|warning|note","file":"<path>","title":"<short>","explanation":"<detail>"}]}
 
 Rules: ${rulesSnippet}
-${bufferSnippet}
+${bufferSnippet}${diskVsEditorSection}
 --- Git diff excerpt (focused file first when it has changes; then other paths) ---
 ${diffSnippet}`
 
@@ -1391,7 +1413,7 @@ function buildProposalSystemPrompt(context: FixContext, tasks: CodeClawTask[] = 
   ].join('\n')
 }
 
-function buildProposalUserMessage(context: FixContext): string {
+function buildProposalUserMessage(context: FixContext, cwd: string): string {
   const file = context.activeFile
   const fileBody = sliceWithTruncNote(file.content, USER_MSG_MAX_FILE)
   const cursor = file.cursor ? `${file.cursor.line}:${file.cursor.column}` : '(none)'
@@ -1411,6 +1433,17 @@ function buildProposalUserMessage(context: FixContext): string {
   const branch = context.git.branch ?? '(unknown)'
 
   const request = sliceWithTruncNote(context.userRequest, USER_MSG_MAX_USER_REQUEST)
+
+  const diskVsEditorMyersRaw = formatEditorVsDiskMyersSnippet(
+    cwd,
+    file.path,
+    context.activeFile.content,
+    USER_MSG_DISK_MYERS_MAX_LINES,
+  )
+  const diskVsEditorMyers =
+    diskVsEditorMyersRaw.length === 0
+      ? ''
+      : sliceWithTruncNote(diskVsEditorMyersRaw, USER_MSG_DISK_MYERS_MAX_CHARS)
 
   return [
     'Fix this failure. Reply with ONLY the JSON patch proposal.',
@@ -1437,6 +1470,13 @@ function buildProposalUserMessage(context: FixContext): string {
     gitStatus || '(clean)',
     'Diff:',
     gitDiff || '(no changes)',
+    ...(diskVsEditorMyers
+      ? [
+          '',
+          '== Unsaved edits vs disk (Myers line diff; git diff omits buffer-only changes) ==',
+          diskVsEditorMyers,
+        ]
+      : []),
     '',
     '== Request ==',
     request || '(none)',

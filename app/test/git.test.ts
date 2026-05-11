@@ -9,11 +9,14 @@ import {
   commitGit,
   pushGit,
   getGitLog,
+  GIT_LOG_MAGIT_COUNT,
   buildGitDisplayLines,
   loadFileHunks,
   getGitRepoRoot,
   hunkNewStartRow,
   resolveRepoFilePath,
+  buildMyersGitHunks,
+  formatEditorVsDiskMyersSnippet,
   type GitStatusData,
 } from '../src/git.ts'
 
@@ -42,6 +45,25 @@ describe('loadGitStatus', () => {
     const status = loadGitStatus(repo)
     const names = status.untracked.map(e => e.path)
     assert.ok(names.includes('untracked.txt'), `untracked.txt not in ${JSON.stringify(names)}`)
+  })
+})
+
+describe('getGitLog', () => {
+  it('returns author and subject after at least one commit', () => {
+    const path = 'logged-file.txt'
+    writeFileSync(join(repo, path), 'v1')
+    spawnSync('git', ['add', '--', path], { cwd: repo, stdio: 'ignore' })
+    const msg = `log-parse ${Date.now()}`
+    assert.equal(commitGit(repo, msg).ok, true)
+    const entries = getGitLog(repo, 8)
+    assert.ok(entries.length >= 1)
+    assert.ok(entries.some(e => e.msg === msg))
+    const hit = entries.find(e => e.msg === msg)
+    assert.ok(hit?.hash && hit.author.length > 0 && hit.date.length > 0)
+  })
+
+  it('defaults to GIT_LOG_MAGIT_COUNT max', () => {
+    assert.ok(GIT_LOG_MAGIT_COUNT >= 40)
   })
 })
 
@@ -167,16 +189,46 @@ describe('buildGitDisplayLines', () => {
     assert.ok(fileLine, 'staged foo.ts not represented in display lines')
   })
 
-  it('includes log entries when logEntries provided', () => {
+  it('status view hints ll for log; log view lists selectable commits', () => {
     const mockStatus: GitStatusData = {
       branch: 'main', ahead: 0, behind: 0,
       untracked: [], unstaged: [], staged: [],
     }
+    const hint = buildGitDisplayLines(mockStatus, null, 'status').find(l => l.type === 'log-header')
+    assert.ok(hint?.text.includes('l l'), 'status should hint Magit-style ll')
+
     const logEntries = [
-      { hash: 'abc1234', msg: 'initial commit', date: '2026-05-10' },
+      { hash: 'abc1234', author: 'Ada', msg: 'initial commit', date: '2026-05-10' },
     ]
-    const lines = buildGitDisplayLines(mockStatus, logEntries)
+    const lines = buildGitDisplayLines(mockStatus, logEntries, 'log')
     const logLine = lines.find(l => l.type === 'log-entry')
-    assert.ok(logLine, 'no log-entry line found')
+    assert.ok(logLine && logLine.selectable, 'log view should have selectable log-entry lines')
+    assert.ok(logLine.logEntry.author.includes('Ada'))
+  })
+})
+
+describe('buildMyersGitHunks', () => {
+  it('produces -/+ lines and @@ headers (display-only; not for git apply)', () => {
+    const hunks = buildMyersGitHunks('a\nb\nc', 'a\nY\nc')
+    assert.equal(hunks.length, 1)
+    assert.match(hunks[0]!.header, /^@@ -\d+,\d+ \+\d+,\d+ @@$/)
+    assert.ok(hunks[0]!.lines.some(l => l.startsWith('-b')))
+    assert.ok(hunks[0]!.lines.some(l => l.startsWith('+Y')))
+  })
+})
+
+describe('formatEditorVsDiskMyersSnippet', () => {
+  it('returns empty when disk matches editor', () => {
+    const path = 'myers-disk-match.txt'
+    writeFileSync(join(repo, path), 'one\ntwo\n')
+    assert.equal(formatEditorVsDiskMyersSnippet(repo, path, 'one\ntwo\n'), '')
+  })
+
+  it('returns Myers +/- snippet when buffer differs from disk', () => {
+    const path = 'myers-disk-diff.txt'
+    writeFileSync(join(repo, path), 'one\ntwo\n')
+    const s = formatEditorVsDiskMyersSnippet(repo, path, 'one\nTWO\n')
+    assert.match(s, /^-two/)
+    assert.match(s, /^\+TWO/m)
   })
 })

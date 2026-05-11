@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join, resolve as resolvePath } from 'node:path'
+import {
+  buildLineChanges,
+  FilesTooBigForDiffError,
+  formatMyersLineDiffSnippet,
+  lineChangesToSyntheticHunks,
+  splitLines,
+} from './diff.js'
 
 export type GitHunk = { header: string; lines: string[] }
 
@@ -21,7 +28,10 @@ export type GitStatusData = {
   staged: GitFileEntry[]
 }
 
-export type GitLogEntry = { hash: string; msg: string; date: string }
+export type GitLogEntry = { hash: string; msg: string; date: string; author: string }
+
+/** How many commits `l l` / log view loads (Magit-style history buffer). */
+export const GIT_LOG_MAGIT_COUNT = 80
 
 export type GitDisplayLine =
   | { type: 'header';     text: string; selectable: false }
@@ -30,8 +40,11 @@ export type GitDisplayLine =
   | { type: 'hunk';       text: string; entry: GitFileEntry; hunk: GitHunk; selectable: true }
   | { type: 'diff';       text: string; selectable: false }
   | { type: 'log-header'; text: string; selectable: false }
-  | { type: 'log-entry';  text: string; logEntry: GitLogEntry; selectable: false }
+  | { type: 'log-entry'; text: string; logEntry: GitLogEntry; selectable: true }
   | { type: 'blank';      selectable: false }
+
+/** Cursor-navigable rows in the git panel (status files/hunks or log commits). */
+export type GitSelectableLine = Extract<GitDisplayLine, { selectable: true }>
 
 function runGit(args: string[], cwd: string, input?: string): { stdout: string; ok: boolean } {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 4000, input })
@@ -50,6 +63,49 @@ export function getGitRepoRoot(cwd: string): string {
 /** Absolute path for a path as reported by git status (repo-relative). */
 export function resolveRepoFilePath(cwd: string, repoRelativePath: string): string {
   return resolvePath(join(getGitRepoRoot(cwd), repoRelativePath))
+}
+
+/**
+ * Myers line diff between **saved working-tree file** and **editor buffer** text.
+ * Returns '' when paths are invalid, the file is missing, or disk matches editor.
+ *
+ * Used by CodeClaw prompts so models see unsaved edits git diff cannot show.
+ */
+export function formatEditorVsDiskMyersSnippet(
+  cwd: string,
+  repoRelativePath: string,
+  editorText: string,
+  maxLines = 120,
+): string {
+  const norm = repoRelativePath.trim().replace(/\\/g, '/').replace(/^\.?\//, '')
+  if (!norm || norm === 'unknown') return ''
+  let disk: string
+  try {
+    disk = readFileSync(resolveRepoFilePath(cwd, norm), 'utf8')
+  } catch {
+    return ''
+  }
+  if (disk === editorText) return ''
+  return formatMyersLineDiffSnippet(disk, editorText, { maxLines })
+}
+
+/**
+ * Synthetic {@link GitHunk}s from a Myers line diff (change-only; no context lines).
+ *
+ * **Do not** pass these to {@link stageEntry} / {@link unstageEntry}: they are not produced by git and
+ * will not apply cleanly against index/working-tree. For display and LLM prompts only.
+ */
+export function buildMyersGitHunks(before: string, after: string): GitHunk[] {
+  try {
+    const changes = buildLineChanges(before, after)
+    if (changes.length === 0) return []
+    return lineChangesToSyntheticHunks(splitLines(before), splitLines(after), changes)
+  } catch (e) {
+    if (e instanceof FilesTooBigForDiffError) {
+      return [{ header: '@@ Myers (skipped: above in-memory diff threshold) @@', lines: [' '] }]
+    }
+    throw e
+  }
 }
 
 /** First line of the hunk in the **new** file, 0-based (from `@@ ... +start ... @@`). */
@@ -189,19 +245,51 @@ export function pushGit(cwd: string): { ok: boolean; error?: string } {
   return r.status === 0 ? { ok: true } : { ok: false, error: (r.stderr || r.stdout).trim() }
 }
 
-export function getGitLog(cwd: string, n = 20): GitLogEntry[] {
+export function getGitLog(cwd: string, n = GIT_LOG_MAGIT_COUNT): GitLogEntry[] {
   const root = getGitRepoRoot(cwd)
-  const out = runGit(['log', `--max-count=${n}`, '--format=%h\t%s\t%ar'], root).stdout
-  return out.split('\n').filter(l => l.trim()).map(line => {
-    const parts = line.split('\t')
-    return { hash: parts[0] ?? '', msg: parts[1] ?? '', date: parts[2] ?? '' }
+  const r = runGit(
+    ['log', `--max-count=${String(n)}`, '--format=%h%x1e%an%x1e%ar%x1e%s'],
+    root,
+  )
+  if (!r.ok) return []
+  return r.stdout.split('\n').filter(l => l.trim()).map(line => {
+    const parts = line.split('\x1e')
+    const hash = parts[0] ?? ''
+    const author = parts[1] ?? ''
+    const date = parts[2] ?? ''
+    const msg = parts.slice(3).join('\x1e')
+    return { hash, author, msg, date }
   })
 }
 
-export function buildGitDisplayLines(data: GitStatusData, logEntries?: GitLogEntry[] | null): GitDisplayLine[] {
+export type GitPanelView = 'status' | 'log'
+
+export function buildGitDisplayLines(
+  data: GitStatusData,
+  logEntries?: GitLogEntry[] | null,
+  view: GitPanelView = 'status',
+): GitDisplayLine[] {
   const lines: GitDisplayLine[] = []
 
   const ab = data.ahead > 0 || data.behind > 0 ? ` ↑${data.ahead} ↓${data.behind}` : ''
+
+  if (view === 'log') {
+    lines.push({ type: 'header', text: `Branch: ${data.branch}${ab} — log`, selectable: false })
+    lines.push({ type: 'blank', selectable: false })
+    const entries = logEntries ?? []
+    if (entries.length === 0) {
+      lines.push({ type: 'section', text: 'No commits yet', selectable: false })
+      lines.push({ type: 'diff', text: '  (empty repository history)', selectable: false })
+      return lines
+    }
+    lines.push({ type: 'section', text: `Commits (${entries.length})`, selectable: false })
+    for (const e of entries) {
+      // One-line `text` kept for tests / accessibility; UI renders structured columns from `logEntry`.
+      lines.push({ type: 'log-entry', text: e.msg, logEntry: e, selectable: true })
+    }
+    return lines
+  }
+
   lines.push({ type: 'header', text: `Branch: ${data.branch}${ab}`, selectable: false })
   lines.push({ type: 'blank', selectable: false })
 
@@ -233,13 +321,8 @@ export function buildGitDisplayLines(data: GitStatusData, logEntries?: GitLogEnt
     lines.push({ type: 'section', text: 'Working tree clean', selectable: false })
   }
 
-  if (logEntries?.length) {
-    lines.push({ type: 'blank', selectable: false })
-    lines.push({ type: 'log-header', text: 'Recent commits', selectable: false })
-    for (const e of logEntries) {
-      lines.push({ type: 'log-entry', text: `  ${e.hash}  ${e.msg}  (${e.date})`, logEntry: e, selectable: false })
-    }
-  }
+  lines.push({ type: 'blank', selectable: false })
+  lines.push({ type: 'log-header', text: 'l l — log (Magit-style)', selectable: false })
 
   return lines
 }
