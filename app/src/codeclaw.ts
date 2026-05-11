@@ -13,6 +13,7 @@ import {
   appendCodeClawTraceEvent,
   writeCodeClawTracePayload,
 } from './codeclaw-trace-recorder.js'
+import { OLLAMA_MODEL, OLLAMA_URL } from './ollama-env.js'
 
 /** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
 const FIX_PROMPT_MAX_RULES = 8000
@@ -190,9 +191,6 @@ const DEFAULT_RULES = [
   '- If changing behavior, add or update a test.',
   '- Prefer patches that can be verified by one command.',
 ].join('\n')
-
-const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://127.0.0.1:11434'
-const OLLAMA_MODEL = process.env['OLLAMA_MODEL'] ?? 'llama3.2:latest'
 
 /**
  * CodeClaw uses large `/api/generate` prompts; Ollama keeps models + KV cache resident by default.
@@ -407,7 +405,14 @@ export async function generatePatchProposal(
       })
     }
     const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`${message}\nRaw response:\n${raw.slice(0, 2000)}`)
+    debugLog('codeclaw', 'fix_parse_failed', {
+      message,
+      rawChars: raw.length,
+      rawHead: raw.slice(0, 400),
+    })
+    throw new Error(
+      `${message} (enable QE_DEBUG for a short raw head in logs, or CODECLAW_TRACE_RAW for full payload)`,
+    )
   }
 }
 
@@ -665,8 +670,21 @@ export async function generateReviewProposal(
   const rulesSnippet = rules ? rules.slice(0, 500) : 'none'
   const activePath = activeFile.trim() || 'unknown'
   const diffSnippet = buildReviewDiffSnippet(gitDiff, activePath, REVIEW_PROMPT_DIFF_MAX)
-  const editorRaw = typeof activeEditorBody === 'string' ? activeEditorBody : null
-  const trimmedBuf = editorRaw !== null ? editorRaw.trim() : ''
+  const editorBodyProvided = activeEditorBody !== undefined
+  let editorRaw: string | null = typeof activeEditorBody === 'string' ? activeEditorBody : null
+  let trimmedBuf = editorRaw !== null ? editorRaw.trim() : ''
+  // `undefined` = no buffer text passed (e.g. snapshot not loaded yet) → may read disk. `''` = caller provided an intentionally empty buffer → do not read disk.
+  if (!trimmedBuf && activePath !== 'unknown' && !editorBodyProvided) {
+    try {
+      const abs = isAbsolute(activePath) ? activePath : join(cwd, activePath)
+      if (existsSync(abs)) {
+        editorRaw = readFileSync(abs, 'utf8')
+        trimmedBuf = editorRaw.trim()
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   const bufferSnippet =
     trimmedBuf.length === 0
       ? ''
@@ -756,8 +774,10 @@ ${diffSnippet}`
   }
   const proposal = parseReviewProposal(raw)
   const rawFindingCount = proposal.findings.length
-  if (trimmedBuf)
+  if (trimmedBuf) {
     proposal.findings = filterReviewFindingsAgainstActiveBuffer(activePath, trimmedBuf, proposal.findings)
+    if (rawFindingCount > 0 && proposal.findings.length === 0) proposal.safeToCommit = true
+  }
   debugLog('codeclaw', 'review_ollama_end', {
     activePath,
     model: OLLAMA_MODEL,
@@ -802,15 +822,32 @@ function countExportedFunctionDeclarations(buffer: string, name: string): number
   return (buffer.match(re) ?? []).length
 }
 
+/** Distinct identifiers declared as `export function name` in the buffer. */
+function exportFunctionDeclarationNames(buffer: string): string[] {
+  const re = /^\s*export\s+(?:async\s+)?function\s+(\w+)\b/gm
+  return [...new Set([...buffer.matchAll(re)].map(m => m[1]!))]
+}
+
+/** True if any exported function name is declared more than once (real duplicate in source). */
+function bufferHasDuplicateExportedFunction(buffer: string): boolean {
+  return exportFunctionDeclarationNames(buffer).some(n => countExportedFunctionDeclarations(buffer, n) >= 2)
+}
+
 function bufferHasImportStatement(buffer: string): boolean {
   return /^\s*import\s+/m.test(buffer)
 }
 
+function duplicateKeywordIndices(blob: string): number[] {
+  const idx: number[] = []
+  for (const m of blob.matchAll(/\bduplicate\b/gi)) idx.push(m.index ?? 0)
+  for (const m of blob.matchAll(/\btwo\s+functions\b/gi)) idx.push(m.index ?? 0)
+  return idx
+}
+
 /**
  * Drop obvious LLM hallucinations for the focused file when we have the real buffer (small models invent duplicate exports / imports).
- * Uses **counts of real `export function <name>` lines** in the buffer — not a phrase whitelist. The only prose hook is a short
- * `two functions named <id>` match (covers "…exports two functions named sum…" etc.); anything else duplicate-ish still goes
- * through the backtick-near-duplicate heuristic below.
+ * Uses **counts of real `export function <name>` lines** in the buffer. Duplicate-ish prose ("exported twice", phantom overloads)
+ * is dropped when it contradicts those counts — no template list of model wordings.
  */
 export function filterReviewFindingsAgainstActiveBuffer(
   activePath: string,
@@ -831,16 +868,35 @@ export function filterReviewFindingsAgainstActiveBuffer(
       if (countExportedFunctionDeclarations(buffer, n) < 2) return false
     }
 
+    const dupTitleDash = f.title.match(/\bDuplicate\s+export\s*[—–-]\s*(\w+)/i)
+    if (dupTitleDash && countExportedFunctionDeclarations(buffer, dupTitleDash[1]!) < 2) return false
+
+    const dupTitleOf = f.title.match(/\bDuplicate\s+export\s+of\s+(\w+)\b/i)
+    if (dupTitleOf && countExportedFunctionDeclarations(buffer, dupTitleOf[1]!) < 2) return false
+
     const twoNamed = blob.match(/\btwo\s+functions\s+named\s+[`']?(\w+)[`']?/i)
     if (twoNamed && countExportedFunctionDeclarations(buffer, twoNamed[1]!) < 2) return false
 
-    if (/\bduplicate\b/i.test(blob)) {
+    // "exported twice" / overload-duplicate prose without matching `export function` counts → model fiction (no per-phrase regex list).
+    if (/\bis\s+exported\s+twice\b|\bexported\s+twice\b/i.test(blob) && !bufferHasDuplicateExportedFunction(buffer)) return false
+
+    const phantomOverloadDup = blob.match(
+      /\bExported function\s+(\w+)\b[^.\n]{0,80}\bdifferent parameter types\b/i,
+    )
+    if (phantomOverloadDup && countExportedFunctionDeclarations(buffer, phantomOverloadDup[1]!) < 2) return false
+
+    const dupIdxs = duplicateKeywordIndices(blob)
+    if (dupIdxs.length > 0 && /\bduplicate\b|\btwo\s+functions\b/i.test(blob)) {
+      const linked = new Set<string>()
       for (const m of blob.matchAll(/`(\w+)`/g)) {
         const n = m[1]!
         if (!/^[A-Za-z_$][\w$]*$/.test(n)) continue
-        const idx = m.index ?? 0
-        const near = blob.slice(Math.max(0, idx - 56), Math.min(blob.length, idx + 56))
-        if (/\bduplicate|two\s+functions\b/i.test(near) && countExportedFunctionDeclarations(buffer, n) < 2) return false
+        const ix = m.index ?? 0
+        if (dupIdxs.some(p => Math.abs(ix - p) <= 100)) linked.add(n)
+      }
+      if (linked.size === 1) {
+        const n = [...linked][0]!
+        if (countExportedFunctionDeclarations(buffer, n) < 2) return false
       }
     }
 
@@ -1156,10 +1212,10 @@ export function validateUnifiedDiffBody(path: string, unifiedDiff: string): void
     const line = lines[i] ?? ''
     if (line.startsWith('@@')) {
       inHunk = true
-      const match = line.match(/^@@ -\d+(?:,(\d+))? \+\s*\d+(?:,(\d+))? @@/)
+      const match = line.match(UNIFIED_DIFF_HUNK_HEADER_LINE_RE)
       if (match) {
-        remainingOld = match[1] ? parseInt(match[1], 10) : 1
-        remainingNew = match[2] ? parseInt(match[2], 10) : 1
+        remainingOld = match[2] ? parseInt(match[2], 10) : 1
+        remainingNew = match[4] ? parseInt(match[4], 10) : 1
       } else {
         remainingOld = Number.POSITIVE_INFINITY
         remainingNew = Number.POSITIVE_INFINITY
@@ -1369,6 +1425,21 @@ export function sanitizeUnifiedDiffInterstitial(unifiedDiff: string): string {
 }
 
 /**
+ * Lines small models paste **inside** a hunk with no `/-/+` prefix — not code, not `git apply` input.
+ * Dropping avoids `validateUnifiedDiffBody` / git failing on obvious echo text (e.g. "Raw response:").
+ */
+function isLikelyHunkProseLine(trimmed: string): boolean {
+  if (!trimmed) return false
+  if (/^raw\s+response\b/i.test(trimmed)) return true
+  if (/^here'?s\s+(the\s+)?(unified\s+)?(diff|patch)\b/i.test(trimmed)) return true
+  if (/^(the\s+)?(following\s+)?(unified\s+)?diff\s*(is|:)\b/i.test(trimmed)) return true
+  if (/^(note|important|warning)\s*:/i.test(trimmed)) return true
+  if (/^output\s*:/i.test(trimmed)) return true
+  if (/^```(?:json|typescript|ts|js|diff|text)?\s*$/i.test(trimmed)) return true
+  return false
+}
+
+/**
  * Inside `@@` hunks, every content line must start with ` `, `+`, `-`, or `\`.
  * Small models often paste `}` / `export …` without the leading space — git apply rejects that.
  * Only rewrite lines that look like code fragments (avoid turning prose into fake context).
@@ -1400,13 +1471,18 @@ export function sanitizeUnifiedDiffBareHunkLines(unifiedDiff: string): string {
       /^[\}\]\);,]\s*;?\s*$/.test(trimmed) ||
       /^[\{\(]\s*$/.test(trimmed) ||
       /^(export|import|return|const|let|var|function|type|interface|enum|namespace|async|await)\b/.test(trimmed)
-    out.push(looksLikeCodeContin ? ` ${line}` : line)
+    if (looksLikeCodeContin) {
+      out.push(` ${line}`)
+      continue
+    }
+    if (isLikelyHunkProseLine(trimmed)) continue
+    out.push(line)
   }
   return out.join('\n')
 }
 
-/** Allow `+ 9,5` typo (space after `+`) — git rejects it as corrupt patch. */
-const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+\s*(\d+)(?:,(\d+))? @@(.*)$/
+/** Allow `+ 9,5` typo (space after `+`) — git rejects it as corrupt patch. Shared with `validateUnifiedDiffBody`. */
+export const UNIFIED_DIFF_HUNK_HEADER_LINE_RE = /^@@ -(\d+)(?:,(\d+))? \+\s*(\d+)(?:,(\d+))? @@(.*)$/
 
 /**
  * Rewrite each `@@ -ls,lc +rs,rc @@` so `lc`/`rc` match the following hunk body.
@@ -1418,7 +1494,7 @@ export function repairUnifiedDiffHunkHeaders(unifiedDiff: string): string {
   let i = 0
   while (i < lines.length) {
     const line = lines[i] ?? ''
-    const hm = line.match(HUNK_HEADER_RE)
+    const hm = line.match(UNIFIED_DIFF_HUNK_HEADER_LINE_RE)
     if (!hm) {
       out.push(line)
       i++
@@ -1450,6 +1526,16 @@ export function repairUnifiedDiffHunkHeaders(unifiedDiff: string): string {
       } else if (ch === '+') {
         newCnt++
       }
+    }
+    // Drop only **empty** placeholder hunks (e.g. `@@ -11,0 +11,0 @@` with no body). If the body is
+    // non-empty but lines lack `/-/+` prefixes, counts stay 0 — swallowing the hunk strips all `@@`
+    // and `normalizeUnifiedDiffForGitApply` can feed `git apply` a bare `@@` line → "patch fragment without header".
+    if (oldCnt === 0 && newCnt === 0) {
+      const bodyHasNonBlank = body.some(L => L.trim() !== '')
+      if (!bodyHasNonBlank) continue
+      out.push(line)
+      out.push(...body)
+      continue
     }
     out.push(`@@ -${oldStart},${oldCnt} +${newStart},${newCnt} @@${rest}`)
     out.push(...body)
@@ -1510,6 +1596,32 @@ function prependSyntheticHunkIfBarePlusMinusLines(t: string): string {
 }
 
 /**
+ * `git apply` requires `--- a/` / `+++ b/` before hunks. Models sometimes emit `@@` first, then headers — that
+ * still matches `hasGitPaths` and was returned verbatim (broken). Move leading `@@…---` segment after headers.
+ */
+function canonicalizeUnifiedDiffHeaderOrder(filePath: string, t: string): string {
+  const lines = t.replace(/\r\n/g, '\n').split('\n')
+  const idxMinus = lines.findIndex(l => /^---\s+a\//.test(l))
+  const idxAt = lines.findIndex(l => l.startsWith('@@'))
+  if (idxMinus < 0 || idxAt < 0 || idxAt >= idxMinus) return t
+
+  const misplaced = lines.slice(idxAt, idxMinus)
+  const minusL = lines[idxMinus]!
+  const plusL = lines[idxMinus + 1]
+  if (!plusL || !/^\+\+\+\s+b\//.test(plusL)) return t
+
+  const rest = lines.slice(idxMinus + 2)
+  const head = lines.slice(0, idxAt)
+  const headNoBlank = head.filter(l => l.trim() !== '')
+  const headDiffGit = headNoBlank.length === 1 && headNoBlank[0]!.startsWith('diff --git ')
+    ? headNoBlank[0]!
+    : `diff --git a/${filePath} b/${filePath}`
+
+  const out: string[] = [headDiffGit, minusL, plusL, ...misplaced, ...rest]
+  return out.join('\n').trimEnd()
+}
+
+/**
  * Small models often return only `@@` hunks. `git apply` needs `--- a/...` + `+++ b/...` (and usually `diff --git`).
  */
 export function normalizeUnifiedDiffForGitApply(filePath: string, unifiedDiff: string): string {
@@ -1520,6 +1632,10 @@ export function normalizeUnifiedDiffForGitApply(filePath: string, unifiedDiff: s
 
   t = sanitizeUnifiedDiffSpacedHunkHeaders(t)
   t = prependSyntheticHunkIfBarePlusMinusLines(t)
+
+  // `repairUnifiedDiffHunkHeaders` walks hunks until `---`/`+++` would not appear inside a hunk — if `@@` was
+  // emitted before file headers, `--- a/` lines start with `-` and were mis-counted as diff lines. Canonicalize first.
+  t = canonicalizeUnifiedDiffHeaderOrder(filePath, t)
 
   if (t.includes('@@')) {
     t = repairUnifiedDiffHunkHeaders(t)
@@ -1699,14 +1815,75 @@ function trimFile<T extends { content: string }>(file: T): T {
   return { ...file, content: file.content.slice(0, FIX_PROMPT_MAX_FILE_SNIPPET) }
 }
 
-function extractJson(raw: string): string {
+function jsonParseOk(s: string): boolean {
+  try {
+    JSON.parse(s)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Walk from `start` to the matching `}` for `{`, respecting JSON string escapes. Returns end index or null. */
+function findMatchingBraceEnd(s: string, start: number): number | null {
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i]!
+    if (esc) {
+      esc = false
+      continue
+    }
+    if (inStr) {
+      if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') {
+      inStr = true
+      continue
+    }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return null
+}
+
+/** First `{…}` slice starting at each `{` that `JSON.parse` accepts (prose / fences / malformed outers). */
+function peelBalancedJsonObject(s: string): string | null {
+  let from = 0
+  while (from < s.length) {
+    const start = s.indexOf('{', from)
+    if (start === -1) return null
+    const end = findMatchingBraceEnd(s, start)
+    if (end === null) return null
+    const slice = s.slice(start, end + 1)
+    if (jsonParseOk(slice)) return slice
+    from = start + 1
+  }
+  return null
+}
+
+export function extractJson(raw: string): string {
   const trimmed = raw.trim()
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed
+  if (trimmed.startsWith('{')) {
+    if (trimmed.endsWith('}') && jsonParseOk(trimmed)) return trimmed
+    const peeled = peelBalancedJsonObject(trimmed)
+    if (peeled) return peeled
+  }
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/)
-  if (fenced?.[1]) return fenced[1].trim()
-  const start = trimmed.indexOf('{')
-  const end = trimmed.lastIndexOf('}')
-  if (start !== -1 && end > start) return trimmed.slice(start, end + 1)
+  if (fenced?.[1]) {
+    const inner = fenced[1].trim()
+    if (jsonParseOk(inner)) return inner
+    const fromFence = peelBalancedJsonObject(inner)
+    if (fromFence) return fromFence
+  }
+  const peeled = peelBalancedJsonObject(trimmed)
+  if (peeled) return peeled
   return trimmed
 }
 

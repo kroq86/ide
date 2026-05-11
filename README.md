@@ -67,13 +67,12 @@ Root [`package.json`](package.json): `dev` = `build:native` + `npm --prefix app 
 
 Defaults are set **in code** (you may override with env):
 
-| Variable | Default (both call sites) | Where read |
-|----------|---------------------------|------------|
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | [`app/src/ai.ts`](app/src/ai.ts), [`app/src/codeclaw.ts`](app/src/codeclaw.ts) |
-| `OLLAMA_MODEL` | **`qwen2.5-coder:1.5b`** (chat / completion / FIM) | [`app/src/ai.ts`](app/src/ai.ts) |
-| `OLLAMA_MODEL` | **`llama3.2:latest`** (CodeClaw fix + review) | [`app/src/codeclaw.ts`](app/src/codeclaw.ts) |
+| Variable | Default | Where read |
+|----------|---------|--------------|
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | [`app/src/ollama-env.ts`](app/src/ollama-env.ts) (used by [`app/src/ai.ts`](app/src/ai.ts) and [`app/src/codeclaw.ts`](app/src/codeclaw.ts)) |
+| `OLLAMA_MODEL` | **`qwen2.5-coder:1.5b`** (chat, completion, FIM, CodeClaw fix + review) | same |
 
-If **`OLLAMA_MODEL` is set** in the environment, **both** `ai.ts` and `codeclaw.ts` use that same tag. Install models with `ollama pull …` to match whatever you set.
+If **`OLLAMA_MODEL` is set** in the environment, all call sites use that tag. Install models with `ollama pull …` to match whatever you set.
 
 ---
 

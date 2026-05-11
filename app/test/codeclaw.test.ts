@@ -15,6 +15,7 @@ import {
   splitGitDiffIntoChunks,
   compactFixContextForPrompt,
   createFixContext,
+  extractJson,
   loadCodeClawProject,
   loadCodeClawProjectForReview,
   makeReviewTraceId,
@@ -65,6 +66,13 @@ const bogusDup = filterReviewFindingsAgainstActiveBuffer(
 )
 assert.equal(bogusDup.length, 0)
 
+const bogusDupOfFunction = filterReviewFindingsAgainstActiveBuffer(
+  'examples/broken-counter/src/counter.ts',
+  'export function sum(): number { return 1 }\n',
+  [{ severity: 'blocker', file: 'examples/broken-counter/src/counter.ts', title: 'Duplicate export of sum function', explanation: '' }],
+)
+assert.equal(bogusDupOfFunction.length, 0)
+
 const keptDup = filterReviewFindingsAgainstActiveBuffer(
   'src/x.ts',
   'export function sum(){return 1}\nexport function sum(){return 2}\n',
@@ -90,6 +98,55 @@ const bogusTwoNamedProse = filterReviewFindingsAgainstActiveBuffer(
   }],
 )
 assert.equal(bogusTwoNamedProse.length, 0)
+
+// Model claims "exported twice" but buffer has no duplicate `export function` — drop (quote style in prose should not matter).
+const hallucinatedExportedTwiceBacktick = filterReviewFindingsAgainstActiveBuffer(
+  'examples/broken-counter/src/counter.ts',
+  'export function add(a: number, b: number): number {\n  return a - b\n}\n\nexport function sum(a: number, b:number): number {\n return a + b\n}\n',
+  [{
+    severity: 'warning',
+    file: 'examples/broken-counter/src/counter.ts',
+    title: 'Duplicate export warning',
+    explanation: 'The function `sum` is exported twice with different parameter types.',
+  }],
+)
+assert.equal(hallucinatedExportedTwiceBacktick.length, 0)
+
+const hallucinatedExportedTwiceSingleQuoted = filterReviewFindingsAgainstActiveBuffer(
+  'examples/broken-counter/src/counter.ts',
+  'export function add(a: number, b: number): number {\n  return a - b\n}\n\nexport function sum(a: number, b:number): number {\n return a + b\n}\n',
+  [{
+    severity: 'warning',
+    file: 'examples/broken-counter/src/counter.ts',
+    title: 'Duplicate export warning',
+    explanation: "The 'sum' function is exported twice with different parameter types.",
+  }],
+)
+assert.equal(hallucinatedExportedTwiceSingleQuoted.length, 0)
+
+const hallucinatedExportedFunctionOverload = filterReviewFindingsAgainstActiveBuffer(
+  'examples/broken-counter/src/counter.ts',
+  'export function add(a: number, b: number): number {\n  return a - b\n}\n\nexport function sum(a: number, b:number): number {\n return a + b\n}\n',
+  [{
+    severity: 'warning',
+    file: 'examples/broken-counter/src/counter.ts',
+    title: 'Duplicate export',
+    explanation: 'Exported function sum with different parameter types.',
+  }],
+)
+assert.equal(hallucinatedExportedFunctionOverload.length, 0)
+
+const keptDupSumMentionsAdd = filterReviewFindingsAgainstActiveBuffer(
+  'src/x.ts',
+  'export function sum(){return 1}\nexport function sum(){return 2}\nexport function add(){}\n',
+  [{
+    severity: 'blocker',
+    file: 'src/x.ts',
+    title: 'Duplicate export',
+    explanation: '`sum` is exported twice; unrelated `add` is fine.',
+  }],
+)
+assert.equal(keptDupSumMentionsAdd.length, 1)
 
 const counterChunk = extractGitDiffForPath(multiFileDiff, 'examples/broken-counter/src/counter.ts')
 assert.match(counterChunk, /counter\.ts/)
@@ -212,6 +269,56 @@ assert.match(wrapped, /^\+\+\+ b\/examples\/foo\.ts$/m)
 const barePlusMinus = normalizeUnifiedDiffForGitApply('examples/foo.ts', '-old\n+new')
 assert.match(barePlusMinus, /^diff --git a\/examples\/foo\.ts/m)
 assert.match(barePlusMinus, /@@ -1,1 \+1,1 @@/)
+
+// Small models echo labels like "Raw response:" inside a hunk (no +/- prefix) — strip before validate/git.
+const hunkWithRawResponse = ['@@ -1,3 +1,3 @@', ' a', '-b', 'Raw response: whatever', '+c'].join('\n')
+assert.ok(!sanitizeUnifiedDiffBareHunkLines(hunkWithRawResponse).includes('Raw response'))
+const noisyPatch = [
+  'diff --git a/sample.txt b/sample.txt',
+  '--- a/sample.txt',
+  '+++ b/sample.txt',
+  '@@ -1,3 +1,3 @@',
+  ' a',
+  '-b',
+  'Raw response: truncated json tail',
+  '+c',
+].join('\n')
+const strippedNoisy = normalizeUnifiedDiffForGitApply('sample.txt', noisyPatch)
+assert.ok(!strippedNoisy.includes('Raw response'), 'prose line must not survive normalize pipeline')
+validateUnifiedDiffBody('sample.txt', strippedNoisy)
+
+// Model puts @@ before ---/+++ — git apply needs headers first; normalize reorders.
+const atFirstThenHeaders = [
+  '@@ -1,1 +1,1 @@',
+  '-old',
+  '+new',
+  '--- a/examples/foo.ts',
+  '+++ b/examples/foo.ts',
+].join('\n')
+const reordered = normalizeUnifiedDiffForGitApply('examples/foo.ts', atFirstThenHeaders)
+const reorderedLines = reordered.split('\n')
+const firstMinus = reorderedLines.findIndex(l => /^---\s+a\//.test(l))
+const firstAt = reorderedLines.findIndex(l => l.startsWith('@@'))
+assert.ok(firstMinus >= 0 && firstAt >= 0 && firstMinus < firstAt, '--- before first @@ after normalize')
+const tmpPatch = mkdtempSync(join(tmpdir(), 'codeclaw-patch-'))
+const patchPath = join(tmpPatch, 'p.patch')
+writeFileSync(patchPath, reordered.endsWith('\n') ? reordered : `${reordered}\n`, 'utf8')
+const init = spawnSync('git', ['init'], { cwd: tmpPatch, encoding: 'utf8' })
+assert.equal(init.status, 0, init.stderr)
+mkdirSync(join(tmpPatch, 'examples'), { recursive: true })
+writeFileSync(join(tmpPatch, 'examples', 'foo.ts'), 'old\n', 'utf8')
+spawnSync('git', ['add', '.'], { cwd: tmpPatch, encoding: 'utf8' })
+const check = spawnSync('git', ['apply', '--check', patchPath], { cwd: tmpPatch, encoding: 'utf8' })
+assert.equal(check.status, 0, check.stderr ?? check.stdout)
+
+assert.equal(extractJson('  {"a":1}  '), '{"a":1}')
+assert.equal(extractJson('Here is JSON:\n{"b":2}\nthanks.'), '{"b":2}')
+assert.equal(extractJson('```json\n{"c":3}\n```'), '{"c":3}')
+assert.equal(extractJson('```\n{"d":4}\n```'), '{"d":4}')
+assert.equal(extractJson('not json {broken}'), 'not json {broken}')
+const nested = '{"outer":{"inner":1}}'
+assert.equal(extractJson(nested), nested)
+assert.equal(extractJson('preamble {"x":1}'), '{"x":1}')
 
 // Models emit `+ 9,5` (space after `+`) — git reports corrupt patch without normalization
 const spacedHunkHeader = normalizeUnifiedDiffForGitApply(
@@ -342,6 +449,26 @@ const miscountedHunk = [
   ' ctx',
 ].join('\n')
 assert.match(repairUnifiedDiffHunkHeaders(miscountedHunk), /@@ -2,2 \+2,2 @@/)
+
+const emptyHunk = [
+  'diff --git a/sample.txt b/sample.txt',
+  '--- a/sample.txt',
+  '+++ b/sample.txt',
+  '@@ -9,3 +9,3 @@',
+  '+one',
+  '-two',
+  '@@ -11,0 +11,0 @@',
+  '',
+].join('\n')
+assert.ok(!repairUnifiedDiffHunkHeaders(emptyHunk).includes('@@ -11,0 +11,0 @@'))
+
+// repair must not swallow hunks whose body lines lack +/- prefixes (else normalize can yield a bare @@ for git apply).
+const miscountedBodyNoPrefix = ['@@ -1,1 +1,1 @@', 'export function x() {}', ''].join('\n')
+assert.match(
+  normalizeUnifiedDiffForGitApply('src/m.ts', miscountedBodyNoPrefix),
+  /^diff --git a\/src\/m\.ts/m,
+  'hunk preserved so git headers are prepended',
+)
 
 const skipsGarbageFiles = parsePatchProposal(JSON.stringify({
   summary: 'ok',

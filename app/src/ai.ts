@@ -3,10 +3,9 @@ import { dirname, join } from 'node:path'
 import type { ShellLine, ShellSession } from './shell.js'
 import { debugLog } from './debug-log.js'
 import { readOllamaNdjsonLines } from './ollama-ndjson.js'
+import { OLLAMA_MODEL, OLLAMA_URL } from './ollama-env.js'
 
-/** Prefer loopback IP — on some hosts `localhost` resolves to ::1 while Ollama listens on IPv4 only. */
-const OLLAMA_URL = process.env['OLLAMA_URL'] ?? 'http://127.0.0.1:11434'
-const OLLAMA_MODEL = process.env['OLLAMA_MODEL'] ?? 'qwen2.5-coder:1.5b'
+/** Defaults use loopback IP — on some hosts `localhost` resolves to ::1 while Ollama listens on IPv4 only. */
 
 /** Model base name (strip `:tag`) for family detection. */
 export function ollamaModelBase(modelName: string): string {

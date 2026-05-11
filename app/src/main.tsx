@@ -791,7 +791,7 @@ function codeClawFixLines(
   if (state.status === 'applying') {
     return [
       { text: thinkingPrefixedLine(thinkingTick, 'CodeClaw fix'), color: C.cyan },
-      { text: thinkingPrefixedLine(thinkingTick, 'Applying patch and rerunning verification…'), color: C.grey, wrap: 'wrap' },
+      { text: thinkingPrefixedLine(thinkingTick, 'Applying patch…'), color: C.grey, wrap: 'wrap' },
     ]
   }
   if (state.status === 'trace') {
@@ -1869,7 +1869,12 @@ function App({
     void (async () => {
       const reviewGitBlob = prepareReviewGitInput(collectGitDiffForReview(cwd), gitCtx.status)
       try {
-        const activeEditorBody = (snapshot?.lines ?? []).join('\n')
+        const activeEditorBody =
+          snapshot == null
+            ? undefined
+            : (snapshot.lines?.length ?? 0) === 0
+              ? undefined
+              : (snapshot.lines ?? []).join('\n')
         const proposal = await generateReviewProposal(reviewGitBlob, rules, activeFile, openBuffers, ctrl.signal, activeEditorBody, cwd, { traceId })
         const endedAt = new Date().toISOString()
         const trace = buildReviewTrace({
@@ -1941,14 +1946,12 @@ function App({
         sidecar.open(activePath)
       }
 
-      const trace = buildTrace(traceId, startedAt, context, proposal, true, undefined, undefined, 'codeclaw_review')
-      const tracePath = writeTrace(process.cwd(), trace)
-      setFixState({
-        status: 'done',
-        message: 'Patch applied. Running CodeClaw review (same as SPC a r)…',
-        tracePath,
-      })
-      runCodeClawReview({ clearFixState: false })
+      const trace = buildTrace(traceId, startedAt, context, proposal, true, undefined, undefined)
+      writeTrace(process.cwd(), trace)
+      setReviewState({ status: 'idle' })
+      setFixState({ status: 'idle' })
+      setPanel(null)
+      actions.setActiveBufferStatus('CodeClaw fix applied.')
     })()
   }
 
