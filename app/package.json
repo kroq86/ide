@@ -10,7 +10,7 @@
     "dev:debug": "npm run build && QE_DEBUG=1 node --env-file-if-exists=../.env dist/main.js",
     "dev:ui": "npm run build && node --env-file-if-exists=../.env dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test test/leader.test.ts test/helpers.test.ts test/git.test.ts test/ai-context.test.ts test/codeclaw.test.ts test/codeclaw-trace-recorder.test.ts test/dired.test.ts test/debug-log.test.ts test/diff.test.ts",
+    "test": "tsx --test test/leader.test.ts test/helpers.test.ts test/git.test.ts test/root.test.ts test/lsp-position.test.ts test/ai-context.test.ts test/codeclaw.test.ts test/codeclaw-trace-recorder.test.ts test/dired.test.ts test/debug-log.test.ts test/diff.test.ts",
     "test:protocol": "cargo build --release --manifest-path ../native/editor-core/Cargo.toml && node test/protocol-smoke.mjs",
     "test:codeclaw": "tsx test/codeclaw.test.ts"
   },

@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
-import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
+import { QeSidecar, type Diagnostic, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, checkCommandDanger, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
 import { streamCompletion, streamChat, sanitizeInlineCompletion, type AiContext } from './ai.js'
 import { getProviderLabel, setActiveModel, listAvailableModels, isOllamaActive } from './ai-registry.js'
@@ -47,10 +47,13 @@ import { loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, type BufferInfo,
 import {
   loadGitStatus, loadFileHunks, getGitRepoRoot, hunkNewStartRow, resolveRepoFilePath, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
   getGitLog, buildGitDisplayLines,
-  type GitStatusData, type GitFileEntry, type GitDisplayLine, type GitLogEntry, type GitPanelView, type GitSelectableLine,
+  type GitStatusData, type GitFileEntry, type GitHunk, type GitDisplayLine, type GitLogEntry, type GitPanelView, type GitSelectableLine,
 } from './git.js'
 import { readDiredEntries, type DiredEntry } from './dired.js'
 import { debugLog, getDebugLogPath } from './debug-log.js'
+import { detectProjectRoot } from './root.js'
+import { diagnosticAtCursor, formatDiagnostic, nextDiagnostic, sortDiagnostics } from './diagnostics.js'
+import { nearestIdentifierPosition } from './lsp-position.js'
 
 
 /** Keep header readable on narrow terminals (avoid path/status/search overlapping). */
@@ -120,7 +123,7 @@ type FuzzyMatch = { path: string; score: number; indices: number[] }
 
 type PromptState =
   | { type: 'buffer'; query: string; selected: number }
-  | { type: 'file'; query: string; candidates: string[]; ranked: FuzzyMatch[]; selectedIdx: number }
+  | { type: 'file'; query: string; candidates: string[]; ranked: FuzzyMatch[]; selectedIdx: number; base: string }
   | { type: 'saveAs'; query: string; thenQuit?: boolean }
   | { type: 'commit'; message: string }
   | { type: 'model'; query: string; candidates: string[]; selected: number }
@@ -152,6 +155,8 @@ type Panel =
   | { type: 'shell' }
   | { type: 'whichkey'; node: LeaderNode; path: string }
   | { type: 'cmdpalette'; query: string; cursor: number; items: CmdItem[] }
+  | { type: 'diagnostics'; diagnostics: Diagnostic[]; cursor: number; title: string }
+  | { type: 'lsp'; title: string; lines: string[] }
   | { type: 'ai'; focused: boolean }
   | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string; view: GitPanelView }
   | { type: 'dired'; path: string; cursor: number }
@@ -186,6 +191,16 @@ type VisualSnap = {
   anchor: { row: number; col: number }
   cursor: { row: number; col: number }
   lineMode: boolean
+}
+
+type YankRegister = {
+  text: string
+  lineWise: boolean
+}
+
+type LspOverlay = {
+  title: string
+  lines: string[]
 }
 
 function lastInclusiveCol(lines: string[], row: number): number {
@@ -357,6 +372,26 @@ function getVisualText(lines: string[], sel: SelBounds): string {
   for (let r = sel.startRow + 1; r < sel.endRow; r++) parts.push(lines[r] ?? '')
   parts.push(lines[sel.endRow]?.slice(0, sel.endCol + 1) ?? '')
   return parts.join('\n')
+}
+
+function writeClipboard(text: string): boolean {
+  const commands =
+    process.platform === 'darwin'
+      ? [['pbcopy']]
+      : process.platform === 'win32'
+        ? [['clip']]
+        : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']]
+
+  for (const command of commands) {
+    const result = spawnSync(command[0]!, command.slice(1), {
+      input: text,
+      encoding: 'utf8',
+      timeout: 1000,
+      stdio: ['pipe', 'ignore', 'ignore'],
+    })
+    if (result.status === 0) return true
+  }
+  return false
 }
 
 function findMatches(lines: string[], query: string): Array<{ row: number; col: number }> {
@@ -549,6 +584,74 @@ function CmdPalettePanel({
   )
 }
 
+function DiagnosticsPanel({ diagnostics, cursor, title, totalRows, totalCols }: {
+  diagnostics: Diagnostic[]
+  cursor: number
+  title: string
+  totalRows: number
+  totalCols: number
+}) {
+  const sorted = sortDiagnostics(diagnostics)
+  const safeCursor = Math.min(cursor, Math.max(0, sorted.length - 1))
+  const contentRows = Math.max(1, totalRows - 2)
+  const idealOffset = Math.max(0, safeCursor - Math.floor(contentRows / 2))
+  const scrollOffset = Math.min(idealOffset, Math.max(0, sorted.length - contentRows))
+  const visible = sorted.slice(scrollOffset, scrollOffset + contentRows)
+  const titleLeft = ` *diagnostics*  ${title} `
+  const hint = 'j/k  Ret=open  q/Esc=close'
+  const titlePad = ' '.repeat(Math.max(0, totalCols - titleLeft.length - hint.length - 2))
+
+  return (
+    <Box flexDirection="column" width={totalCols} height={totalRows}>
+      <Box flexDirection="row">
+        <Text backgroundColor={C.red} color={C.bg}>{titleLeft}</Text>
+        <Text backgroundColor='#21252b' color={C.grey}>{titlePad + ' ' + hint}</Text>
+      </Box>
+      {visible.length === 0
+        ? <Text color={C.grey}>  no diagnostics</Text>
+        : visible.map((diagnostic, index) => {
+            const actual = scrollOffset + index
+            const selected = actual === safeCursor
+            const sevColor = diagnostic.severity === 'error' ? C.red
+              : diagnostic.severity === 'warning' ? C.yellow
+              : diagnostic.severity === 'hint' ? C.cyan
+              : C.blue
+            const line = `${diagnostic.row + 1}:${diagnostic.startCol + 1}  ${diagnostic.severity.padEnd(7)}  ${diagnostic.message}`
+            return (
+              <Box key={`${actual}:${diagnostic.row}:${diagnostic.startCol}:${diagnostic.message}`} flexDirection="row">
+                <Text color={selected ? C.cyan : C.grey}>{selected ? '>' : ' '}</Text>
+                <Text color={selected ? C.bg : sevColor} backgroundColor={selected ? C.violet : undefined} wrap="truncate">
+                  {line}
+                </Text>
+              </Box>
+            )
+          })}
+    </Box>
+  )
+}
+
+function LspPanel({ title, lines, totalCols }: {
+  title: string
+  lines: string[]
+  totalCols: number
+}) {
+  const shown = lines.length > 0 ? lines.slice(0, 8) : ['(no LSP information)']
+  const titleLeft = ` *${title}* `
+  const hint = 'Esc/q=close'
+  const titlePad = ' '.repeat(Math.max(0, totalCols - titleLeft.length - hint.length - 2))
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row">
+        <Text backgroundColor={C.blue} color={C.bg}>{titleLeft}</Text>
+        <Text backgroundColor='#21252b' color={C.grey}>{titlePad + ' ' + hint}</Text>
+      </Box>
+      {shown.map((line, index) => (
+        <Text key={index} color={index === 0 ? C.cyan : C.fg} wrap="truncate">{line || ' '}</Text>
+      ))}
+    </Box>
+  )
+}
+
 function lspHoverText(response: LspResponse): string {
   const result = response.result as { text?: unknown; message?: unknown } | undefined
   const text = typeof result?.text === 'string' && result.text.trim()
@@ -559,10 +662,29 @@ function lspHoverText(response: LspResponse): string {
   return text.split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3).join('  ')
 }
 
+function lspHoverLines(response: LspResponse): string[] {
+  const text = lspHoverText(response)
+  return text
+    .replace(/```[a-zA-Z0-9_-]*/g, '')
+    .replace(/```/g, '')
+    .split('\n')
+    .flatMap(line => line.split('  '))
+    .map(line => line.trim())
+    .filter(Boolean)
+}
+
 function lspDefinitionTarget(response: LspResponse): LspTarget | null {
   const result = response.result as { target?: LspTarget; message?: unknown } | undefined
   if (result?.target?.path) return result.target
   return null
+}
+
+function lspUnavailableText(response: LspResponse, label: string): string {
+  const result = response.result as { available?: boolean; message?: unknown } | undefined
+  const message = typeof result?.message === 'string' && result.message.trim()
+    ? result.message.trim()
+    : response.status
+  return `${label}: ${message}`
 }
 
 function isDirty(buffer: EditorBuffer): boolean {
@@ -1476,6 +1598,10 @@ function fuzzyRank(needle: string, candidates: string[]): FuzzyMatch[] {
     .sort((a, b) => a.score - b.score)
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', '__pycache__', '.cache'])
 
 async function collectFilesAsync(dir: string, depth: number, base: string): Promise<string[]> {
@@ -1496,7 +1622,7 @@ async function collectFilesAsync(dir: string, depth: number, base: string): Prom
 // ── Main app component ────────────────────────────────────────────────────────
 
 function App({
-  buffers, activeId, bufferKey, sidecar, shell, shellLines, userLeader, actions,
+  buffers, activeId, bufferKey, sidecar, shell, shellLines, userLeader, lspOverlay, actions,
 }: {
   buffers: EditorBuffer[]
   activeId: string
@@ -1505,6 +1631,7 @@ function App({
   shell: ShellSidecar
   shellLines: ShellLine[]
   userLeader: LeaderTree
+  lspOverlay: LspOverlay | null
   actions: {
     openFile: (path: string, jump?: { row: number; col: number }) => void
     switchBuffer: (id: string) => void
@@ -1515,6 +1642,7 @@ function App({
     quitAll: () => void
     reloadConfig: () => Promise<void>
     openConfig: () => void
+    clearLspOverlay: () => void
     /** Mutates active buffer status + triggers rerender (for completion errors etc.). */
     setActiveBufferStatus: (status: string) => void
   }
@@ -1578,7 +1706,7 @@ function App({
   }, [aiPanelBusy])
 
   const pendingKeyRef    = React.useRef<string | null>(null)
-  const yankRegisterRef  = React.useRef<string | null>(null)
+  const yankRegisterRef  = React.useRef<YankRegister | null>(null)
   const abortRef         = React.useRef<AbortController | null>(null)
   const aiAbortRef       = React.useRef<AbortController | null>(null)
   const searchQueryRef   = React.useRef('')
@@ -1599,6 +1727,13 @@ function App({
     setCmdBuf('')
     setSearchBuf('')
   }, [setGhostTextSync])
+
+  const yankText = React.useCallback((text: string, lineWise: boolean) => {
+    yankRegisterRef.current = { text, lineWise }
+    const clipboardText = lineWise ? `${text}\n` : text
+    const copied = writeClipboard(clipboardText)
+    actions.setActiveBufferStatus(`yanked ${lineWise ? 'line' : 'selection'}${copied ? ' to clipboard' : ''}`)
+  }, [actions])
 
   const saveCurrentBuffer = React.useCallback(() => {
     const path = snapshot?.filename ?? activeBuffer.filename ?? null
@@ -1665,6 +1800,106 @@ function App({
     [buffers, activeId],
   )
 
+  const openFilePromptFromRoot = React.useCallback((root: string) => {
+    enterNormal()
+    setPrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0, base: root })
+    collectFilesAsync(root, 0, root).then(candidates => {
+      setPrompt(prev => {
+        if (prev?.type !== 'file') return prev
+        const ranked = prev.query
+          ? fuzzyRank(prev.query, candidates).slice(0, 50)
+          : candidates.slice(0, 50).map(path => ({ path, score: 0, indices: [] }))
+        return { ...prev, candidates, ranked }
+      })
+    }).catch(() => {})
+  }, [enterNormal])
+
+  const setStatus = React.useCallback((message: string) => {
+    actions.setActiveBufferStatus(message)
+  }, [actions])
+
+  const jumpToDiagnostic = React.useCallback((diagnostic: Diagnostic | null) => {
+    if (!diagnostic) {
+      setStatus('diagnostics: none')
+      return
+    }
+    sidecar.moveTo(diagnostic.row, diagnostic.startCol)
+    setStatus(formatDiagnostic(diagnostic))
+  }, [setStatus, sidecar])
+
+  const openDiagnosticsPanel = React.useCallback((title = 'buffer') => {
+    setPanel({
+      type: 'diagnostics',
+      diagnostics: sortDiagnostics(snapshot?.diagnostics ?? []),
+      cursor: 0,
+      title,
+    })
+  }, [snapshot?.diagnostics])
+
+  const currentGitHunk = React.useCallback((
+    sections: Array<GitFileEntry['section']>,
+    movement: 'current' | 'next' | 'previous' = 'current',
+  ): { entry: GitFileEntry; hunk: GitHunk; row: number } | null => {
+    if (!snapshot?.filename) return null
+    const root = getGitRepoRoot(process.cwd())
+    const abs = resolvePath(snapshot.filename)
+    const rel = abs.startsWith(`${root}/`) ? abs.slice(root.length + 1) : snapshot.filename
+    const status = loadGitStatus(process.cwd())
+    const entries = {
+      untracked: status.untracked,
+      unstaged: status.unstaged,
+      staged: status.staged,
+    }
+    const entry = sections.flatMap(section => entries[section]).find(item => item.path === rel)
+    if (!entry) return null
+    const hunks = loadFileHunks(process.cwd(), entry.path, entry.section)
+    const cursorRow = snapshot.cursor.row
+    const hunkRows = hunks
+      .map(hunk => ({ hunk, row: hunkNewStartRow(hunk.header) }))
+      .filter((item): item is { hunk: GitHunk; row: number } => item.row != null)
+
+    let target = hunkRows.find((candidate, index) => {
+      const start = candidate.row
+      const nextStart = hunkRows[index + 1]?.row
+      return start != null && cursorRow >= start && (nextStart == null || cursorRow < nextStart)
+    }) ?? hunkRows[0]
+
+    if (movement === 'next') {
+      target = hunkRows.find(candidate => candidate.row > cursorRow) ?? hunkRows[0]
+    } else if (movement === 'previous') {
+      target = [...hunkRows].reverse().find(candidate => candidate.row < cursorRow) ?? hunkRows[hunkRows.length - 1]
+    }
+
+    return target ? { entry: { ...entry, hunks }, hunk: target.hunk, row: target.row } : null
+  }, [snapshot])
+
+  const openGitPanelForHunk = React.useCallback((target: { entry: GitFileEntry; hunk: GitHunk }, note?: string) => {
+    const data = loadGitStatus(process.cwd())
+    const update = (entries: GitFileEntry[]) => entries.map(entry =>
+      entry.path === target.entry.path && entry.section === target.entry.section
+        ? { ...entry, expanded: true, hunks: target.entry.hunks }
+        : entry,
+    )
+    const nextData: GitStatusData = {
+      ...data,
+      untracked: update(data.untracked),
+      unstaged: update(data.unstaged),
+      staged: update(data.staged),
+    }
+    const lines = buildGitDisplayLines(nextData)
+    let selectableCursor = 0
+    let seen = 0
+    for (const line of lines) {
+      if (!line.selectable) continue
+      if (line.type === 'hunk' && line.entry.path === target.entry.path && line.entry.section === target.entry.section && line.hunk.header === target.hunk.header) {
+        selectableCursor = seen
+        break
+      }
+      seen++
+    }
+    setPanel({ type: 'git', data: nextData, cursor: selectableCursor, pendingKey: null, logEntries: null, gitError: note, view: 'status' })
+  }, [])
+
   const makeCtx = React.useCallback((): EditorContext => ({
       filename: snapshot?.filename ?? null,
       lines:    snapshot?.lines   ?? [],
@@ -1696,18 +1931,7 @@ function App({
         setPrompt({ type: 'buffer', query: '', selected })
       },
       openFilePrompt: () => {
-        enterNormal()
-        const base = process.cwd()
-        setPrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0 })
-        collectFilesAsync(base, 0, base).then(candidates => {
-          setPrompt(prev => {
-            if (prev?.type !== 'file') return prev
-            const ranked = prev.query
-              ? fuzzyRank(prev.query, candidates).slice(0, 50)
-              : candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] }))
-            return { ...prev, candidates, ranked }
-          })
-        }).catch(() => {})
+        openFilePromptFromRoot(detectProjectRoot({ filename: snapshot?.filename ?? activeBuffer.filename, cwd: process.cwd() }))
       },
       next: actions.nextBuffer,
       previous: actions.previousBuffer,
@@ -1734,16 +1958,88 @@ function App({
     {
       open: openGitPanel,
       stage: stageCurrentFile,
+      log: () => {
+        const data = loadGitStatus(process.cwd())
+        setPanel({ type: 'git', data, cursor: 0, pendingKey: null, logEntries: getGitLog(process.cwd()), gitError: undefined, view: 'log' })
+      },
+      nextHunk: () => {
+        const target = currentGitHunk(['unstaged', 'staged'], 'next')
+        if (!target) { setStatus('git: no next hunk for current file'); return }
+        sidecar.moveTo(target.row, 0)
+        setStatus(`git: next hunk ${target.entry.path}:${target.row + 1}`)
+      },
+      previousHunk: () => {
+        const target = currentGitHunk(['unstaged', 'staged'], 'previous')
+        if (!target) { setStatus('git: no previous hunk for current file'); return }
+        sidecar.moveTo(target.row, 0)
+        setStatus(`git: previous hunk ${target.entry.path}:${target.row + 1}`)
+      },
+      stageHunk: () => {
+        const target = currentGitHunk(['unstaged', 'untracked'])
+        if (!target) { setStatus('git: no hunk at current file'); return }
+        stageEntry(process.cwd(), target.entry, target.hunk)
+        setStatus(`git: staged hunk in ${target.entry.path}`)
+      },
+      unstageHunk: () => {
+        const target = currentGitHunk(['staged'])
+        if (!target) { setStatus('git: no staged hunk at current file'); return }
+        unstageEntry(process.cwd(), target.entry, target.hunk)
+        setStatus(`git: unstaged hunk in ${target.entry.path}`)
+      },
+      previewHunk: () => {
+        const target = currentGitHunk(['unstaged', 'staged'])
+        if (!target) { setStatus('git: no hunk at current file'); return }
+        openGitPanelForHunk(target, `preview ${target.entry.path} ${target.hunk.header}`)
+      },
+      blameLine: () => {
+        if (!snapshot?.filename) { setStatus('git: no file for blame'); return }
+        void shell.runTracked(`git --no-pager blame -L ${snapshot.cursor.row + 1},${snapshot.cursor.row + 1} -- ${shellQuote(snapshot.filename)}`)
+        setPanel({ type: 'shell' })
+      },
+      fileHistory: () => {
+        if (!snapshot?.filename) { setStatus('git: no file history for scratch buffer'); return }
+        void shell.runTracked(`git --no-pager log --stat --patch -- ${shellQuote(snapshot.filename)}`)
+        setPanel({ type: 'shell' })
+      },
     },
     {
       hover: () => {
-        const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+        const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
         sidecar.hover(cursor.row, cursor.col)
       },
       definition: () => {
-        const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+        const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
         sidecar.goToDefinition(cursor.row, cursor.col)
       },
+      references: () => setStatus('LSP references: not supported by the sidecar yet'),
+      rename: () => setStatus('LSP rename: not supported by the sidecar yet'),
+      codeAction: () => setStatus('LSP code action: not supported by the sidecar yet'),
+      format: () => sidecar.format(),
+      toggleInlayHints: () => setStatus('inlay hints: not supported by the sidecar yet'),
+    },
+    {
+      list: () => openDiagnosticsPanel('project'),
+      buffer: () => openDiagnosticsPanel('buffer'),
+      line: () => jumpToDiagnostic(diagnosticAtCursor(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 })),
+      next: () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1)),
+      previous: () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, -1)),
+      nextError: () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1, 'error')),
+      nextWarning: () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1, 'warning')),
+      toggle: () => setStatus('diagnostics display: inline count and diagnostics panel are enabled'),
+    },
+    {
+      buffer: () => {
+        visualExpandHistoryRef.current = []
+        setVisualAnchor(null)
+        setVisualLineMode(false)
+        setMode('search')
+        setSearchBuf('')
+        pendingKeyRef.current = null
+      },
+      replace: () => setStatus('search replace: not implemented yet'),
+    },
+    {
+      toggleWrap: () => setStatus('wrap: terminal renderer wraps by pane width'),
     },
     {
       open:   actions.openConfig,
@@ -1766,7 +2062,7 @@ function App({
     },
     userLeader,
     makeCtx,
-  ), [actions, activeId, buffers, makeCtx, saveBufferAndQuit, saveCurrentBuffer, shell, snapshot, userLeader])
+  ), [actions, activeBuffer.filename, activeId, buffers, currentGitHunk, jumpToDiagnostic, makeCtx, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -2241,6 +2537,10 @@ function App({
       setPanel(prev => prev?.type === 'shell' ? null : { type: 'shell' })
       return
     }
+    if (lspOverlay && (key.escape || input === 'q')) {
+      actions.clearLspOverlay()
+      return
+    }
 
     // ── Command palette ───────────────────────────────────────────────────────
     if (panel?.type === 'cmdpalette') {
@@ -2523,6 +2823,38 @@ function App({
       return
     }
 
+    // ── Diagnostics panel ───────────────────────────────────────────────────
+    if (panel?.type === 'diagnostics') {
+      const diagnostics = sortDiagnostics(panel.diagnostics)
+      const maxIdx = Math.max(0, diagnostics.length - 1)
+      const cursor = Math.min(panel.cursor, maxIdx)
+      if (key.escape || input === 'q') { setPanel(null); return }
+      if (input === 'j' || key.downArrow) {
+        setPanel(prev => prev?.type === 'diagnostics' ? { ...prev, cursor: Math.min(maxIdx, cursor + 1) } : prev)
+        return
+      }
+      if (input === 'k' || key.upArrow) {
+        setPanel(prev => prev?.type === 'diagnostics' ? { ...prev, cursor: Math.max(0, cursor - 1) } : prev)
+        return
+      }
+      if (key.return) {
+        const diagnostic = diagnostics[cursor]
+        if (diagnostic) {
+          sidecar.moveTo(diagnostic.row, diagnostic.startCol)
+          setStatus(formatDiagnostic(diagnostic))
+        }
+        setPanel(null)
+        return
+      }
+      return
+    }
+
+    // ── LSP result panel ────────────────────────────────────────────────────
+    if (panel?.type === 'lsp') {
+      if (key.escape || input === 'q') { setPanel(null); return }
+      return
+    }
+
     // ── Dired panel (directory browser; mirrors Evil dired + h / l) ───────────
     if (panel?.type === 'dired') {
       const entries = readDiredEntries(panel.path)
@@ -2675,7 +3007,7 @@ function App({
       if (key.escape) { enterNormal(); return }
       if (key.return) {
         const chosen = prompt.ranked[prompt.selectedIdx]?.path ?? prompt.query.trim()
-        if (chosen) actions.openFile(resolvePath(process.cwd(), chosen))
+        if (chosen) actions.openFile(resolvePath(prompt.base, chosen))
         enterNormal()
         return
       }
@@ -2950,14 +3282,14 @@ function App({
 
       if (input === 'y' && snapshot && visualAnchor) {
         const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
-        yankRegisterRef.current = getVisualText(snapshot.lines, sel)
+        yankText(getVisualText(snapshot.lines, sel), sel.lineMode)
         enterNormal()
         return
       }
 
       if ((input === 'd' || input === 'c') && snapshot && visualAnchor) {
         const sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
-        yankRegisterRef.current = getVisualText(snapshot.lines, sel)
+        yankText(getVisualText(snapshot.lines, sel), sel.lineMode)
         if (sel.lineMode) {
           sidecar.deleteRange(sel.startRow, 0, sel.endRow, 999999)
         } else {
@@ -3043,16 +3375,21 @@ function App({
         sidecar.move('fileStart')
         return
       }
+      if (input === 'd') {
+        const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+        sidecar.goToDefinition(cursor.row, cursor.col)
+        return
+      }
       /* incomplete `gg` — fall through so e.g. `n` still runs search-next */
     } else if (pending === 'd') {
       if (input === 'd' && snapshot) {
-        yankRegisterRef.current = snapshot.lines[snapshot.cursor.row] ?? ''
+        yankText(snapshot.lines[snapshot.cursor.row] ?? '', true)
         sidecar.deleteLine()
       }
       return
     } else if (pending === 'y') {
       if (input === 'y' && snapshot)
-        yankRegisterRef.current = snapshot.lines[snapshot.cursor.row] ?? ''
+        yankText(snapshot.lines[snapshot.cursor.row] ?? '', true)
       return
     }
 
@@ -3070,6 +3407,11 @@ function App({
       case '0': sidecar.move('home');        break
       case '$': sidecar.move('end');         break
       case 'G': sidecar.move('fileEnd');     break
+      case 'K': {
+        const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+        sidecar.hover(cursor.row, cursor.col)
+        break
+      }
       case 'g': pendingKeyRef.current = 'g'; break
       case 'd': pendingKeyRef.current = 'd'; break
       case 'y': pendingKeyRef.current = 'y'; break
@@ -3078,23 +3420,25 @@ function App({
       case 'X': sidecar.deleteBackward();    break
       case 'p':
         if (yankRegisterRef.current !== null) {
-          if (yankRegisterRef.current.includes('\n')) {
+          const yank = yankRegisterRef.current
+          if (yank.lineWise) {
             // line-wise yank → paste as new line below
-            sidecar.move('end'); sidecar.insert('\n' + yankRegisterRef.current)
+            sidecar.move('end'); sidecar.insert('\n' + yank.text)
           } else {
             // char-wise yank → paste after cursor
-            sidecar.move('right'); sidecar.insert(yankRegisterRef.current)
+            sidecar.move('right'); sidecar.insert(yank.text)
           }
         }
         break
       case 'P':
         if (yankRegisterRef.current !== null) {
-          if (yankRegisterRef.current.includes('\n')) {
+          const yank = yankRegisterRef.current
+          if (yank.lineWise) {
             // line-wise → paste as new line above
-            sidecar.move('home'); sidecar.insert(yankRegisterRef.current + '\n'); sidecar.move('up')
+            sidecar.move('home'); sidecar.insert(yank.text + '\n'); sidecar.move('up')
           } else {
             // char-wise → paste before cursor
-            sidecar.insert(yankRegisterRef.current)
+            sidecar.insert(yank.text)
           }
         }
         break
@@ -3163,11 +3507,27 @@ function App({
     )
   }
 
-  const panelRows = panel === null || panel.type === 'ai' ? 0
+  if (panel?.type === 'diagnostics') {
+    return (
+      <Box flexDirection="column" width={totalCols} height={totalRows}>
+        <DiagnosticsPanel
+          diagnostics={panel.diagnostics}
+          cursor={panel.cursor}
+          title={panel.title}
+          totalRows={totalRows}
+          totalCols={totalCols}
+        />
+      </Box>
+    )
+  }
+
+  const lspOverlayRows = lspOverlay ? Math.min(10, lspOverlay.lines.length + 2) : 0
+  const panelRows = (panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell'      ? 3 + shellRows
     : panel.type === 'dired'      ? totalRows
     : panel.type === 'cmdpalette' ? 0
-    : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
+    : panel.type === 'lsp'        ? Math.min(10, panel.lines.length + 2)
+    : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))) + lspOverlayRows
   const editorHeight = panel?.type === 'dired' ? 0 : Math.max(1, totalRows - panelRows)
 
   const editorPane = (
@@ -3261,6 +3621,12 @@ function App({
       {panel?.type === 'cmdpalette' && (
         <CmdPalettePanel items={panel.items} query={panel.query} cursor={panel.cursor} width={Math.min(70, totalCols - 4)} />
       )}
+      {panel?.type === 'lsp' && (
+        <LspPanel title={panel.title} lines={panel.lines} totalCols={totalCols} />
+      )}
+      {lspOverlay && (
+        <LspPanel title={lspOverlay.title} lines={lspOverlay.lines} totalCols={totalCols} />
+      )}
       {panel?.type === 'shell' && (
         <ShellPane
           lines={shellLines}
@@ -3324,6 +3690,7 @@ async function main() {
   let shellLines: ShellLine[] = [...shell.lines]
   let instance: Instance | null = null
   let quitting = false
+  let lspOverlay: LspOverlay | null = null
 
   const refresh = () => instance?.rerender(view())
 
@@ -3383,10 +3750,13 @@ async function main() {
               openFile(target.path, { row: target.row ?? 0, col: target.col ?? 0 })
               buffer.status = `definition ${target.path}:${(target.row ?? 0) + 1}`
             } else {
-              buffer.status = message.status
+              buffer.status = lspUnavailableText(message, 'definition unavailable')
+              lspOverlay = { title: 'definition', lines: [buffer.status] }
             }
           } else if (message.kind === 'hover') {
-            buffer.status = lspHoverText(message)
+            const lines = lspHoverLines(message)
+            buffer.status = lines[0] ?? lspUnavailableText(message, 'hover unavailable')
+            lspOverlay = { title: 'hover', lines }
           } else if (message.kind === 'completion') {
             const result = message.result as { available?: boolean; items?: Array<{ label: string; insertText: string; detail: string }> } | undefined
             const items = result?.items ?? []
@@ -3509,7 +3879,16 @@ async function main() {
       return bPath ? resolvePath(bPath) === resolved : false
     })
     if (existing) {
-      if (jump) existing.jumpTo = jump
+      if (jump) {
+        if (existing.id === activeId && activeSidecar) {
+          activeSidecar.moveTo(jump.row, jump.col)
+          existing.status = `jump ${jump.row + 1}:${jump.col + 1}`
+          buffers = [...buffers]
+          refresh()
+          return
+        }
+        existing.jumpTo = jump
+      }
       switchBuffer(existing.id)
       return
     }
@@ -3587,6 +3966,7 @@ async function main() {
           shell={shell}
           shellLines={displayLines}
           userLeader={cfg.leader ?? {}}
+          lspOverlay={lspOverlay}
           actions={{
             openFile,
             switchBuffer,
@@ -3597,6 +3977,10 @@ async function main() {
             quitAll,
             reloadConfig: reloadCfg,
             openConfig,
+            clearLspOverlay: () => {
+              lspOverlay = null
+              refresh()
+            },
             setActiveBufferStatus: (status: string) => {
               const b = activeBuffer()
               if (!b) return

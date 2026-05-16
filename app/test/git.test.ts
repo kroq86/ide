@@ -15,6 +15,8 @@ import {
   getGitRepoRoot,
   hunkNewStartRow,
   resolveRepoFilePath,
+  stageEntry,
+  unstageEntry,
   buildMyersGitHunks,
   formatEditorVsDiskMyersSnippet,
   type GitStatusData,
@@ -159,6 +161,47 @@ describe('loadFileHunks', () => {
       hunks.some(h => h.lines.some(l => l.startsWith('+') || l.startsWith('-'))),
       'expected +/- diff lines',
     )
+  })
+})
+
+describe('hunk staging', () => {
+  it('stages and unstages one selected hunk without swallowing unrelated hunks', () => {
+    const rel = 'hunk-stage.txt'
+    const original = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join('\n') + '\n'
+    writeFileSync(join(repo, rel), original)
+    spawnSync('git', ['add', '--', rel], { cwd: repo, stdio: 'ignore' })
+    assert.equal(commitGit(repo, 'add hunk stage fixture').ok, true)
+
+    const edited = original
+      .replace('line 2', 'line 2 changed')
+      .replace('line 34', 'line 34 changed')
+    writeFileSync(join(repo, rel), edited)
+
+    const unstagedEntry = loadGitStatus(repo).unstaged.find(entry => entry.path === rel)
+    assert.ok(unstagedEntry, 'expected unstaged fixture entry')
+    const unstagedHunks = loadFileHunks(repo, rel, 'unstaged')
+    assert.equal(unstagedHunks.length, 2, `expected separate hunks, got ${unstagedHunks.length}`)
+
+    stageEntry(repo, unstagedEntry!, unstagedHunks[0])
+
+    const cachedDiff = spawnSync('git', ['diff', '--cached', '--', rel], { cwd: repo, encoding: 'utf8' }).stdout
+    const worktreeDiff = spawnSync('git', ['diff', '--', rel], { cwd: repo, encoding: 'utf8' }).stdout
+    assert.match(cachedDiff, /line 2 changed/)
+    assert.doesNotMatch(cachedDiff, /line 34 changed/)
+    assert.match(worktreeDiff, /line 34 changed/)
+
+    const stagedEntry = loadGitStatus(repo).staged.find(entry => entry.path === rel)
+    assert.ok(stagedEntry, 'expected staged fixture entry')
+    const stagedHunks = loadFileHunks(repo, rel, 'staged')
+    assert.equal(stagedHunks.length, 1)
+
+    unstageEntry(repo, stagedEntry!, stagedHunks[0])
+
+    const cachedAfterUnstage = spawnSync('git', ['diff', '--cached', '--', rel], { cwd: repo, encoding: 'utf8' }).stdout
+    const worktreeAfterUnstage = spawnSync('git', ['diff', '--', rel], { cwd: repo, encoding: 'utf8' }).stdout
+    assert.equal(cachedAfterUnstage.trim(), '')
+    assert.match(worktreeAfterUnstage, /line 2 changed/)
+    assert.match(worktreeAfterUnstage, /line 34 changed/)
   })
 })
 

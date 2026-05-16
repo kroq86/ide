@@ -192,7 +192,7 @@ impl LspManager {
             "textDocument": { "uri": uri },
             "position": { "line": row, "character": col },
         });
-        match client.request(method, params, Duration::from_millis(900)) {
+        match client.request(method, params, Duration::from_secs(3)) {
             Ok(Some(result)) => LspActionResult {
                 kind: kind.to_owned(),
                 status: self.status.clone(),

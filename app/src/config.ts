@@ -35,6 +35,38 @@ export type BufferInfo = {
   active: boolean
 }
 
+export type QeExtra =
+  | 'typescript'
+  | 'rust'
+  | 'git'
+  | 'ai'
+  | 'formatting'
+  | 'debug'
+
+export type QePreset = {
+  name: string
+  extras: readonly QeExtra[]
+  description: string
+}
+
+export const QE_PRESETS = {
+  web: {
+    name: 'web',
+    extras: ['typescript', 'git', 'ai', 'formatting', 'debug'],
+    description: 'TypeScript/React defaults with Git, AI, formatting, and debug entry points.',
+  },
+  rust: {
+    name: 'rust',
+    extras: ['rust', 'git', 'ai', 'formatting', 'debug'],
+    description: 'Rust defaults with Cargo-aware project roots, Git, AI, and formatting commands.',
+  },
+  minimal: {
+    name: 'minimal',
+    extras: ['git'],
+    description: 'Small terminal-editor setup with Git workflows enabled.',
+  },
+} as const satisfies Record<string, QePreset>
+
 export interface LeaderNode {
   [key: string]: ((ctx: EditorContext) => void) | LeaderTree
 }
@@ -42,6 +74,8 @@ export interface LeaderNode {
 export type LeaderTree = LeaderNode
 
 export type QeConfig = {
+  preset?: keyof typeof QE_PRESETS
+  extras?: QeExtra[]
   theme?: Partial<{
     bg: string; fg: string; grey: string
     red: string; orange: string; green: string
@@ -54,6 +88,12 @@ export type QeConfig = {
     onOpen?:   (ctx: EditorContext) => void | Promise<void>
     onChange?: (ctx: EditorContext) => void | Promise<void>
   }
+}
+
+export function resolveExtras(config: QeConfig): QeExtra[] {
+  const preset = config.preset ? QE_PRESETS[config.preset] : QE_PRESETS.web
+  const extras = [...preset.extras, ...(config.extras ?? [])]
+  return [...new Set(extras)]
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────

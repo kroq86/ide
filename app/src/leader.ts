@@ -26,12 +26,13 @@ export function isLeafAction(v: (() => void) | LeaderNode): v is () => void {
 }
 
 export const NODE_LABELS: Record<string, string> = {
-  q: 'quit',    b: 'buffer',  f: 'file/fix', t: 'toggle',
+  q: 'quit/session', b: 'buffer',  f: 'file/find', t: 'terminal',
   s: 'save',    k: 'kill',    n: 'next',     p: 'parameters',
   N: 'new',     l: 'list',    w: 'save+quit',
   a: 'ai',      c: 'code',   e: 'explain-err',
   g: 'git',     d: 'definition', r: 'refresh',
-  h: 'hover',   m: 'mode',
+  h: 'hover',   m: 'mode',    x: 'diagnostics/quickfix',
+  u: 'ui/toggle',
   o: 'open',
 }
 
@@ -46,9 +47,11 @@ export const COMMAND_LABELS: Record<string, string> = {
   'b s': 'buffer: save',
   'b N': 'buffer: new scratch',
   'f f': 'file: open',
+  'f n': 'file: new scratch',
   'f s': 'file: save',
   't t': 'terminal: toggle shell',
   't a': 'terminal: toggle AI panel',
+  't r': 'terminal: rerun last command',
   'a p': 'ai: open chat',
   'a c': 'ai: trigger completion',
   'a e': 'ai: explain last error',
@@ -60,8 +63,33 @@ export const COMMAND_LABELS: Record<string, string> = {
   'a m': 'ai: select model',
   'g g': 'git: status — ll commit log (Magit)',
   'g s': 'git: stage current',
+  'g h n': 'git: next hunk',
+  'g h p': 'git: previous hunk',
+  'g h s': 'git: stage hunk',
+  'g h u': 'git: unstage hunk',
+  'g h v': 'git: preview hunk',
+  'g b': 'git: blame line',
+  'g l': 'git: log',
+  'g f': 'git: current file history',
   'c h': 'code: hover (LSP)',
   'c d': 'code: go to definition',
+  'c r': 'code: references',
+  'c R': 'code: rename',
+  'c a': 'code: action',
+  'c f': 'code: format',
+  'c i': 'code: toggle inlay hints',
+  's s': 'search: buffer',
+  's r': 'search: replace',
+  'x x': 'diagnostics: list',
+  'x b': 'diagnostics: buffer',
+  'x d': 'diagnostics: line',
+  'x n': 'diagnostics: next',
+  'x p': 'diagnostics: previous',
+  'x e': 'diagnostics: next error',
+  'x w': 'diagnostics: next warning',
+  'u h': 'ui: toggle inlay hints',
+  'u w': 'ui: toggle wrap',
+  'u d': 'ui: toggle diagnostics',
   'p e': 'config: edit config file',
   'p r': 'config: reload config',
   'm t f': 'mode: test current file',
@@ -124,10 +152,40 @@ export function buildLeaderMap(
   git: {
     open: () => void
     stage: () => void
+    log: () => void
+    nextHunk: () => void
+    previousHunk: () => void
+    stageHunk: () => void
+    unstageHunk: () => void
+    previewHunk: () => void
+    blameLine: () => void
+    fileHistory: () => void
   },
   lsp: {
     hover: () => void
     definition: () => void
+    references: () => void
+    rename: () => void
+    codeAction: () => void
+    format: () => void
+    toggleInlayHints: () => void
+  },
+  diagnostics: {
+    list: () => void
+    buffer: () => void
+    line: () => void
+    next: () => void
+    previous: () => void
+    nextError: () => void
+    nextWarning: () => void
+    toggle: () => void
+  },
+  search: {
+    buffer: () => void
+    replace: () => void
+  },
+  ui: {
+    toggleWrap: () => void
   },
   config: {
     open: () => void
@@ -154,7 +212,7 @@ export function buildLeaderMap(
       s: () => sidecar.save(),
       N: buffers.newScratch,
     },
-    f: { f: buffers.openFilePrompt, s: () => sidecar.save() },
+    f: { f: buffers.openFilePrompt, n: buffers.newScratch, s: () => sidecar.save() },
     t: {
       t: () => setPanel((prev: unknown) => {
         const p = prev as { type?: string } | null
@@ -164,6 +222,7 @@ export function buildLeaderMap(
         const p = prev as { type?: string } | null
         return p?.type === 'ai' ? null : { type: 'ai', focused: true }
       }),
+      r: ai.rerunLast,
     },
     a: {
       p: ai.openChat,
@@ -179,10 +238,43 @@ export function buildLeaderMap(
     g: {
       g: git.open,
       s: git.stage,
+      h: {
+        n: git.nextHunk,
+        p: git.previousHunk,
+        s: git.stageHunk,
+        u: git.unstageHunk,
+        v: git.previewHunk,
+      },
+      b: git.blameLine,
+      l: git.log,
+      f: git.fileHistory,
     },
     c: {
       h: lsp.hover,
       d: lsp.definition,
+      r: lsp.references,
+      R: lsp.rename,
+      a: lsp.codeAction,
+      f: lsp.format,
+      i: lsp.toggleInlayHints,
+    },
+    s: {
+      s: search.buffer,
+      r: search.replace,
+    },
+    x: {
+      x: diagnostics.list,
+      b: diagnostics.buffer,
+      d: diagnostics.line,
+      n: diagnostics.next,
+      p: diagnostics.previous,
+      e: diagnostics.nextError,
+      w: diagnostics.nextWarning,
+    },
+    u: {
+      h: lsp.toggleInlayHints,
+      w: ui.toggleWrap,
+      d: diagnostics.toggle,
     },
     p: {
       e: config.open,
