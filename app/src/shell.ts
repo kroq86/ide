@@ -88,6 +88,7 @@ export class ShellSidecar extends EventEmitter {
   #term: ReturnType<typeof pty.spawn> | null = null
   #cwd: string
   #lines: ShellLine[] = []
+  #linesBytes = 0
   #buf = ''
   #inputLine = ''
   #runs: ShellRun[] = []
@@ -329,7 +330,11 @@ export class ShellSidecar extends EventEmitter {
   #pushLine(text: string, isError: boolean): void {
     const line: ShellLine = { text, isError }
     this.#lines.push(line)
-    if (this.#lines.length > 500) this.#lines.shift()
+    this.#linesBytes += text.length
+    while (this.#lines.length > 500 || this.#linesBytes > 512_000) {
+      const evicted = this.#lines.shift()
+      if (evicted) this.#linesBytes -= evicted.text.length
+    }
     this.emit('line', line)
   }
 

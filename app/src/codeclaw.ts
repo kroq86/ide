@@ -58,11 +58,18 @@ function sliceWithTruncNote(s: string, max: number): string {
   return `${s.slice(0, max)}\n… [truncated ${String(s.length - max)} chars]`
 }
 
+export function middleTruncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  const half = Math.floor(maxChars / 2)
+  const omitted = text.length - maxChars
+  return `${text.slice(0, half)}\n… [${omitted} chars omitted] …\n${text.slice(text.length - half)}`
+}
+
 function trimShellRunForPrompt(run: ShellRun): ShellRun {
   return {
     ...run,
-    stdout: sliceWithTruncNote(run.stdout, FIX_PROMPT_MAX_SHELL_STDOUT),
-    stderr: sliceWithTruncNote(run.stderr, FIX_PROMPT_MAX_SHELL_STDERR),
+    stdout: middleTruncate(run.stdout, FIX_PROMPT_MAX_SHELL_STDOUT),
+    stderr: middleTruncate(run.stderr, FIX_PROMPT_MAX_SHELL_STDERR),
   }
 }
 
@@ -1654,8 +1661,8 @@ export function compactFixContextForPrompt(context: FixContext): FixContext {
     lastFailedRun: trimShellRunForPrompt(context.lastFailedRun),
     git: {
       branch: context.git.branch,
-      status: sliceWithTruncNote(context.git.status, FIX_PROMPT_MAX_GIT_STATUS),
-      diff: sliceWithTruncNote(context.git.diff, FIX_PROMPT_MAX_GIT_DIFF),
+      status: middleTruncate(context.git.status, FIX_PROMPT_MAX_GIT_STATUS),
+      diff: middleTruncate(context.git.diff, FIX_PROMPT_MAX_GIT_DIFF),
     },
     rules: sliceWithTruncNote(context.rules, FIX_PROMPT_MAX_RULES),
     memory: context.memory !== undefined
@@ -1733,8 +1740,8 @@ function buildProposalUserMessage(context: FixContext, cwd: string): string {
   const cursor = file.cursor ? `${file.cursor.line}:${file.cursor.column}` : '(none)'
 
   const failure = context.lastFailedRun
-  const stderr = sliceWithTruncNote(failure.stderr, USER_MSG_MAX_STDERR)
-  const stdout = sliceWithTruncNote(failure.stdout, USER_MSG_MAX_STDOUT)
+  const stderr = middleTruncate(failure.stderr, USER_MSG_MAX_STDERR)
+  const stdout = middleTruncate(failure.stdout, USER_MSG_MAX_STDOUT)
 
   const otherBuffers = context.openBuffers
     .filter(b => b.path !== file.path)
@@ -1742,8 +1749,8 @@ function buildProposalUserMessage(context: FixContext, cwd: string): string {
     .map(b => `- ${b.path}:\n${sliceWithTruncNote(b.content, USER_MSG_MAX_OPEN_BUFFER)}`)
     .join('\n')
 
-  const gitDiff = sliceWithTruncNote(context.git.diff, USER_MSG_MAX_GIT_DIFF)
-  const gitStatus = sliceWithTruncNote(context.git.status, USER_MSG_MAX_GIT_STATUS)
+  const gitDiff = middleTruncate(context.git.diff, USER_MSG_MAX_GIT_DIFF)
+  const gitStatus = middleTruncate(context.git.status, USER_MSG_MAX_GIT_STATUS)
   const branch = context.git.branch ?? '(unknown)'
 
   const request = sliceWithTruncNote(context.userRequest, USER_MSG_MAX_USER_REQUEST)

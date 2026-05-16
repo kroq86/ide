@@ -149,20 +149,40 @@ export function buildProjectMemoryPart(rules?: string, memory?: string): string 
   return parts.length > 0 ? `\n\n${parts.join('\n\n')}` : ''
 }
 
+const CHAT_SYSTEM_BUDGET = 10_000
+
+function middleTruncateChat(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  const half = Math.floor(maxChars / 2)
+  const omitted = text.length - maxChars
+  return `${text.slice(0, half)}\n… [${omitted} chars omitted] …\n${text.slice(text.length - half)}`
+}
+
 export async function* streamChat(
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
   context: AiContext,
   signal: AbortSignal,
 ): AsyncGenerator<string> {
-  const fileSnippet = context.lines.join('\n').slice(0, 1500)
+  let budget = CHAT_SYSTEM_BUDGET
 
-  const shellPart   = buildShellContext(context.shellSessions, context.shellLines)
-  const gitPart     = context.gitContext ? `\n\n${context.gitContext}` : ''
-  const bufPart     = context.openBuffers?.length
+  const fileRaw = context.lines.join('\n')
+  const fileSnippet = fileRaw.slice(0, Math.min(2000, budget - 500))
+  budget -= fileSnippet.length
+
+  const shellRaw = buildShellContext(context.shellSessions, context.shellLines)
+  const shellPart = shellRaw.slice(0, Math.min(1500, Math.max(0, budget - 300)))
+  budget -= shellPart.length
+
+  const gitRaw = context.gitContext ? `\n\n${context.gitContext}` : ''
+  const gitPart = middleTruncateChat(gitRaw, Math.min(3000, Math.max(0, budget - 200)))
+  budget -= gitPart.length
+
+  const bufPart = context.openBuffers?.length
     ? `\nOpen buffers: ${context.openBuffers.join(', ')}`
     : ''
-  const projectPart  = findProjectContext(context.filename)
-  const memoryPart   = buildProjectMemoryPart(context.projectRules, context.projectMemory)
+  const projectPart = findProjectContext(context.filename)
+  const memoryRaw  = buildProjectMemoryPart(context.projectRules, context.projectMemory)
+  const memoryPart = memoryRaw.slice(0, Math.max(0, budget))
 
   const systemContent =
     `You are a coding assistant embedded in a terminal editor with a shell pane, git pane, and editor pane.\n` +
