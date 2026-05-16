@@ -513,8 +513,11 @@ function CmdPalettePanel({
   const visible = filtered.slice(0, 12)
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={C.violet} paddingX={1} width={width}>
-      <Text bold color={C.violet}>M-x  <Text color={C.grey}>j/k=navigate  Enter=run  Esc=close</Text></Text>
+    <Box flexDirection="column" width={width}>
+      <Box flexDirection="row">
+        <Text backgroundColor={C.violet} color={C.bg}> M-x </Text>
+        <Text color={C.grey}>  j/k=navigate  Enter=run  Esc=close</Text>
+      </Box>
       <Box flexDirection="row" marginTop={1}>
         <Text color={C.yellow}>{'> '}</Text>
         <Text color={C.fg}>{query}</Text>
@@ -583,7 +586,7 @@ function filterBuffers(buffers: EditorBuffer[], query: string): EditorBuffer[] {
 // ── Shell pane ────────────────────────────────────────────────────────────────
 
 function ShellPane({
-  lines, rows, focused, mode, input, running, height,
+  lines, rows, focused, mode, input, running, height, scrollOffset,
 }: {
   lines: ShellLine[]
   rows: number
@@ -592,12 +595,19 @@ function ShellPane({
   input: string
   running: boolean
   height: number
+  scrollOffset: number
 }) {
-  const borderColor = focused ? C.green : C.grey
-  const visible = lines.slice(-Math.max(1, rows - 2))
+  const maxVisible = Math.max(1, rows - 1)
+  const clampedOffset = Math.min(scrollOffset, Math.max(0, lines.length - maxVisible))
+  const sliceEnd = clampedOffset > 0 ? lines.length - clampedOffset : undefined
+  const visible = lines.slice(Math.max(0, lines.length - maxVisible - clampedOffset), sliceEnd)
+  const scrollHint = clampedOffset > 0 ? `  ↑${clampedOffset} lines  ↑↓=scroll` : mode === 'runner' ? '  ↑↓=scroll' : '  Shift+↑↓=scroll'
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} height={height}>
-      <Text bold color={borderColor}>{`*shell*  mode: ${mode}${running ? '  running...' : ''}`}</Text>
+    <Box flexDirection="column" height={height}>
+      <Box flexDirection="row">
+        <Text backgroundColor={focused ? C.green : '#21252b'} color={focused ? C.bg : C.grey}> *shell* </Text>
+        <Text color={C.grey}>{`  mode: ${mode}${running ? '  running...' : ''}${scrollHint}`}</Text>
+      </Box>
       {visible.length === 0
         ? <Text color={C.grey}>  (no output yet)</Text>
         : visible.map((l, i) => (
@@ -637,13 +647,14 @@ function WhichKeyPanel({ node, path, totalCols }: { node: LeaderNode; path: stri
     )
   }
 
+  const titleLeft = ` ${label} `
+  const titleRight = ` ${category} `
+  const titlePad = ' '.repeat(Math.max(0, totalCols - titleLeft.length - titleRight.length))
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={C.violet} paddingX={1}>
+    <Box flexDirection="column">
       <Box flexDirection="row">
-        <Box flexGrow={1}>
-          <Text bold color={C.cyan}>{label}</Text>
-        </Box>
-        <Text color={C.grey}>{`[${category}]`}</Text>
+        <Text backgroundColor={C.violet} color={C.bg}>{titleLeft}</Text>
+        <Text backgroundColor='#21252b' color={C.grey}>{titlePad + titleRight}</Text>
       </Box>
       {rowGroups.map((row, i) => (
         <Box key={i} flexDirection="row">
@@ -694,8 +705,7 @@ function AiPanel({
   /** Incremented on an interval while the AI panel is busy (stream / CodeClaw). */
   thinkingTick: number
 }) {
-  const borderColor = focused ? C.green : C.grey
-  const msgAreaRows = Math.max(3, height - 8)
+  const msgAreaRows = Math.max(3, height - 6)
   const clampedOffset = Math.min(scrollOffset, Math.max(0, messages.length - msgAreaRows))
   const sliceEnd = clampedOffset === 0 ? undefined : -clampedOffset
   const visible = messages.slice(-msgAreaRows - clampedOffset, sliceEnd)
@@ -723,8 +733,11 @@ function AiPanel({
       : overlayActive ? 'x=dismiss  SPC a p=focus' : 'SPC a p=focus'
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={width} height={height}>
-      <Text bold color={borderColor}>*AI*  {hint}{scrollHint}</Text>
+    <Box flexDirection="column" width={width} height={height}>
+      <Box flexDirection="row">
+        <Text backgroundColor={focused ? C.green : '#21252b'} color={focused ? C.bg : C.grey}> *AI* </Text>
+        <Text color={C.grey}>{`  ${hint}${scrollHint}`}</Text>
+      </Box>
       <Box flexDirection="column" flexGrow={1} marginTop={1}>
         {overlayLinesForDisplay.length > 0
           ? overlayLinesForDisplay.map((line, i) => (
@@ -1066,7 +1079,7 @@ function GitPanel({ data, cursor, pendingKey, logEntries, gitError, view, displa
   const flatRows = flattenGitPanelRows(displayLines, view, totalCols)
   const cursorFlatAnchor = flatRowIndexForCursorHighlight(flatRows, cursorDIdx)
 
-  const contentRows = Math.max(1, totalRows - 4)
+  const contentRows = Math.max(1, totalRows - 2)
   const idealOffset = Math.max(0, cursorFlatAnchor - Math.floor(contentRows / 2))
   const scrollOffset = Math.min(idealOffset, Math.max(0, flatRows.length - contentRows))
   const visibleFlat = flatRows.slice(scrollOffset, scrollOffset + contentRows)
@@ -1079,12 +1092,13 @@ function GitPanel({ data, cursor, pendingKey, logEntries, gitError, view, displa
       : 'j/k  TAB=expand  Ret=open  s/u=stage  ll=log  cc=commit  F=pull  P=push  q/Esc=close'
   const hintColor: ThemeColor = gitError ? C.red : C.grey
 
+  const gitTitleLeft = ` *git*  ${data.branch} `
+  const gitTitlePad = ' '.repeat(Math.max(0, totalCols - gitTitleLeft.length - hint.length - 2))
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={C.magenta} paddingX={1} width={totalCols} height={totalRows}>
-      <Box flexDirection="row" gap={2}>
-        <Text bold color={C.magenta}>*git*</Text>
-        <Text bold color={C.cyan}>{data.branch}</Text>
-        <Text color={hintColor}>{hint}</Text>
+    <Box flexDirection="column" width={totalCols} height={totalRows}>
+      <Box flexDirection="row">
+        <Text backgroundColor={C.magenta} color={C.bg}>{gitTitleLeft}</Text>
+        <Text backgroundColor='#21252b' color={hintColor}>{gitTitlePad + ' ' + hint}</Text>
       </Box>
       {visibleFlat.map((row, i) => {
         const flatIdx = i + scrollOffset
@@ -1180,16 +1194,16 @@ function DiredPanel({ path, cursor, totalRows, totalCols, entries }: {
 }) {
   const maxIdx = Math.max(0, entries.length - 1)
   const safeCursor = Math.min(cursor, maxIdx)
-  const contentRows = Math.max(1, totalRows - 4)
+  const contentRows = Math.max(1, totalRows - 2)
   const idealOffset = Math.max(0, safeCursor - Math.floor(contentRows / 2))
   const scrollOffset = Math.min(idealOffset, Math.max(0, entries.length - contentRows))
   const visible = entries.slice(scrollOffset, scrollOffset + contentRows)
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={C.blue} paddingX={1} width={totalCols} height={totalRows}>
-      <Box flexDirection="row" gap={2}>
-        <Text bold color={C.cyan}>*dired*</Text>
-        <Text color={C.grey} wrap="truncate">{path}</Text>
+    <Box flexDirection="column" width={totalCols} height={totalRows}>
+      <Box flexDirection="row">
+        <Text backgroundColor={C.cyan} color={C.bg}> *dired* </Text>
+        <Text color={C.grey}>{`  ${path}`}</Text>
       </Box>
       {visible.map((e, i) => {
         const idx = scrollOffset + i
@@ -1254,7 +1268,7 @@ function EditorPane({
   const titleMax = Math.max(12, headerBarW - 46)
   const pathShown = editorHeaderPath(title, titleMax)
   const metaShown = editorHeaderMeta(status, searchQuery, matchCount, headerBarW)
-  const visibleRows = Math.max(1, paneHeight - 5)
+  const visibleRows = Math.max(1, paneHeight - 2)
   const lineNumWidth = Math.max(2, String(Math.max(1, lines.length)).length)
   const lineGutterCols = lineNumWidth + 1
   const visibleCols = Math.max(20, effectiveCols - 4 - lineGutterCols)
@@ -1292,49 +1306,18 @@ function EditorPane({
     hintLine = 'SPC/C-SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
   }
 
-  const sortedBuffers = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
-  const filteredBuffers = prompt?.type === 'buffer'
-    ? filterBuffers(sortedBuffers, prompt.query)
-    : []
-  const visibleBuffers = filteredBuffers.slice(0, 8)
+  const segFileBg = '#3e4452'
+  const segInfoBg = '#21252b'
+  const modelinePill = ` ${modeLabel} `
+  const modelineFile = `  ${pathShown}${dirty ? ' ●' : ''}  `
+  const modelineInfo = `  ${cursor.row + 1}:${cursor.col + 1}${diagnosticCount > 0 ? `  ⚠ ${diagnosticCount}` : ''}  `
+  const modelineModel = `  ${aiModelLabel} `
+  const modelinePadLen = Math.max(0, effectiveCols - modelinePill.length - modelineFile.length - modelineInfo.length - modelineModel.length)
+  const modelinePad = ' '.repeat(modelinePadLen)
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1} width={paneWidth} height={paneHeight}>
+    <Box flexDirection="column" width={paneWidth} height={paneHeight}>
       <Box flexDirection="column">
-        <Box flexDirection="row" gap={2}>
-          <Text bold color={modeColor}>{`[${modeLabel}]`}</Text>
-          <Text bold color={C.magenta}>qe</Text>
-          <Text color={dirty ? C.orange : C.fg}>{`${pathShown}${dirty ? ' *' : ''}`}</Text>
-          <Text color={C.grey}>{`${bufferIndex + 1}/${bufferCount}`}</Text>
-          <Text color={C.grey}>{`${cursor.row + 1}:${cursor.col + 1}`}</Text>
-          {diagnosticCount > 0 && <Text color={C.orange}>{`diag ${diagnosticCount}`}</Text>}
-        </Box>
-        <Box flexDirection="row" justifyContent="space-between">
-          <Text color={searchQuery ? C.yellow : C.grey}>{metaShown}</Text>
-          <Text color={C.grey}>{aiModelLabel}</Text>
-        </Box>
-      </Box>
-
-      <Box flexDirection="column" marginTop={1}>
-        {prompt?.type === 'buffer' && (
-          <Box flexDirection="column">
-            {visibleBuffers.length === 0
-              ? <Text color={C.grey}>  no matching buffers</Text>
-              : visibleBuffers.map((buffer, index) => {
-                  const actualIndex = filteredBuffers.indexOf(buffer)
-                  const selected = actualIndex === prompt.selected
-                  const filenameLabel = buffer.snapshot?.filename ?? buffer.filename ?? ''
-                  const mark = buffer.id === activeBufferId ? '>' : ' '
-                  const mod = isDirty(buffer) ? '*' : ' '
-                  return (
-                    <Text key={buffer.id} color={selected ? C.bg : C.fg} backgroundColor={selected ? C.cyan : undefined}>
-                      {`${mark}${mod} ${buffer.name}${filenameLabel ? `  ${filenameLabel}` : ''}`}
-                    </Text>
-                  )
-                })}
-            <Text color={C.grey}>{' '}</Text>
-          </Box>
-        )}
         {prompt?.type === 'model' && (() => {
           const q = prompt.query.toLowerCase()
           const filtered = prompt.candidates.filter(m => !q || m.toLowerCase().includes(q))
@@ -1381,9 +1364,22 @@ function EditorPane({
             </Box>
           )
         })}
+        {Array.from({ length: Math.max(0, visibleRows - visibleLines.length) }, (_, i) => (
+          <Box key={`~${i}`} flexDirection="row">
+            <Text color={C.grey}>{' '.repeat(lineNumWidth - 1)}~</Text>
+          </Box>
+        ))}
       </Box>
 
-      <Box marginTop={1} flexDirection="row" gap={2}>
+      <Box flexDirection="row">
+        <Text backgroundColor={modeColor} color={C.bg}>{modelinePill}</Text>
+        <Text backgroundColor={segFileBg} color={C.fg}>{modelineFile}</Text>
+        <Text backgroundColor={segInfoBg} color={C.grey}>{modelineInfo}</Text>
+        <Text backgroundColor={segInfoBg} color={C.grey}>{modelinePad}</Text>
+        <Text backgroundColor={segFileBg} color={C.grey}>{modelineModel}</Text>
+      </Box>
+
+      <Box flexDirection="row">
         <Text color={prompt || mode === 'command' || mode === 'search' ? C.yellow : C.grey}>
           {hintLine}
         </Text>
@@ -1454,6 +1450,7 @@ function App({
   const [thinkingTick, setThinkingTick] = React.useState(0)
   const [shellInput, setShellInput] = React.useState('')
   const [shellRunning, setShellRunning] = React.useState(false)
+  const [shellScrollOffset, setShellScrollOffset] = React.useState(0)
 
   const aiPanelBusy =
     aiStreaming
@@ -2432,12 +2429,15 @@ function App({
 
     // ── Shell panel ──────────────────────────────────────────────────────────
     if (panel?.type === 'shell') {
-      if (key.escape)                                  { setPanel(null); return }
+      if (key.escape)                                  { setShellScrollOffset(0); setPanel(null); return }
       if (shell.mode === 'runner') {
+        if (key.upArrow)   { setShellScrollOffset(prev => prev + 1); return }
+        if (key.downArrow) { setShellScrollOffset(prev => Math.max(0, prev - 1)); return }
         if (key.return) {
           const cmd = shellInput.trim()
           if (!cmd || shellRunning) return
           setShellInput('')
+          setShellScrollOffset(0)
           setShellRunning(true)
           void shell.runTracked(cmd).finally(() => setShellRunning(false))
           return
@@ -2453,6 +2453,8 @@ function App({
         if (loc) { actions.openFile(loc.file, { row: loc.row, col: loc.col }); setPanel(null) }
         return
       }
+      if (key.shift && key.upArrow)   { setShellScrollOffset(prev => prev + 1); return }
+      if (key.shift && key.downArrow) { setShellScrollOffset(prev => Math.max(0, prev - 1)); return }
       if (key.return)                                  { void shell.submitCurrentInput(); return }
       if (key.backspace || key.delete)                 { shell.write('\x7f'); return }
       if (key.upArrow)                                 { shell.write('\x1b[A'); return }
@@ -2993,11 +2995,10 @@ function App({
 
   const panelRows = panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell'      ? 3 + shellRows
-    : panel.type === 'dired'
-      ? Math.min(Math.floor(totalRows * 0.48), Math.max(7, diredEntries.length + 4))
+    : panel.type === 'dired'      ? totalRows
     : panel.type === 'cmdpalette' ? 0
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))
-  const editorHeight = Math.max(1, totalRows - panelRows)
+  const editorHeight = panel?.type === 'dired' ? 0 : Math.max(1, totalRows - panelRows)
 
   const editorPane = (
     <EditorPane
@@ -3049,9 +3050,39 @@ function App({
     )
   }
 
+  const sortedBuffers = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
+  const filteredBuffers = prompt?.type === 'buffer' ? filterBuffers(sortedBuffers, prompt.query) : []
+
   return (
     <Box flexDirection="column" width={totalCols} height={totalRows}>
-      {editorPane}
+      {panel?.type !== 'dired' && editorPane}
+      {prompt?.type === 'buffer' && (() => {
+        const visibleBuffers = filteredBuffers.slice(0, 10)
+        const titleRight = prompt.query ? `  /${prompt.query}_` : ''
+        const titlePad = ' '.repeat(Math.max(0, totalCols - ' *buffers* '.length - titleRight.length))
+        return (
+          <Box flexDirection="column">
+            <Box flexDirection="row">
+              <Text backgroundColor={C.cyan} color={C.bg}> *buffers* </Text>
+              <Text backgroundColor='#21252b' color={C.grey}>{titlePad + titleRight}</Text>
+            </Box>
+            {visibleBuffers.length === 0
+              ? <Text color={C.grey}>  no matching buffers</Text>
+              : visibleBuffers.map((buffer, index) => {
+                  const actualIndex = filteredBuffers.indexOf(buffer)
+                  const selected = actualIndex === prompt.selected
+                  const filenameLabel = buffer.snapshot?.filename ?? buffer.filename ?? ''
+                  const mark = buffer.id === activeId ? '>' : ' '
+                  const mod = isDirty(buffer) ? '*' : ' '
+                  return (
+                    <Text key={buffer.id} color={selected ? C.bg : C.fg} backgroundColor={selected ? C.cyan : undefined}>
+                      {`${mark}${mod} ${buffer.name}${filenameLabel ? `  ${filenameLabel}` : ''}`}
+                    </Text>
+                  )
+                })}
+          </Box>
+        )
+      })()}
       {panel?.type === 'whichkey' && (
         <WhichKeyPanel node={panel.node} path={panel.path} totalCols={totalCols} />
       )}
@@ -3067,6 +3098,7 @@ function App({
           input={shellInput}
           running={shellRunning}
           height={panelRows}
+          scrollOffset={shellScrollOffset}
         />
       )}
       {panel?.type === 'dired' && (
