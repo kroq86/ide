@@ -1,7 +1,7 @@
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync, readFileSync } from 'node:fs'
-import { mergeLeaderTree, type LeaderTree, type EditorContext } from './config.js'
+import { mergeLeaderTree, type ConfigAction, type LeaderTree, type EditorContext } from './config.js'
 
 // Internal leader node: leaves are plain () => void (no EditorContext arg).
 // The config-level LeaderTree (with ctx arg) is merged in via mergeLeaderTree.
@@ -197,6 +197,8 @@ export function buildLeaderMap(
   },
   userLeader: LeaderTree,
   makeCtx: () => EditorContext,
+  runAction?: (action: ConfigAction, ctx: EditorContext) => void,
+  commandItems: CmdItem[] = [],
 ): LeaderNode {
   const builtin: LeaderNode = {
     q: {
@@ -287,9 +289,9 @@ export function buildLeaderMap(
       },
     },
   }
-  const tree = mergeLeaderTree(builtin, userLeader, makeCtx) as LeaderNode
+  const tree = mergeLeaderTree(builtin, userLeader, makeCtx, runAction) as LeaderNode
   ;(tree as LeaderNode)[':'] = () => {
-    setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: flattenLeader(tree) })
+    setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: [...flattenLeader(tree), ...commandItems] })
   }
   return tree
 }

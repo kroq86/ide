@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { extname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 // ── Public types — what users write in their config file ─────────────────────
 
@@ -24,7 +25,33 @@ export type EditorContext = {
     next: () => void
     previous: () => void
   }
-  openFile: (path: string) => void
+  openFile: (path: string, jump?: { row: number; col: number }) => void
+  commands: {
+    run: (id: string, args?: Record<string, unknown>) => Promise<void>
+  }
+  ui: {
+    pick: (title: string, items: ConfigPickItem[]) => Promise<string | null>
+    input: (title: string, initial?: string) => Promise<string | null>
+    confirm: (title: string, body?: string) => Promise<boolean>
+    notify: (message: string, level?: ConfigNotifyLevel) => void
+    panel: (name: ConfigPanelName, options?: Record<string, unknown>) => void
+  }
+  git: {
+    status: () => void
+    stageCurrentFile: () => void
+    stageHunk: () => void
+    previewHunk: () => void
+  }
+  lsp: {
+    hover: () => void
+    definition: () => void
+    format: () => void
+  }
+  diagnostics: {
+    list: () => void
+    next: () => void
+    line: () => void
+  }
 }
 
 export type BufferInfo = {
@@ -67,8 +94,40 @@ export const QE_PRESETS = {
   },
 } as const satisfies Record<string, QePreset>
 
+export type ConfigNotifyLevel = 'info' | 'warn' | 'error'
+export type ConfigPanelName = 'shell' | 'ai' | 'git' | 'diagnostics' | 'commandPalette'
+export type ConfigPickItem = string | { label: string; value?: string; description?: string }
+
+export type ConfigDirective =
+  | { type: 'shell.run'; command: string }
+  | { type: 'panel.open'; panel: ConfigPanelName; options?: Record<string, unknown> }
+  | { type: 'openFile'; path: string; row?: number; col?: number }
+  | { type: 'editor.insert'; text: string }
+  | { type: 'editor.move'; direction: string }
+  | { type: 'command.run'; command: string; args?: Record<string, unknown> }
+  | { type: 'ui.notify'; message: string; level?: ConfigNotifyLevel }
+
+export type ConfigCommand = {
+  command: string
+  args?: Record<string, unknown>
+  label?: string
+}
+
+export type ConfigActionResult =
+  | void
+  | ConfigDirective
+  | ConfigDirective[]
+  | Promise<void | ConfigDirective | ConfigDirective[]>
+
+export type ConfigAction =
+  | string
+  | ConfigCommand
+  | ConfigDirective
+  | ConfigDirective[]
+  | ((ctx: EditorContext) => ConfigActionResult)
+
 export interface LeaderNode {
-  [key: string]: ((ctx: EditorContext) => void) | LeaderTree
+  [key: string]: ConfigAction | LeaderTree
 }
 
 export type LeaderTree = LeaderNode
@@ -84,10 +143,15 @@ export type QeConfig = {
   }>
   leader?: LeaderTree
   hooks?: {
-    onSave?:   (ctx: EditorContext) => void | Promise<void>
-    onOpen?:   (ctx: EditorContext) => void | Promise<void>
-    onChange?: (ctx: EditorContext) => void | Promise<void>
+    onSave?:   ConfigAction
+    onOpen?:   ConfigAction
+    onChange?: ConfigAction
   }
+  commands?: Record<string, ConfigAction>
+}
+
+export function defineConfig<const T extends QeConfig>(config: T): T {
+  return config
 }
 
 export function resolveExtras(config: QeConfig): QeExtra[] {
@@ -99,6 +163,8 @@ export function resolveExtras(config: QeConfig): QeExtra[] {
 // ── Loader ───────────────────────────────────────────────────────────────────
 
 export const CONFIG_PATHS = [
+  join(homedir(), '.config', 'qe', 'config.ts'),
+  join(homedir(), '.config', 'qe', 'config.mts'),
   join(homedir(), '.config', 'qe', 'config.js'),
   join(homedir(), '.config', 'qe', 'config.mjs'),
   join(homedir(), '.qe', 'config.js'),
@@ -109,12 +175,35 @@ let _configPath: string | null = null
 
 export function getConfigPath(): string | null { return _configPath }
 
+async function importConfig(path: string): Promise<{ default?: QeConfig }> {
+  const [file = path, query] = path.split('?')
+  const ext = extname(file)
+  if (ext === '.ts' || ext === '.mts') {
+    const { tsImport } = await import('tsx/esm/api')
+    const specifier = `${pathToFileURL(file).href}${query ? `?${query}` : ''}`
+    return await tsImport(specifier, import.meta.url) as { default?: QeConfig }
+  }
+  return await import(path) as { default?: QeConfig }
+}
+
+function configFromModule(mod: { default?: QeConfig | { default?: QeConfig } }): QeConfig {
+  const value = mod.default
+  if (value && typeof value === 'object' && 'default' in value) {
+    return (value as { default?: QeConfig }).default ?? {}
+  }
+  return (value as QeConfig | undefined) ?? {}
+}
+
 export async function loadConfig(): Promise<QeConfig> {
-  for (const p of CONFIG_PATHS) {
+  return loadConfigFromPaths(CONFIG_PATHS)
+}
+
+export async function loadConfigFromPaths(paths: readonly string[]): Promise<QeConfig> {
+  for (const p of paths) {
     if (!existsSync(p)) continue
     try {
-      const mod = await import(p) as { default?: QeConfig }
-      _config = mod.default ?? {}
+      const mod = await importConfig(p)
+      _config = configFromModule(mod)
       _configPath = p
       return _config
     } catch (e) {
@@ -129,8 +218,8 @@ export async function reloadConfig(): Promise<QeConfig> {
   const p = _configPath
   if (!p || !existsSync(p)) return _config
   try {
-    const mod = await import(`${p}?t=${Date.now()}`) as { default?: QeConfig }
-    _config = mod.default ?? {}
+    const mod = await importConfig(`${p}?t=${Date.now()}`)
+    _config = configFromModule(mod)
     return _config
   } catch (e) {
     process.stderr.write(`qe: config reload error in ${p}: ${String(e)}\n`)
@@ -142,16 +231,28 @@ export function getConfig(): QeConfig {
   return _config
 }
 
+export function isConfigAction(value: unknown): value is ConfigAction {
+  if (typeof value === 'function' || typeof value === 'string' || Array.isArray(value)) return true
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return typeof record.command === 'string' || typeof record.type === 'string'
+}
+
 // Merge user leader tree on top of the built-in one — user wins on conflicts
 export function mergeLeaderTree(
   builtin: Record<string, (() => void) | Record<string, unknown>>,
   user: LeaderTree,
   makeCtx: () => EditorContext,
+  runAction?: (action: ConfigAction, ctx: EditorContext) => void,
 ): Record<string, (() => void) | Record<string, unknown>> {
   const result = { ...builtin }
   for (const [key, value] of Object.entries(user)) {
-    if (typeof value === 'function') {
-      result[key] = () => value(makeCtx())
+    if (isConfigAction(value)) {
+      result[key] = () => {
+        const ctx = makeCtx()
+        if (runAction) runAction(value, ctx)
+        else if (typeof value === 'function') void value(ctx)
+      }
     } else {
       const existing = result[key]
       if (existing && typeof existing === 'object') {
@@ -159,9 +260,10 @@ export function mergeLeaderTree(
           existing as Record<string, (() => void) | Record<string, unknown>>,
           value,
           makeCtx,
+          runAction,
         )
       } else {
-        result[key] = mergeLeaderTree({}, value, makeCtx)
+        result[key] = mergeLeaderTree({}, value, makeCtx, runAction)
       }
     }
   }

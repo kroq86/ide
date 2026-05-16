@@ -1,10 +1,12 @@
 {
   "mcpServers": {
     "docs-memory": {
-      "command": "/Users/ll/Documents/mcp-docs-memory/.venv/bin/python",
-      "args": ["-m", "docs_memory_mcp"],
+      "command": "sh",
+      "args": [
+        "-lc",
+        "DOCS_ROOT=\"${DOCS_ROOT:-$PWD}\" exec \"${DOCS_MEMORY_PYTHON:-python3}\" -m docs_memory_mcp"
+      ],
       "env": {
-        "DOCS_ROOT": "/Users/ll/Documents/qe-react-editor",
         "OLLAMA_HOST": "http://127.0.0.1:11434",
         "OLLAMA_EMBED_MODEL": "nomic-embed-text"
       }

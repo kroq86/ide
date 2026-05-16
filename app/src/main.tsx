@@ -43,7 +43,12 @@ import {
   type ReviewProposal,
   type TraceSummary,
 } from './codeclaw.js'
-import { loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, type BufferInfo, type EditorContext, type LeaderTree } from './config.js'
+import {
+  loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS,
+  type BufferInfo, type ConfigAction, type ConfigNotifyLevel, type ConfigPanelName,
+  type ConfigPickItem, type EditorContext, type LeaderTree, type QeConfig,
+} from './config.js'
+import { CommandRegistry, registerConfigCommands, runConfigAction } from './config-runtime.js'
 import {
   loadGitStatus, loadFileHunks, getGitRepoRoot, hunkNewStartRow, resolveRepoFilePath, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
   getGitLog, buildGitDisplayLines,
@@ -127,6 +132,9 @@ type PromptState =
   | { type: 'saveAs'; query: string; thenQuit?: boolean }
   | { type: 'commit'; message: string }
   | { type: 'model'; query: string; candidates: string[]; selected: number }
+  | { type: 'configPick'; id: number; title: string; query: string; items: NormalizedPickItem[]; selected: number }
+  | { type: 'configInput'; id: number; title: string; value: string }
+  | { type: 'configConfirm'; id: number; title: string; body?: string }
 
 type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
 
@@ -201,6 +209,18 @@ type YankRegister = {
 type LspOverlay = {
   title: string
   lines: string[]
+}
+
+type NormalizedPickItem = {
+  label: string
+  value: string
+  description?: string
+}
+
+function normalizePickItems(items: ConfigPickItem[]): NormalizedPickItem[] {
+  return items.map(item => typeof item === 'string'
+    ? { label: item, value: item }
+    : { label: item.label, value: item.value ?? item.label, description: item.description })
 }
 
 function lastInclusiveCol(lines: string[], row: number): number {
@@ -1448,6 +1468,12 @@ function EditorPane({
     hintLine = `Commit: ${prompt.message}_`
   } else if (prompt?.type === 'model') {
     hintLine = `Select model: ${prompt.query}_  j/k=navigate  Ret=confirm  Esc=cancel`
+  } else if (prompt?.type === 'configPick') {
+    hintLine = `${prompt.title}: ${prompt.query}_  j/k=navigate  Ret=choose  Esc=cancel`
+  } else if (prompt?.type === 'configInput') {
+    hintLine = `${prompt.title}: ${prompt.value}_`
+  } else if (prompt?.type === 'configConfirm') {
+    hintLine = `${prompt.title}  y=confirm  n/Esc=cancel`
   } else if (mode === 'command') {
     hintLine = `:${cmdBuf}_`
   } else if (mode === 'search') {
@@ -1525,6 +1551,40 @@ function EditorPane({
             </Box>
           )
         })()}
+        {prompt?.type === 'configPick' && (() => {
+          const q = prompt.query.toLowerCase()
+          const filtered = prompt.items.filter(item =>
+            !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
+          )
+          const windowSize = 8
+          const scrollStart = Math.max(0, Math.min(prompt.selected - Math.floor(windowSize / 2), filtered.length - windowSize))
+          const visible = filtered.slice(scrollStart, scrollStart + windowSize)
+          return (
+            <Box flexDirection="column">
+              <Box flexDirection="row">
+                <Text backgroundColor={C.violet} color={C.bg}> pick </Text>
+                <Text color={C.grey}>{`  ${prompt.title}: ${prompt.query || '(type to filter)'}_`}</Text>
+              </Box>
+              {visible.length === 0
+                ? <Text color={C.grey}>  no items match</Text>
+                : visible.map((item, index) => {
+                    const isSelected = scrollStart + index === prompt.selected
+                    const desc = item.description ? `  ${item.description}` : ''
+                    return (
+                      <Text key={`${item.value}:${index}`} color={isSelected ? C.bg : C.fg} backgroundColor={isSelected ? C.violet : undefined}>
+                        {`  ${item.label}${desc}`}
+                      </Text>
+                    )
+                  })}
+            </Box>
+          )
+        })()}
+        {prompt?.type === 'configConfirm' && (
+          <Box flexDirection="column">
+            <Text backgroundColor={C.yellow} color={C.bg}>{` confirm `}</Text>
+            {prompt.body ? <Text color={C.grey}>{`  ${prompt.body}`}</Text> : null}
+          </Box>
+        )}
         {visibleLines.map((line, index) => {
           const actualRow = index + scrollOffset
           const isCursor  = actualRow === cursor.row
@@ -1622,7 +1682,7 @@ async function collectFilesAsync(dir: string, depth: number, base: string): Prom
 // ── Main app component ────────────────────────────────────────────────────────
 
 function App({
-  buffers, activeId, bufferKey, sidecar, shell, shellLines, userLeader, lspOverlay, actions,
+  buffers, activeId, bufferKey, sidecar, shell, shellLines, config, userLeader, lspOverlay, actions,
 }: {
   buffers: EditorBuffer[]
   activeId: string
@@ -1630,6 +1690,7 @@ function App({
   sidecar: QeSidecar
   shell: ShellSidecar
   shellLines: ShellLine[]
+  config: QeConfig
   userLeader: LeaderTree
   lspOverlay: LspOverlay | null
   actions: {
@@ -1672,6 +1733,8 @@ function App({
   const [searchBuf,      setSearchBuf]      = React.useState('')
   const [searchQuery,    setSearchQuery]    = React.useState('')
   const [prompt,         setPrompt]         = React.useState<PromptState | null>(null)
+  const uiPromptIdRef = React.useRef(1)
+  const uiPromptResolversRef = React.useRef(new Map<number, (value: unknown) => void>())
 
   const [aiModelLabel,   setAiModelLabel]   = React.useState(() => getProviderLabel())
   const [aiMessages,     setAiMessages]     = React.useState<AiMessage[]>([])
@@ -1707,6 +1770,7 @@ function App({
 
   const pendingKeyRef    = React.useRef<string | null>(null)
   const yankRegisterRef  = React.useRef<YankRegister | null>(null)
+  const leaderMapRef     = React.useRef<LeaderNode>({})
   const abortRef         = React.useRef<AbortController | null>(null)
   const aiAbortRef       = React.useRef<AbortController | null>(null)
   const searchQueryRef   = React.useRef('')
@@ -1900,6 +1964,98 @@ function App({
     setPanel({ type: 'git', data: nextData, cursor: selectableCursor, pendingKey: null, logEntries: null, gitError: note, view: 'status' })
   }, [])
 
+  const resolveUiPrompt = React.useCallback((id: number, value: unknown) => {
+    const resolver = uiPromptResolversRef.current.get(id)
+    uiPromptResolversRef.current.delete(id)
+    resolver?.(value)
+  }, [])
+
+  const uiPick = React.useCallback((title: string, items: ConfigPickItem[]): Promise<string | null> => {
+    const id = uiPromptIdRef.current++
+    const normalized = normalizePickItems(items)
+    return new Promise(resolve => {
+      uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
+      setPrompt({ type: 'configPick', id, title, query: '', items: normalized, selected: 0 })
+    })
+  }, [])
+
+  const uiInput = React.useCallback((title: string, initial = ''): Promise<string | null> => {
+    const id = uiPromptIdRef.current++
+    return new Promise(resolve => {
+      uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
+      setPrompt({ type: 'configInput', id, title, value: initial })
+    })
+  }, [])
+
+  const uiConfirm = React.useCallback((title: string, body?: string): Promise<boolean> => {
+    const id = uiPromptIdRef.current++
+    return new Promise(resolve => {
+      uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
+      setPrompt({ type: 'configConfirm', id, title, body })
+    })
+  }, [])
+
+  const openNamedPanel = React.useCallback((name: ConfigPanelName) => {
+    if (name === 'shell') setPanel({ type: 'shell' })
+    else if (name === 'ai') setPanel({ type: 'ai', focused: true })
+    else if (name === 'git') openGitPanel()
+    else if (name === 'diagnostics') openDiagnosticsPanel('buffer')
+    else if (name === 'commandPalette') setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: flattenLeader(leaderMapRef.current) })
+  }, [openDiagnosticsPanel])
+
+  const notify = React.useCallback((message: string, level: ConfigNotifyLevel = 'info') => {
+    setStatus(level === 'info' ? message : `${level}: ${message}`)
+  }, [setStatus])
+
+  const commandRegistry = React.useMemo(() => {
+    const registry = new CommandRegistry()
+    registry.register('file.find', 'file: find', () => openFilePromptFromRoot(detectProjectRoot({ filename: snapshot?.filename ?? activeBuffer.filename, cwd: process.cwd() })))
+    registry.register('file.save', 'file: save', () => saveCurrentBuffer())
+    registry.register('buffer.switch', 'buffer: switch', () => {
+      const sorted = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
+      const selected = Math.max(0, sorted.findIndex(buffer => buffer.id === activeId))
+      setPrompt({ type: 'buffer', query: '', selected })
+    })
+    registry.register('shell.run', 'shell: run command', (ctx, args) => {
+      const command = typeof args?.command === 'string' ? args.command : ''
+      if (command) ctx.shell.run(command)
+    })
+    registry.register('panel.open', 'panel: open', (ctx, args) => {
+      const panel = typeof args?.panel === 'string' ? args.panel as ConfigPanelName : 'shell'
+      ctx.ui.panel(panel, args)
+    })
+    registry.register('code.hover', 'code: hover', () => {
+      const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+      sidecar.hover(cursor.row, cursor.col)
+    })
+    registry.register('code.definition', 'code: go to definition', () => {
+      const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+      sidecar.goToDefinition(cursor.row, cursor.col)
+    })
+    registry.register('code.format', 'code: format', () => sidecar.format())
+    registry.register('git.status', 'git: status', () => openGitPanel())
+    registry.register('git.hunk.stage', 'git: stage hunk', () => {
+      const target = currentGitHunk(['unstaged', 'untracked'])
+      if (!target) { setStatus('git: no hunk at current file'); return }
+      stageEntry(process.cwd(), target.entry, target.hunk)
+      setStatus(`git: staged hunk in ${target.entry.path}`)
+    })
+    registry.register('git.hunk.preview', 'git: preview hunk', () => {
+      const target = currentGitHunk(['unstaged', 'staged'])
+      if (!target) { setStatus('git: no hunk at current file'); return }
+      openGitPanelForHunk(target, `preview ${target.entry.path} ${target.hunk.header}`)
+    })
+    registry.register('diagnostics.list', 'diagnostics: list', () => openDiagnosticsPanel('buffer'))
+    registry.register('diagnostics.next', 'diagnostics: next', () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1)))
+    registry.register('diagnostics.line', 'diagnostics: current line', () => jumpToDiagnostic(diagnosticAtCursor(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 })))
+    registry.register('ai.chat', 'ai: chat', () => setPanel({ type: 'ai', focused: true }))
+    registerConfigCommands(config, registry)
+    return registry
+  }, [
+    activeBuffer.filename, activeId, buffers, config, currentGitHunk, jumpToDiagnostic, openDiagnosticsPanel,
+    openFilePromptFromRoot, openGitPanelForHunk, saveCurrentBuffer, setStatus, sidecar, snapshot,
+  ])
+
   const makeCtx = React.useCallback((): EditorContext => ({
       filename: snapshot?.filename ?? null,
       lines:    snapshot?.lines   ?? [],
@@ -1918,7 +2074,52 @@ function App({
         previous: actions.previousBuffer,
       },
       openFile: actions.openFile,
-    }), [actions, bufferInfos, saveCurrentBuffer, shell, shellLines, sidecar, snapshot])
+      commands: {
+        run: async (id, args) => commandRegistry.run(id, makeCtx(), args),
+      },
+      ui: {
+        pick: uiPick,
+        input: uiInput,
+        confirm: uiConfirm,
+        notify,
+        panel: openNamedPanel,
+      },
+      git: {
+        status: openGitPanel,
+        stageCurrentFile,
+        stageHunk: () => {
+          const target = currentGitHunk(['unstaged', 'untracked'])
+          if (!target) { setStatus('git: no hunk at current file'); return }
+          stageEntry(process.cwd(), target.entry, target.hunk)
+          setStatus(`git: staged hunk in ${target.entry.path}`)
+        },
+        previewHunk: () => {
+          const target = currentGitHunk(['unstaged', 'staged'])
+          if (!target) { setStatus('git: no hunk at current file'); return }
+          openGitPanelForHunk(target, `preview ${target.entry.path} ${target.hunk.header}`)
+        },
+      },
+      lsp: {
+        hover: () => {
+          const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+          sidecar.hover(cursor.row, cursor.col)
+        },
+        definition: () => {
+          const cursor = nearestIdentifierPosition(snapshot?.lines ?? [], snapshot?.cursor ?? { row: 0, col: 0 })
+          sidecar.goToDefinition(cursor.row, cursor.col)
+        },
+        format: () => sidecar.format(),
+      },
+      diagnostics: {
+        list: () => openDiagnosticsPanel('buffer'),
+        next: () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1)),
+        line: () => jumpToDiagnostic(diagnosticAtCursor(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 })),
+      },
+    }), [
+      actions, bufferInfos, commandRegistry, currentGitHunk, jumpToDiagnostic, notify, openDiagnosticsPanel,
+      openGitPanelForHunk, openNamedPanel, saveCurrentBuffer, setStatus, shell, shellLines, sidecar, snapshot,
+      uiConfirm, uiInput, uiPick,
+    ])
 
   const leaderMap = React.useMemo(() => buildLeaderMap(
     { save: saveCurrentBuffer, saveAndQuit: saveBufferAndQuit },
@@ -2062,7 +2263,23 @@ function App({
     },
     userLeader,
     makeCtx,
-  ), [actions, activeBuffer.filename, activeId, buffers, currentGitHunk, jumpToDiagnostic, makeCtx, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
+    (action: ConfigAction, ctx: EditorContext) => {
+      void runConfigAction(action, ctx, commandRegistry).catch(error => {
+        ctx.ui.notify(`config action failed: ${String(error)}`, 'error')
+      })
+    },
+    commandRegistry.list().map(command => ({
+      label: command.label,
+      keys: command.id,
+      action: () => {
+        void commandRegistry.run(command.id, makeCtx()).catch(error => {
+          notify(`command failed: ${String(error)}`, 'error')
+        })
+      },
+    })),
+  ), [actions, activeBuffer.filename, activeId, buffers, commandRegistry, currentGitHunk, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
+
+  leaderMapRef.current = leaderMap
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -2950,6 +3167,81 @@ function App({
       return
     }
 
+    if (prompt?.type === 'configPick') {
+      if (key.escape) {
+        resolveUiPrompt(prompt.id, null)
+        enterNormal()
+        return
+      }
+      const q = prompt.query.toLowerCase()
+      const filtered = prompt.items.filter(item =>
+        !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
+      )
+      const selected = Math.min(prompt.selected, Math.max(0, filtered.length - 1))
+      if (key.return) {
+        resolveUiPrompt(prompt.id, filtered[selected]?.value ?? null)
+        enterNormal()
+        return
+      }
+      if (key.upArrow || input === 'k') {
+        setPrompt(prev => prev?.type === 'configPick'
+          ? { ...prev, selected: Math.max(0, Math.min(prev.selected, filtered.length - 1) - 1) }
+          : prev)
+        return
+      }
+      if (key.downArrow || input === 'j') {
+        setPrompt(prev => prev?.type === 'configPick'
+          ? { ...prev, selected: Math.min(Math.max(0, filtered.length - 1), prev.selected + 1) }
+          : prev)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
+        return
+      }
+      return
+    }
+
+    if (prompt?.type === 'configInput') {
+      if (key.escape) {
+        resolveUiPrompt(prompt.id, null)
+        enterNormal()
+        return
+      }
+      if (key.return) {
+        resolveUiPrompt(prompt.id, prompt.value)
+        enterNormal()
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value.slice(0, -1) } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value + input } : prev)
+        return
+      }
+      return
+    }
+
+    if (prompt?.type === 'configConfirm') {
+      if (key.escape || input === 'n' || input === 'N') {
+        resolveUiPrompt(prompt.id, false)
+        enterNormal()
+        return
+      }
+      if (input === 'y' || input === 'Y' || key.return) {
+        resolveUiPrompt(prompt.id, true)
+        enterNormal()
+        return
+      }
+      return
+    }
+
     // ── Commit prompt ────────────────────────────────────────────────────────
     if (prompt?.type === 'commit') {
       if (key.escape) { setPrompt(null); return }
@@ -3691,10 +3983,27 @@ async function main() {
   let instance: Instance | null = null
   let quitting = false
   let lspOverlay: LspOverlay | null = null
+  const changeHookTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
   const refresh = () => instance?.rerender(view())
 
   const bufferInfos = () => buffers.map(buffer => toBufferInfo(buffer, activeId))
+
+  const makeHookRegistry = (buffer: EditorBuffer): CommandRegistry => {
+    const registry = new CommandRegistry()
+    registry.register('file.save', 'file: save', () => activeSidecar?.save())
+    registry.register('shell.run', 'shell: run command', (ctx, args) => {
+      const command = typeof args?.command === 'string' ? args.command : ''
+      if (command) ctx.shell.run(command)
+    })
+    registry.register('code.format', 'code: format', () => activeSidecar?.format())
+    registry.register('openFile', 'file: open', (_ctx, args) => {
+      const path = typeof args?.path === 'string' ? args.path : null
+      if (path) openFile(path)
+    })
+    registerConfigCommands(cfg, registry)
+    return registry
+  }
 
   const makeCtx = (buffer: EditorBuffer): EditorContext => ({
     filename: buffer.snapshot?.filename ?? buffer.filename,
@@ -3714,7 +4023,62 @@ async function main() {
       previous: previousBuffer,
     },
     openFile,
+    commands: {
+      run: async (id, args) => makeHookRegistry(buffer).run(id, makeCtx(buffer), args),
+    },
+    ui: {
+      pick: async () => null,
+      input: async () => null,
+      confirm: async () => false,
+      notify: (message, level = 'info') => {
+        buffer.status = level === 'info' ? message : `${level}: ${message}`
+        refresh()
+      },
+      panel: () => {},
+    },
+    git: {
+      status: () => {},
+      stageCurrentFile: () => {},
+      stageHunk: () => {},
+      previewHunk: () => {},
+    },
+    lsp: {
+      hover: () => {
+        const cursor = nearestIdentifierPosition(buffer.snapshot?.lines ?? [], buffer.snapshot?.cursor ?? { row: 0, col: 0 })
+        activeSidecar?.hover(cursor.row, cursor.col)
+      },
+      definition: () => {
+        const cursor = nearestIdentifierPosition(buffer.snapshot?.lines ?? [], buffer.snapshot?.cursor ?? { row: 0, col: 0 })
+        activeSidecar?.goToDefinition(cursor.row, cursor.col)
+      },
+      format: () => activeSidecar?.format(),
+    },
+    diagnostics: {
+      list: () => {},
+      next: () => {},
+      line: () => {},
+    },
   })
+
+  function runHookAction(action: ConfigAction, buffer: EditorBuffer): void {
+    const ctx = makeCtx(buffer)
+    void runConfigAction(action, ctx, makeHookRegistry(buffer)).catch(error => {
+      buffer.status = `config hook failed: ${String(error)}`
+      refresh()
+    })
+  }
+
+  function scheduleChangeHook(buffer: EditorBuffer): void {
+    const action = cfg.hooks?.onChange
+    if (!action) return
+    const existing = changeHookTimers.get(buffer.id)
+    if (existing) clearTimeout(existing)
+    changeHookTimers.set(buffer.id, setTimeout(() => {
+      changeHookTimers.delete(buffer.id)
+      if (quitting || !buffers.some(candidate => candidate.id === buffer.id)) return
+      runHookAction(action, buffer)
+    }, 250))
+  }
 
   function createSidecarForBuffer(buffer: EditorBuffer): QeSidecar {
     const sc = new QeSidecar(buffer.filename ?? undefined)
@@ -3735,10 +4099,11 @@ async function main() {
           buffer.filename = message.filename
           buffer.name = bufferName(message.filename)
           buffer.status = message.status
+          scheduleChangeHook(buffer)
           break
         case 'saved':
           buffer.status = 'saved'
-          if (cfg.hooks?.onSave) void cfg.hooks.onSave(makeCtx(buffer))
+          if (cfg.hooks?.onSave) runHookAction(cfg.hooks.onSave, buffer)
           break
         case 'error':
           buffer.status = message.message
@@ -3848,6 +4213,9 @@ async function main() {
   function removeBuffer(id: string): void {
     if (!buffers.find(b => b.id === id)) return  // already gone — idempotent
 
+    const timer = changeHookTimers.get(id)
+    if (timer) clearTimeout(timer)
+    changeHookTimers.delete(id)
     buffers = buffers.filter(b => b.id !== id)
 
     if (activeId === id) {
@@ -3895,12 +4263,14 @@ async function main() {
     const buffer = createBuffer(resolved)
     if (jump) buffer.jumpTo = jump
     activateBuffer(buffer)
-    if (cfg.hooks?.onOpen) void cfg.hooks.onOpen(makeCtx(buffer))
+    if (cfg.hooks?.onOpen) runHookAction(cfg.hooks.onOpen, buffer)
     refresh()
   }
 
   function quitAll(): void {
     quitting = true
+    for (const timer of changeHookTimers.values()) clearTimeout(timer)
+    changeHookTimers.clear()
     if (activeSidecar) { activeSidecar.kill(); activeSidecar = null }
     shell.kill()
     instance?.unmount()
@@ -3924,19 +4294,99 @@ async function main() {
     const existing = getConfigPath()
     if (existing) { openFile(existing); return }
     // Create the default config file with a starter template
-    import('node:fs').then(({ mkdirSync, writeFileSync }) => {
-      import('node:path').then(({ dirname }) => {
+    import('node:fs').then(({ existsSync, mkdirSync, writeFileSync }) => {
+      import('node:path').then(({ dirname, join }) => {
         const target = CONFIG_PATHS[0]!
-        mkdirSync(dirname(target), { recursive: true })
+        const configDir = dirname(target)
+        mkdirSync(configDir, { recursive: true })
+        const apiTarget = join(configDir, 'config-api.ts')
+        if (!existsSync(apiTarget)) {
+          const apiTemplate = [
+            `// Local qe config typing helper. Generated next to config.ts so this setup is portable.`,
+            `export type QeExtra = 'typescript' | 'rust' | 'git' | 'ai' | 'formatting' | 'debug'`,
+            `export type ConfigNotifyLevel = 'info' | 'warn' | 'error'`,
+            `export type ConfigPanelName = 'shell' | 'ai' | 'git' | 'diagnostics' | 'commandPalette'`,
+            `export type ConfigPickItem = string | { label: string; value?: string; description?: string }`,
+            `export type ConfigDirective =`,
+            `  | { type: 'shell.run'; command: string }`,
+            `  | { type: 'panel.open'; panel: ConfigPanelName; options?: Record<string, unknown> }`,
+            `  | { type: 'openFile'; path: string; row?: number; col?: number }`,
+            `  | { type: 'editor.insert'; text: string }`,
+            `  | { type: 'editor.move'; direction: string }`,
+            `  | { type: 'command.run'; command: string; args?: Record<string, unknown> }`,
+            `  | { type: 'ui.notify'; message: string; level?: ConfigNotifyLevel }`,
+            `export type ConfigActionResult = void | ConfigDirective | ConfigDirective[] | Promise<void | ConfigDirective | ConfigDirective[]>`,
+            `export type EditorContext = {`,
+            `  readonly filename: string | null`,
+            `  readonly lines: string[]`,
+            `  readonly cursor: { row: number; col: number }`,
+            `  save: () => void`,
+            `  quit: () => void`,
+            `  insert: (text: string) => void`,
+            `  move: (dir: string) => void`,
+            `  openFile: (path: string, jump?: { row: number; col: number }) => void`,
+            `  shell: { run: (cmd: string) => void; lines: () => string[] }`,
+            `  buffers: { list: () => unknown[]; current: () => unknown | null; switch: (id: string) => void; kill: (id?: string) => void; next: () => void; previous: () => void }`,
+            `  commands: { run: (id: string, args?: Record<string, unknown>) => Promise<void> }`,
+            `  ui: { pick: (title: string, items: ConfigPickItem[]) => Promise<string | null>; input: (title: string, initial?: string) => Promise<string | null>; confirm: (title: string, body?: string) => Promise<boolean>; notify: (message: string, level?: ConfigNotifyLevel) => void; panel: (name: ConfigPanelName, options?: Record<string, unknown>) => void }`,
+            `  git: { status: () => void; stageCurrentFile: () => void; stageHunk: () => void; previewHunk: () => void }`,
+            `  lsp: { hover: () => void; definition: () => void; format: () => void }`,
+            `  diagnostics: { list: () => void; next: () => void; line: () => void }`,
+            `}`,
+            `export type ConfigAction = string | { command: string; args?: Record<string, unknown>; label?: string } | ConfigDirective | ConfigDirective[] | ((ctx: EditorContext) => ConfigActionResult)`,
+            `export type QeConfig = {`,
+            `  preset?: 'web' | 'rust' | 'minimal'`,
+            `  extras?: QeExtra[]`,
+            `  theme?: Partial<Record<'bg' | 'fg' | 'grey' | 'red' | 'orange' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'violet', string>>`,
+            `  leader?: { [key: string]: ConfigAction | QeConfig['leader'] }`,
+            `  hooks?: { onSave?: ConfigAction; onOpen?: ConfigAction; onChange?: ConfigAction }`,
+            `  commands?: Record<string, ConfigAction>`,
+            `}`,
+            `export function defineConfig<const T extends QeConfig>(config: T): T { return config }`,
+          ].join('\n')
+          writeFileSync(apiTarget, `${apiTemplate}\n`, 'utf8')
+        }
         const template = [
-          `// ~/.config/qe/config.js — qe editor user config`,
-          `// Add custom keybindings under "leader". Keys receive an EditorContext.`,
+          `// ~/.config/qe/config.ts - qe programmable editor config`,
+          `// This file is trusted local code. It can use command IDs, directives, or functions.`,
+          `import { defineConfig } from './config-api.ts'`,
           ``,
-          `export default {`,
-          `  // leader: {`,
-          `  //   z: { r: (ctx) => ctx.shell.run('cargo test') },`,
-          `  // },`,
-          `}`,
+          `export default defineConfig({`,
+          `  preset: 'web',`,
+          `  extras: ['typescript', 'git', 'ai', 'formatting'],`,
+          ``,
+          `  commands: {`,
+          `    'tasks.pickAndRun': async (ctx) => {`,
+          `      const task = await ctx.ui.pick('Run task', [`,
+          `        'npm run typecheck',`,
+          `        'npm --prefix app run test',`,
+          `        'cargo test --manifest-path native/editor-core/Cargo.toml',`,
+          `      ])`,
+          `      if (task) return [`,
+          `        { type: 'shell.run', command: task },`,
+          `        { type: 'panel.open', panel: 'shell' },`,
+          `      ]`,
+          `    },`,
+          `  },`,
+          ``,
+          `  leader: {`,
+          `    p: { t: 'tasks.pickAndRun' },`,
+          `    x: { t: [`,
+          `      { type: 'shell.run', command: 'npm test' },`,
+          `      { type: 'panel.open', panel: 'shell' },`,
+          `    ] },`,
+          `    z: { r: (ctx) => ctx.shell.run('cargo test') },`,
+          `  },`,
+          ``,
+          `  hooks: {`,
+          `    // Hooks support commands/directives. Interactive UI prompts are only available from leader commands.`,
+          `    onSave: async (ctx) => {`,
+          `      if (ctx.filename?.endsWith('.ts')) await ctx.commands.run('code.format')`,
+          `    },`,
+          `    // onChange is debounced. Prefer quick commands/directives here.`,
+          `    // onChange: { type: 'ui.notify', message: 'buffer changed' },`,
+          `  },`,
+          `})`,
         ].join('\n')
         writeFileSync(target, template, 'utf8')
         openFile(target)
@@ -3965,6 +4415,7 @@ async function main() {
           sidecar={activeSidecar!}
           shell={shell}
           shellLines={displayLines}
+          config={cfg}
           userLeader={cfg.leader ?? {}}
           lspOverlay={lspOverlay}
           actions={{

@@ -45,6 +45,17 @@ const makeCtx = (): EditorContext => ({
   shell: { run: noop, lines: () => [] },
   buffers: { list: () => [], current: () => null, switch: noop, kill: noop, next: noop, previous: noop },
   openFile: noop,
+  commands: { run: async () => {} },
+  ui: {
+    pick: async () => null,
+    input: async () => null,
+    confirm: async () => false,
+    notify: noop,
+    panel: noop,
+  },
+  git: { status: noop, stageCurrentFile: noop, stageHunk: noop, previewHunk: noop },
+  lsp: { hover: noop, definition: noop, format: noop },
+  diagnostics: { list: noop, next: noop, line: noop },
 })
 
 function makeMap(overrides: Partial<typeof mockAi & typeof mockBufs> = {}): LeaderNode {
@@ -239,5 +250,26 @@ describe('userLeader merge', () => {
     assert.ok(item, 'user-defined SPC u u not found in flattened map')
     item!.action()
     assert.ok(called, 'user-defined action was not called')
+  })
+
+  it('user leader command IDs and directives are routed through runAction', () => {
+    const seen: unknown[] = []
+    const userLeader: LeaderTree = {
+      p: { t: 'tasks.pickAndRun' },
+      x: { t: [{ type: 'shell.run', command: 'npm test' }] },
+    }
+    const map = buildLeaderMap(
+      mockSidecar, mockSetPanel,
+      mockBufs, mockAi, mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockCfg, mockMode,
+      userLeader, makeCtx,
+      (action) => { seen.push(action) },
+    )
+    const items = flattenLeader(map)
+    items.find(i => i.keys === 'SPC p t')?.action()
+    items.find(i => i.keys === 'SPC x t')?.action()
+    assert.deepEqual(seen, [
+      'tasks.pickAndRun',
+      [{ type: 'shell.run', command: 'npm test' }],
+    ])
   })
 })

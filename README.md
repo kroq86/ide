@@ -35,6 +35,7 @@ In the app (normal mode, `SPC` leader):
 | **Shell** | PTY pane; tracked runs with exit code, output tail, parsed locations — [`app/src/shell.ts`](app/src/shell.ts). |
 | **Git** | Status / diff / stage / commit / pull / push / log UI — [`app/src/git.ts`](app/src/git.ts). |
 | **AI** | Chat, inline completion — [`app/src/ai.ts`](app/src/ai.ts). CodeClaw fix/review — [`app/src/codeclaw.ts`](app/src/codeclaw.ts). Multi-provider registry (Ollama + any OpenAI-compatible API) — [`app/src/ai-registry.ts`](app/src/ai-registry.ts). Optional append-only raw bundle: `CODECLAW_TRACE_RAW=1` (see [`app/src/codeclaw-trace-recorder.ts`](app/src/codeclaw-trace-recorder.ts)). |
+| **Config** | TypeScript/ESM programmable config with command IDs, directives, hooks, and interactive UI helpers — [`app/src/config.ts`](app/src/config.ts), [`app/src/config-runtime.ts`](app/src/config-runtime.ts). |
 | **Project** | `.codeclaw/` for rules, tasks, memory, traces — paths are relative to **process cwd** (often the `app/` directory if you start the binary from there). |
 
 ---
@@ -60,6 +61,95 @@ npm run dev -- README.md
 ```
 
 Root [`package.json`](package.json): `dev` = `build:native` + `npm --prefix app run dev --` (forwards args to `node dist/main.js`).
+
+---
+
+## Programmable config
+
+`qe` has a trusted local config layer, closer to Emacs/Vim config than static settings. Config files are searched in this order:
+
+1. `~/.config/qe/config.ts`
+2. `~/.config/qe/config.mts`
+3. `~/.config/qe/config.js`
+4. `~/.config/qe/config.mjs`
+5. `~/.qe/config.js`
+
+Press **`SPC p e`** to open or create a starter config. For a new TypeScript config, `qe` also creates `~/.config/qe/config-api.ts` beside it, so the generated config is portable across machines and does not depend on this repo living at a hardcoded path.
+
+Example:
+
+```ts
+import { defineConfig } from './config-api.ts'
+
+export default defineConfig({
+  preset: 'web',
+  extras: ['typescript', 'git', 'ai', 'formatting'],
+
+  commands: {
+    'tasks.pickAndRun': async (ctx) => {
+      const task = await ctx.ui.pick('Run task', [
+        'npm run typecheck',
+        'npm --prefix app run test',
+        'cargo test --manifest-path native/editor-core/Cargo.toml',
+      ])
+      if (task) return [
+        { type: 'shell.run', command: task },
+        { type: 'panel.open', panel: 'shell' },
+      ]
+    },
+  },
+
+  leader: {
+    p: { t: 'tasks.pickAndRun' },
+    x: {
+      t: [
+        { type: 'shell.run', command: 'npm test' },
+        { type: 'panel.open', panel: 'shell' },
+      ],
+    },
+    z: { r: (ctx) => ctx.shell.run('cargo test') },
+  },
+
+  hooks: {
+    onSave: async (ctx) => {
+      if (ctx.filename?.endsWith('.ts')) await ctx.commands.run('code.format')
+    },
+    // onChange is debounced. Keep it quick; prefer commands/directives over prompts.
+  },
+})
+```
+
+### Config action forms
+
+Leader leaves, hooks, and user commands can be written as:
+
+| Form | Example |
+|------|---------|
+| Command ID | `'file.find'` |
+| Command object | `{ command: 'shell.run', args: { command: 'npm test' } }` |
+| Directive | `{ type: 'ui.notify', message: 'saved' }` |
+| Directive array | `[{ type: 'shell.run', command: 'npm test' }, { type: 'panel.open', panel: 'shell' }]` |
+| Function | `(ctx) => ctx.shell.run('cargo test')` |
+
+Built-in command IDs include:
+
+```txt
+file.find          file.save          buffer.switch
+shell.run          panel.open         ai.chat
+code.hover         code.definition    code.format
+git.status         git.hunk.stage     git.hunk.preview
+diagnostics.list   diagnostics.next   diagnostics.line
+```
+
+Supported directives:
+
+```txt
+shell.run      panel.open     openFile
+editor.insert  editor.move    command.run
+ui.notify
+```
+
+`EditorContext` exposes `ctx.commands.run`, `ctx.ui.pick/input/confirm/notify/panel`, `ctx.git`, `ctx.lsp`, `ctx.diagnostics`, `ctx.shell`, `ctx.buffers`, and basic editor operations. Interactive UI prompts are intended for leader commands; hooks run from sidecar events and should stay quick.
 
 ---
 
@@ -136,6 +226,18 @@ Press **`SPC`** in normal mode for which-key. Bindings are defined in [`app/src/
 | `SPC t a` | terminal: toggle AI panel |
 | `SPC g g` | git: status — ll commit log (Magit) |
 | `SPC g s` | git: stage current |
+| `SPC g h n/p` | git: next / previous hunk |
+| `SPC g h s/u/v` | git: stage / unstage / preview hunk |
+| `SPC g b` | git: blame line |
+| `SPC g l` | git: log |
+| `SPC c d` / `gd` | code: go to definition |
+| `SPC c h` / `K` | code: hover |
+| `SPC c f` | code: format |
+| `SPC x x` | diagnostics: list |
+| `SPC x n/p` | diagnostics: next / previous |
+| `SPC p e` | config: edit config file |
+| `SPC p r` | config: reload config |
+| `SPC :` | command palette |
 | `SPC f f` | file: open |
 | `SPC b b` | buffer: switch |
 | `Ctrl-Q` | quit (handled in [`app/src/main.tsx`](app/src/main.tsx)) |
@@ -180,6 +282,9 @@ npm --prefix examples/broken-counter test
 | Path | Role |
 |------|------|
 | [`app/src/main.tsx`](app/src/main.tsx) | UI, modes, panels, fix/review flows, quit |
+| [`app/src/config.ts`](app/src/config.ts) | Public config types, config search/loading, `defineConfig`, leader merge |
+| [`app/src/config-runtime.ts`](app/src/config-runtime.ts) | Command registry, config action normalization, directive execution |
+| [`app/src/leader.ts`](app/src/leader.ts) | Leader groups, labels, which-key flattening |
 | [`app/src/protocol.ts`](app/src/protocol.ts) | Sidecar binary resolution, snapshot / LSP message types |
 | [`app/src/codeclaw.ts`](app/src/codeclaw.ts) | CodeClaw fix/review, traces, git diff for review |
 | [`app/src/shell.ts`](app/src/shell.ts) | Shell sidecar, `ShellRun` |
@@ -191,6 +296,19 @@ npm --prefix examples/broken-counter test
 | [`app/src/openai-compat-provider.ts`](app/src/openai-compat-provider.ts) | OpenAI-compatible SSE provider |
 | [`native/editor-core/`](native/editor-core/) | Rust editor core |
 | [`native/qe-core/`](native/qe-core/) | Legacy C protocol binary / QEmacs-derived sources |
+
+---
+
+## Cursor MCP config
+
+The optional Cursor MCP config in [`.cursor/mcp.json`](.cursor/mcp.json) is intentionally portable. It uses:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DOCS_ROOT` | `$PWD` | Docs root for the MCP server |
+| `DOCS_MEMORY_PYTHON` | `python3` | Python executable used to run `docs_memory_mcp` |
+
+Set `DOCS_MEMORY_PYTHON` to a venv interpreter if needed; do not hardcode machine-local paths in the repo.
 
 ---
 
