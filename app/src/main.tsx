@@ -7,6 +7,7 @@ import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'ter
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
 import { ShellSidecar, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
 import { streamCompletion, streamChat, sanitizeInlineCompletion, type AiContext } from './ai.js'
+import { getProviderLabel, setActiveModel, listAvailableModels, isOllamaActive } from './ai-registry.js'
 import {
   REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
   buildLeaderMap, flattenLeader, isLeafAction, whichKeyDesc,
@@ -119,6 +120,7 @@ type PromptState =
   | { type: 'file'; query: string }
   | { type: 'saveAs'; query: string; thenQuit?: boolean }
   | { type: 'commit'; message: string }
+  | { type: 'model'; query: string; candidates: string[]; selected: number }
 
 type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
 
@@ -1230,12 +1232,13 @@ type EditorPaneProps = {
   searchQuery: string
   cmdBuf: string
   searchBuf: string
+  aiModelLabel: string
 }
 
 function EditorPane({
   filename, snapshot, status, bufferName, bufferIndex, bufferCount, buffers, prompt,
   activeBufferId, ghostText, completionStreaming, thinkingTick, mode, scrollOffset, panelRows, paneWidth, panel,
-  paneHeight, sel, searchQuery, cmdBuf, searchBuf,
+  paneHeight, sel, searchQuery, cmdBuf, searchBuf, aiModelLabel,
 }: EditorPaneProps) {
   const lines  = snapshot?.lines  ?? ['']
   const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
@@ -1275,6 +1278,8 @@ function EditorPane({
     hintLine = `Switch buffer: ${prompt.query}_`
   } else if (prompt?.type === 'commit') {
     hintLine = `Commit: ${prompt.message}_`
+  } else if (prompt?.type === 'model') {
+    hintLine = `Select model: ${prompt.query}_  j/k=navigate  Ret=confirm  Esc=cancel`
   } else if (mode === 'command') {
     hintLine = `:${cmdBuf}_`
   } else if (mode === 'search') {
@@ -1304,8 +1309,9 @@ function EditorPane({
           <Text color={C.grey}>{`${cursor.row + 1}:${cursor.col + 1}`}</Text>
           {diagnosticCount > 0 && <Text color={C.orange}>{`diag ${diagnosticCount}`}</Text>}
         </Box>
-        <Box flexDirection="row">
+        <Box flexDirection="row" justifyContent="space-between">
           <Text color={searchQuery ? C.yellow : C.grey}>{metaShown}</Text>
+          <Text color={C.grey}>{aiModelLabel}</Text>
         </Box>
       </Box>
 
@@ -1329,6 +1335,28 @@ function EditorPane({
             <Text color={C.grey}>{' '}</Text>
           </Box>
         )}
+        {prompt?.type === 'model' && (() => {
+          const q = prompt.query.toLowerCase()
+          const filtered = prompt.candidates.filter(m => !q || m.toLowerCase().includes(q))
+          const windowSize = 8
+          const scrollStart = Math.max(0, Math.min(prompt.selected - Math.floor(windowSize / 2), filtered.length - windowSize))
+          const visible = filtered.slice(scrollStart, scrollStart + windowSize)
+          return (
+            <Box flexDirection="column">
+              {visible.length === 0
+                ? <Text color={C.grey}>  no matching models</Text>
+                : visible.map((m, index) => {
+                    const isSelected = scrollStart + index === prompt.selected
+                    return (
+                      <Text key={m} color={isSelected ? C.bg : C.fg} backgroundColor={isSelected ? C.cyan : undefined}>
+                        {`  ${m}`}
+                      </Text>
+                    )
+                  })}
+              <Text color={C.grey}>{scrollStart > 0 ? `  ↑ ${scrollStart} more` : ' '}</Text>
+            </Box>
+          )
+        })()}
         {visibleLines.map((line, index) => {
           const actualRow = index + scrollOffset
           const isCursor  = actualRow === cursor.row
@@ -1416,6 +1444,7 @@ function App({
   const [searchQuery,    setSearchQuery]    = React.useState('')
   const [prompt,         setPrompt]         = React.useState<PromptState | null>(null)
 
+  const [aiModelLabel,   setAiModelLabel]   = React.useState(() => getProviderLabel())
   const [aiMessages,     setAiMessages]     = React.useState<AiMessage[]>([])
   const [aiInput,        setAiInput]        = React.useState('')
   const [aiStreaming,    setAiStreaming]     = React.useState(false)
@@ -1581,6 +1610,7 @@ function App({
       },
       review: () => runCodeClawReview(),
       clearChat: () => clearAiChat(),
+      selectModel: () => openModelPicker(),
     },
     {
       open: openGitPanel,
@@ -1713,6 +1743,16 @@ function App({
     setAiMessages([])
     setAiScrollOffset(0)
     setAiInput('')
+  }
+
+  function openModelPicker() {
+    enterNormal()
+    const ctrl = new AbortController()
+    listAvailableModels(ctrl.signal).then(candidates => {
+      setPrompt({ type: 'model', query: '', candidates, selected: 0 })
+    }).catch(() => {
+      setPrompt({ type: 'model', query: '', candidates: [getProviderLabel().split('/').slice(1).join('/')], selected: 0 })
+    })
   }
 
   function explainLastError() {
@@ -1994,14 +2034,15 @@ function App({
     void (async () => {
       try {
         let acc = ''
+        const loose = !isOllamaActive()
         for await (const chunk of streamCompletion(
           fname, lines, cursor, controller.signal, shellLines,
         )) {
           acc += chunk
-          const cleaned = sanitizeInlineCompletion(acc)
+          const cleaned = sanitizeInlineCompletion(acc, loose)
           setGhostTextSync(cleaned.length > 0 ? cleaned : '')
         }
-        const finalClean = sanitizeInlineCompletion(acc)
+        const finalClean = sanitizeInlineCompletion(acc, loose)
         debugLog('completion', 'trigger_finish', {
           aborted: controller.signal.aborted,
           rawChars: acc.length,
@@ -2531,6 +2572,43 @@ function App({
       return
     }
 
+    if (prompt?.type === 'model') {
+      if (key.escape) { enterNormal(); return }
+      const q = prompt.query.toLowerCase()
+      const filtered = prompt.candidates.filter(m => !q || m.toLowerCase().includes(q))
+      const selected = Math.min(prompt.selected, Math.max(0, filtered.length - 1))
+      if (key.return) {
+        const chosen = filtered[selected] ?? prompt.query.trim()
+        if (chosen) {
+          setActiveModel(chosen)
+          setAiModelLabel(getProviderLabel())
+        }
+        enterNormal()
+        return
+      }
+      if (key.upArrow || input === 'k') {
+        setPrompt(prev => prev?.type === 'model'
+          ? { ...prev, selected: Math.max(0, Math.min(prev.selected, filtered.length - 1) - 1) }
+          : prev)
+        return
+      }
+      if (key.downArrow || input === 'j') {
+        setPrompt(prev => prev?.type === 'model'
+          ? { ...prev, selected: Math.min(Math.max(0, filtered.length - 1), prev.selected + 1) }
+          : prev)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'model' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'model' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
+        return
+      }
+      return
+    }
+
     if (key.escape) { enterNormal(); return }
 
     // ── Command mode ─────────────────────────────────────────────────────────
@@ -2945,6 +3023,7 @@ function App({
       searchQuery={searchQuery}
       cmdBuf={cmdBuf}
       searchBuf={searchBuf}
+      aiModelLabel={aiModelLabel}
     />
   )
 

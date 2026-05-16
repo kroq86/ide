@@ -19,7 +19,7 @@ const mockBufs = {
 }
 const mockAi = {
   openChat: noop, triggerCompletion: noop, explainError: noop,
-  fixFailure: noop, showTrace: noop, rerunLast: noop, review: noop, clearChat: noop,
+  fixFailure: noop, showTrace: noop, rerunLast: noop, review: noop, clearChat: noop, selectModel: noop,
 }
 const mockGit   = { open: noop, stage: noop }
 const mockLsp   = { hover: noop, definition: noop }

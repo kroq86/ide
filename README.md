@@ -34,7 +34,7 @@ In the app (normal mode, `SPC` leader):
 | **Editor** | Modal buffers; Rust sidecar [`native/editor-core/`](native/editor-core/) speaks JSONL with snapshots, edits, and **LSP-shaped** requests/responses (hover, definition, completion, format) — see [`app/src/protocol.ts`](app/src/protocol.ts). |
 | **Shell** | PTY pane; tracked runs with exit code, output tail, parsed locations — [`app/src/shell.ts`](app/src/shell.ts). |
 | **Git** | Status / diff / stage / commit / pull / push / log UI — [`app/src/git.ts`](app/src/git.ts). |
-| **AI** | Chat, inline completion — [`app/src/ai.ts`](app/src/ai.ts). CodeClaw fix/review — [`app/src/codeclaw.ts`](app/src/codeclaw.ts). Optional append-only raw bundle: `CODECLAW_TRACE_RAW=1` (see [`app/src/codeclaw-trace-recorder.ts`](app/src/codeclaw-trace-recorder.ts)). |
+| **AI** | Chat, inline completion — [`app/src/ai.ts`](app/src/ai.ts). CodeClaw fix/review — [`app/src/codeclaw.ts`](app/src/codeclaw.ts). Multi-provider registry (Ollama + any OpenAI-compatible API) — [`app/src/ai-registry.ts`](app/src/ai-registry.ts). Optional append-only raw bundle: `CODECLAW_TRACE_RAW=1` (see [`app/src/codeclaw-trace-recorder.ts`](app/src/codeclaw-trace-recorder.ts)). |
 | **Project** | `.codeclaw/` for rules, tasks, memory, traces — paths are relative to **process cwd** (often the `app/` directory if you start the binary from there). |
 
 ---
@@ -63,16 +63,57 @@ Root [`package.json`](package.json): `dev` = `build:native` + `npm --prefix app 
 
 ---
 
-## Ollama environment
+## AI providers
 
-Defaults are set **in code** (you may override with env):
+The editor supports **Ollama** (default) and any **OpenAI-compatible API** (OpenAI, Groq, LM Studio, OpenRouter, …). Switch providers via env or at runtime with **`SPC a m`** (model picker).
 
-| Variable | Default | Where read |
-|----------|---------|--------------|
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | [`app/src/ollama-env.ts`](app/src/ollama-env.ts) (used by [`app/src/ai.ts`](app/src/ai.ts) and [`app/src/codeclaw.ts`](app/src/codeclaw.ts)) |
-| `OLLAMA_MODEL` | **`qwen2.5-coder:1.5b`** (chat, completion, FIM, CodeClaw fix + review) | same |
+### Env vars
 
-If **`OLLAMA_MODEL` is set** in the environment, all call sites use that tag. Install models with `ollama pull …` to match whatever you set.
+Env is loaded from a `.env` file at the repo root at startup (no shell flag needed — handled by [`app/src/env-loader.ts`](app/src/env-loader.ts)).
+
+#### Provider selection
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `AI_PROVIDER` | `ollama` | Set to `openai` or `openai-compat` to use an OpenAI-compatible endpoint |
+
+#### Ollama
+
+| Variable | Default |
+|----------|---------|
+| `OLLAMA_URL` | `http://127.0.0.1:11434` |
+| `OLLAMA_MODEL` | `qwen2.5-coder:1.5b` |
+
+FIM (fill-in-middle) is used automatically for supported model families (qwen-coder ≥7B, deepseek-coder, starcoder, codellama). Smaller qwen-coder models fall back to chat + `[CURSOR]`.
+
+#### OpenAI-compatible
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `AI_BASE_URL` | `https://api.openai.com` | Override for Groq (`https://api.groq.com/openai`), LM Studio (`http://localhost:1234`), etc. |
+| `AI_API_KEY` | — | Falls back to `OPENAI_API_KEY` |
+| `AI_MODEL` | `gpt-4o-mini` | Falls back to `OAPENAI_MODEL` |
+
+Example `.env` for GPT-4o:
+
+```
+AI_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+AI_MODEL=gpt-4o
+```
+
+Example `.env` for Groq:
+
+```
+AI_PROVIDER=openai
+AI_BASE_URL=https://api.groq.com/openai
+AI_API_KEY=gsk_...
+AI_MODEL=llama-3.3-70b-versatile
+```
+
+### Runtime model switching (`SPC a m`)
+
+Press **`SPC a m`** in normal mode to open the model picker. It fetches models from both Ollama and your OpenAI-compatible endpoint in parallel (Ollama first), displays them as `ollama/<name>` / `openai/<name>`, and switches the active provider immediately on selection. The current model is shown in the editor header.
 
 ---
 
@@ -86,6 +127,7 @@ Press **`SPC`** in normal mode for which-key. Bindings are defined in [`app/src/
 | `SPC a r` | ai: review git diff (CodeClaw) |
 | `SPC a t` | ai: show trace |
 | `SPC a p` | ai: open chat |
+| `SPC a m` | ai: select model (model picker, switches provider) |
 | `SPC a c` | ai: trigger completion |
 | `SPC a e` | ai: explain last error |
 | `SPC a l` | ai: rerun last shell command |
@@ -142,7 +184,11 @@ npm --prefix examples/broken-counter test
 | [`app/src/codeclaw.ts`](app/src/codeclaw.ts) | CodeClaw fix/review, traces, git diff for review |
 | [`app/src/shell.ts`](app/src/shell.ts) | Shell sidecar, `ShellRun` |
 | [`app/src/git.ts`](app/src/git.ts) | Git operations |
-| [`app/src/ai.ts`](app/src/ai.ts) | Ollama chat / completion |
+| [`app/src/ai.ts`](app/src/ai.ts) | Chat / completion wrappers, prompt building, inline completion sanitizer |
+| [`app/src/ai-provider.ts`](app/src/ai-provider.ts) | `AiProvider` interface |
+| [`app/src/ai-registry.ts`](app/src/ai-registry.ts) | Active provider singleton, model picker helpers |
+| [`app/src/ollama-provider.ts`](app/src/ollama-provider.ts) | Ollama HTTP provider (FIM + chat) |
+| [`app/src/openai-compat-provider.ts`](app/src/openai-compat-provider.ts) | OpenAI-compatible SSE provider |
 | [`native/editor-core/`](native/editor-core/) | Rust editor core |
 | [`native/qe-core/`](native/qe-core/) | Legacy C protocol binary / QEmacs-derived sources |
 

@@ -2,8 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { ShellLine, ShellSession } from './shell.js'
 import { debugLog } from './debug-log.js'
-import { readOllamaNdjsonLines } from './ollama-ndjson.js'
-import { OLLAMA_MODEL, OLLAMA_URL } from './ollama-env.js'
+import { getActiveProvider } from './ai-registry.js'
 
 /** Defaults use loopback IP — on some hosts `localhost` resolves to ::1 while Ollama listens on IPv4 only. */
 
@@ -172,54 +171,7 @@ export async function* streamChat(
     `File: ${context.filename ?? 'untitled'}  cursor: ${context.cursor.row + 1}:${context.cursor.col + 1}${bufPart}\n` +
     `\`\`\`\n${fileSnippet}\n\`\`\`${shellPart}${gitPart}${projectPart}${memoryPart}`
 
-  debugLog('ollama', 'ai_chat_begin', {
-    model: OLLAMA_MODEL,
-    url: OLLAMA_URL,
-    userTurns: messages.length,
-    systemChars: systemContent.length,
-    aborted: signal.aborted,
-  })
-
-  let response: Response
-  try {
-    response = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        messages: [{ role: 'system', content: systemContent }, ...messages],
-        stream: true,
-      }),
-      signal,
-    })
-  } catch (err) {
-    debugLog('ollama', 'ai_chat_fetch_failed', { error: String(err) })
-    throw err
-  }
-
-  if (!response.ok || !response.body) {
-    const text = await response.text()
-    debugLog('ollama', 'ai_chat_bad_response', { status: response.status, bodyPreview: text.slice(0, 1200) })
-    throw new Error(`ollama ${response.status}: ${text}`)
-  }
-
-  let deltaChunks = 0
-  let deltaChars = 0
-
-  try {
-    for await (const line of readOllamaNdjsonLines(response.body)) {
-      const parsed = parseOllamaChatLine(line)
-      if (!parsed) continue
-      if (parsed.delta) {
-        deltaChunks++
-        deltaChars += parsed.delta.length
-        yield parsed.delta
-      }
-      if (parsed.done) return
-    }
-  } finally {
-    debugLog('ollama', 'ai_chat_stream_end', { deltaChunks, deltaChars })
-  }
+  yield* getActiveProvider().streamChatMessages(systemContent, messages, signal)
 }
 
 /** If the model mixed chat with a fence, keep only the first fenced code body ( drops "It looks like…" wrappers). */
@@ -251,7 +203,7 @@ export function lineLooksLikeCodeLine(raw: string): boolean {
   // Typical editor indent (2+ spaces or tab) before code
   if (/^[\t ]{2,}\S/.test(raw)) return true
   // Short gap-fill expressions (operators, calls, literals)
-  if (t.length <= 72 && /^[\w\s+\-*/().,:'"`[\]{}=<>!?|&%;$]+$/.test(t) && /[=+(){},;:<>\-]/.test(t)) return true
+  if (t.length <= 72 && /^[\w\s+\-*/().,:'"`[\]{}=<>!?|&%;$]+$/.test(t) && /[=+(){},;:<>\-\[\]]/.test(t)) return true
   // Tiny identifier / suffix fragments (e.g. completing `a -` with `b`)
   if (t.length <= 28 && /^[\w.+\-`'"]+$/.test(t)) return true
   return false
@@ -411,7 +363,7 @@ function capInlineCompletionSize(s: string): string {
  * Strip markdown fences / language tags small models often emit around inline completions.
  * Pass the full streamed accumulator each update (handles partial ``` lines by returning '').
  */
-export function sanitizeInlineCompletion(acc: string): string {
+export function sanitizeInlineCompletion(acc: string, loose = false): string {
   let s = acc
   if (/^\s*```/.test(s)) {
     // Language tag is only word-like chars — do not use [^`\n]* or it eats the whole code line.
@@ -439,147 +391,21 @@ export function sanitizeInlineCompletion(acc: string): string {
   s = s.replace(/\r?\n```[^\n`]*$/g, '')
   s = s.replace(/```\s*$/g, '')
 
-  s = stripLeadingUntilCodeLine(s)
-  s = stripTrailingAfterLastCodeLine(s)
+  if (!loose) {
+    s = stripLeadingUntilCodeLine(s)
+    s = stripTrailingAfterLastCodeLine(s)
+    s = truncateAtTutorialNoise(s)
+  }
   s = stripLeadingChatLines(s)
   s = stripTrailingTutorialParagraph(s)
-  s = truncateAtTutorialNoise(s)
   s = capInlineCompletionSize(s)
 
-  const lines = s.replace(/\r\n/g, '\n').split('\n')
-  if (!lines.some(line => lineLooksLikeCodeLine(line))) return ''
+  if (!loose) {
+    const lines = s.replace(/\r\n/g, '\n').split('\n')
+    if (!lines.some(line => lineLooksLikeCodeLine(line))) return ''
+  }
 
   return s
-}
-
-async function* streamOllamaGenerate(
-  prompt: string,
-  signal: AbortSignal,
-  genOptions: { temperature: number; num_predict: number; stop?: readonly string[] },
-): AsyncGenerator<string> {
-  debugLog('ollama', 'generate_begin', {
-    model: OLLAMA_MODEL,
-    url: OLLAMA_URL,
-    promptChars: prompt.length,
-    numPredict: genOptions.num_predict,
-  })
-
-  let response: Response
-  try {
-    response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt,
-        stream: true,
-        options: {
-          temperature: genOptions.temperature,
-          num_predict: genOptions.num_predict,
-          ...(genOptions.stop?.length ? { stop: [...genOptions.stop] } : {}),
-        },
-      }),
-      signal,
-    })
-  } catch (err) {
-    debugLog('ollama', 'generate_fetch_failed', { error: String(err) })
-    throw err
-  }
-
-  if (!response.ok || !response.body) {
-    const text = await response.text()
-    debugLog('ollama', 'generate_bad_response', { status: response.status, bodyPreview: text.slice(0, 1200) })
-    throw new Error(`ollama ${response.status}: ${text}`)
-  }
-
-  let deltaChunks = 0
-  let deltaChars = 0
-
-  try {
-    for await (const line of readOllamaNdjsonLines(response.body)) {
-      const parsed = parseOllamaGenerateLine(line)
-      if (!parsed) continue
-      if (parsed.delta) {
-        deltaChunks++
-        deltaChars += parsed.delta.length
-        yield parsed.delta
-      }
-      if (parsed.done) return
-    }
-  } finally {
-    debugLog('ollama', 'generate_stream_end', { deltaChunks, deltaChars })
-  }
-}
-
-async function* streamOllamaChatCompletionInline(
-  systemMsg: string,
-  userMsg: string,
-  signal: AbortSignal,
-): AsyncGenerator<string> {
-  debugLog('ollama', 'inline_chat_begin', {
-    model: OLLAMA_MODEL,
-    url: OLLAMA_URL,
-    systemChars: systemMsg.length,
-    userChars: userMsg.length,
-    userTail: userMsg.slice(-160),
-  })
-
-  // Do not pass stop: ['```'] — small models often open with a fence; Ollama stops immediately → empty stream.
-  const chatBody = {
-    model: OLLAMA_MODEL,
-    options: {
-      temperature: 0.2,
-      num_predict: 220,
-    },
-    messages: [
-      { role: 'system', content: systemMsg },
-      { role: 'user', content: userMsg },
-    ],
-  }
-
-  let response: Response
-  try {
-    response = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...chatBody, stream: true }),
-      signal,
-    })
-  } catch (err) {
-    debugLog('ollama', 'inline_chat_fetch_failed', { error: String(err) })
-    throw err
-  }
-
-  if (!response.ok || !response.body) {
-    const text = await response.text()
-    debugLog('ollama', 'inline_chat_bad_response', { status: response.status, bodyPreview: text.slice(0, 1200) })
-    throw new Error(`ollama ${response.status}: ${text}`)
-  }
-
-  let deltaChunks = 0
-  let deltaChars = 0
-  const rawLineSamples: string[] = []
-
-  try {
-    for await (const line of readOllamaNdjsonLines(response.body)) {
-      const tr = line.trim()
-      if (tr && rawLineSamples.length < 3) rawLineSamples.push(tr.slice(0, 1200))
-      const parsed = parseOllamaChatLine(line)
-      if (!parsed) continue
-      if (parsed.delta) {
-        deltaChunks++
-        deltaChars += parsed.delta.length
-        yield parsed.delta
-      }
-      if (parsed.done) return
-    }
-  } finally {
-    debugLog('ollama', 'inline_chat_stream_end', {
-      deltaChunks,
-      deltaChars,
-      ...(deltaChunks === 0 ? { rawLineSamples } : {}),
-    })
-  }
 }
 
 /**
@@ -651,42 +477,14 @@ export async function* streamCompletion(
   prefix = tight.prefix
   suffix = tight.suffix
 
-  // Suppress unused-shell-context param — dropped from completion prompt (noise + wrong shape for FIM).
+  // Shell context is not used in completion prompts (noise + wrong shape for FIM).
   void shellLines
 
-  const useFim = shouldUseOllamaFimPrompt(OLLAMA_MODEL)
   debugLog('completion', 'stream_completion_route', {
-    model: OLLAMA_MODEL,
-    url: OLLAMA_URL,
-    mode: useFim ? 'fim' : 'chat',
-    cursor,
-    gapCollapsed,
-    suffixTightened: tight.tightened,
-    lineCount: lines.length,
-    prefixLen: prefix.length,
-    suffixLen: suffix.length,
-    prefixTail: prefix.slice(-120),
-    suffixHead: suffix.slice(0, 120),
+    cursor, gapCollapsed, suffixTightened: tight.tightened,
+    lineCount: lines.length, prefixLen: prefix.length, suffixLen: suffix.length,
+    prefixTail: prefix.slice(-120), suffixHead: suffix.slice(0, 120),
   })
 
-  if (useFim) {
-    const prompt = buildFimPrompt(prefix, suffix)
-    yield* streamOllamaGenerate(prompt, signal, {
-      temperature: 0.2,
-      num_predict: 220,
-      stop: FIM_STOP_SEQS,
-    })
-    return
-  }
-
-  const systemMsg =
-    'You are a code autocomplete engine. The user sends a file with a [CURSOR] marker. ' +
-    'Reply with ONLY the raw characters that should replace [CURSOR]. ' +
-    'No prose, no markdown, no quotes, no explanation, no language tag. ' +
-    'Do not repeat the [CURSOR] marker itself.'
-
-  const userMsg =
-    `File: ${filename ?? 'untitled'}\n${prefix}[CURSOR]${suffix}\n` +
-    '(Output only the text that replaces [CURSOR]; never repeat the marker.)'
-  yield* streamOllamaChatCompletionInline(systemMsg, userMsg, signal)
+  yield* getActiveProvider().streamInlineCompletion(prefix, suffix, filename, signal)
 }

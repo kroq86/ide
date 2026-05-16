@@ -6,9 +6,9 @@
   "scripts": {
     "build:native": "cargo build --release --manifest-path ../native/editor-core/Cargo.toml",
     "build": "esbuild src/main.tsx --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.js \"--alias:react=$(npm root)/react\" \"--define:process.env.NODE_ENV='production'\"",
-    "dev": "npm run build && node dist/main.js",
-    "dev:debug": "npm run build && QE_DEBUG=1 node dist/main.js",
-    "dev:ui": "npm run build && node dist/main.js",
+    "dev": "npm run build && node --env-file-if-exists=../.env dist/main.js",
+    "dev:debug": "npm run build && QE_DEBUG=1 node --env-file-if-exists=../.env dist/main.js",
+    "dev:ui": "npm run build && node --env-file-if-exists=../.env dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/leader.test.ts test/helpers.test.ts test/git.test.ts test/ai-context.test.ts test/codeclaw.test.ts test/codeclaw-trace-recorder.test.ts test/dired.test.ts test/debug-log.test.ts test/diff.test.ts",
     "test:protocol": "cargo build --release --manifest-path ../native/editor-core/Cargo.toml && node test/protocol-smoke.mjs",

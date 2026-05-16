@@ -57,6 +57,7 @@ export const COMMAND_LABELS: Record<string, string> = {
   'a l': 'ai: rerun last shell command',
   'a r': 'ai: review git diff (CodeClaw)',
   'a k': 'ai: clear chat',
+  'a m': 'ai: select model',
   'g g': 'git: status — ll commit log (Magit)',
   'g s': 'git: stage current',
   'c h': 'code: hover (LSP)',
@@ -118,6 +119,7 @@ export function buildLeaderMap(
     rerunLast: () => void
     review: () => void
     clearChat: () => void
+    selectModel: () => void
   },
   git: {
     open: () => void
@@ -172,6 +174,7 @@ export function buildLeaderMap(
       l: ai.rerunLast,
       r: ai.review,
       k: ai.clearChat,
+      m: ai.selectModel,
     },
     g: {
       g: git.open,

@@ -13,7 +13,7 @@ import {
   appendCodeClawTraceEvent,
   writeCodeClawTracePayload,
 } from './codeclaw-trace-recorder.js'
-import { OLLAMA_MODEL, OLLAMA_URL } from './ollama-env.js'
+import { getActiveProvider } from './ai-registry.js'
 
 /** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
 const FIX_PROMPT_MAX_RULES = 8000
@@ -192,16 +192,6 @@ const DEFAULT_RULES = [
   '- Prefer patches that can be verified by one command.',
 ].join('\n')
 
-/**
- * CodeClaw uses large `/api/generate` prompts; Ollama keeps models + KV cache resident by default.
- * Default `keep_alive: "0"` unloads after each CodeClaw request (same effect as restarting Ollama for RAM).
- * Set `OLLAMA_CODECLAW_KEEP_ALIVE=` (empty) to omit and use server default, or `5m` etc. to tune.
- */
-function codeClawOllamaKeepAliveField(): { keep_alive?: string } {
-  const v = process.env['OLLAMA_CODECLAW_KEEP_ALIVE']
-  if (v === '') return {}
-  return { keep_alive: v ?? '0' }
-}
 
 export function codeClawDir(cwd: string): string {
   return join(cwd, '.codeclaw')
@@ -338,49 +328,25 @@ export async function generatePatchProposal(
   const user = buildProposalUserMessage(context, cwd)
   if (recording?.traceId) {
     appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'ollama_request', {
-      detail: { model: OLLAMA_MODEL, endpoint: 'chat', url: `${OLLAMA_URL}/api/chat` },
+      detail: { endpoint: 'chat' },
     })
   }
-  const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      stream: false,
-      format: 'json',
-      // Low temperature + bounded output. num_predict must fit whole JSON; models often emit huge
-      // unifiedDiff strings — truncation yields "Unterminated string in JSON". Cap via env on weak HW.
-      options: {
-        temperature: 0.05,
-        num_predict: (() => {
-          const v = process.env['OLLAMA_CODECLAW_NUM_PREDICT']?.trim()
-          if (v && /^\d+$/.test(v)) return Math.min(8192, Math.max(512, parseInt(v, 10)))
-          return 2560
-        })(),
-      },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user',   content: user   },
-      ],
-      ...codeClawOllamaKeepAliveField(),
-    }),
-    signal,
-  })
 
-  if (!response.ok) {
-    const errBody = await response.text()
+  let raw: string
+  try {
+    raw = await getActiveProvider().complete(system, [{ role: 'user', content: user }], { format: 'json', temperature: 0.05 }, signal)
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
     if (recording?.traceId) {
-      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'fix', 'ollama_error', errBody)
+      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'fix', 'ollama_error', errMsg)
       appendCodeClawTraceEvent(cwd, recording.traceId, 'fix', 'ollama_http_error', {
         payloadRef: ref ?? undefined,
-        detail: { status: response.status },
+        detail: {},
       })
     }
-    throw new Error(`ollama ${response.status}: ${errBody}`)
+    throw err
   }
 
-  const payload = await response.json() as { message?: { content?: string } }
-  const raw = payload.message?.content ?? ''
   let rawPayloadRef: string | null = null
   if (recording?.traceId) {
     rawPayloadRef = writeCodeClawTracePayload(cwd, recording.traceId, 'fix', 'ollama_raw', raw)
@@ -721,10 +687,8 @@ ${bufferSnippet}${diskVsEditorSection}
 --- Git diff excerpt (focused file first when it has changes; then other paths) ---
 ${diffSnippet}`
 
-  debugLog('codeclaw', 'review_ollama_begin', {
+  debugLog('codeclaw', 'review_begin', {
     activePath,
-    model: OLLAMA_MODEL,
-    url: OLLAMA_URL,
     gitDiffChars: gitDiff.length,
     bufferChars: trimmedBuf.length,
     promptChars: prompt.length,
@@ -733,37 +697,25 @@ ${diffSnippet}`
 
   if (recording?.traceId) {
     appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'ollama_request', {
-      detail: { model: OLLAMA_MODEL, endpoint: 'generate', url: `${OLLAMA_URL}/api/generate`, activePath },
+      detail: { endpoint: 'generate', activePath },
     })
   }
 
-  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      prompt,
-      stream: false,
-      format: 'json',
-      ...codeClawOllamaKeepAliveField(),
-    }),
-    signal,
-  })
-
-  if (!response.ok) {
-    const errBody = await response.text()
+  let raw: string
+  try {
+    raw = await getActiveProvider().complete('', [{ role: 'user', content: prompt }], { format: 'json' }, signal)
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
     if (recording?.traceId) {
-      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'review', 'ollama_error', errBody)
+      const ref = writeCodeClawTracePayload(cwd, recording.traceId, 'review', 'ollama_error', errMsg)
       appendCodeClawTraceEvent(cwd, recording.traceId, 'review', 'ollama_http_error', {
         payloadRef: ref ?? undefined,
-        detail: { status: response.status },
+        detail: {},
       })
     }
-    throw new Error(`ollama ${response.status}: ${errBody}`)
+    throw err
   }
 
-  const payload = await response.json() as { response?: string }
-  const raw = payload.response ?? ''
   let rawPayloadRef: string | null = null
   if (recording?.traceId) {
     rawPayloadRef = writeCodeClawTracePayload(cwd, recording.traceId, 'review', 'ollama_raw', raw)
@@ -778,9 +730,8 @@ ${diffSnippet}`
     proposal.findings = filterReviewFindingsAgainstActiveBuffer(activePath, trimmedBuf, proposal.findings)
     if (rawFindingCount > 0 && proposal.findings.length === 0) proposal.safeToCommit = true
   }
-  debugLog('codeclaw', 'review_ollama_end', {
+  debugLog('codeclaw', 'review_end', {
     activePath,
-    model: OLLAMA_MODEL,
     rawResponseChars: raw.length,
     rawFindingCount,
     filteredFindingCount: proposal.findings.length,
