@@ -358,3 +358,16 @@ function appendTail(run: ShellRun, field: 'stdout' | 'stderr', line: string): vo
 function trimTail(text: string): string {
   return text.replace(/\r/g, '').split('\n').slice(-200).join('\n').trimEnd()
 }
+
+export function checkCommandDanger(cmd: string): { dangerous: true; reason: string } | { dangerous: false } {
+  const tokens = cmd.trim().split(/\s+/)
+  const base = tokens[0] ?? ''
+  if (base === 'rm') {
+    const flags = tokens.slice(1).filter(t => t.startsWith('-')).join('')
+    if (/f/.test(flags)) return { dangerous: true, reason: 'rm with -f flag' }
+  }
+  if (base === 'sudo') return { dangerous: true, reason: 'sudo command' }
+  if (/>\s*\//.test(cmd) || />\s*~/.test(cmd)) return { dangerous: true, reason: 'redirect to root/home' }
+  if (cmd.includes(':()', )) return { dangerous: true, reason: 'potential fork bomb' }
+  return { dangerous: false }
+}

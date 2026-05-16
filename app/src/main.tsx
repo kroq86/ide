@@ -1,11 +1,11 @@
 import React from 'react'
-import { realpathSync } from 'node:fs'
+import { realpathSync, readdirSync, statSync } from 'node:fs'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { AlternateScreen, Box, Text, render, useInput, type Instance } from 'terminal-react-core'
 import { QeSidecar, type LspResponse, type Snapshot, type SyntaxToken } from './protocol.js'
-import { ShellSidecar, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
+import { ShellSidecar, checkCommandDanger, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
 import { streamCompletion, streamChat, sanitizeInlineCompletion, type AiContext } from './ai.js'
 import { getProviderLabel, setActiveModel, listAvailableModels, isOllamaActive } from './ai-registry.js'
 import {
@@ -115,14 +115,18 @@ type EditorBuffer = {
   jumpTo?: { row: number; col: number }
 }
 
+type FuzzyMatch = { path: string; score: number; indices: number[] }
+
 type PromptState =
   | { type: 'buffer'; query: string; selected: number }
-  | { type: 'file'; query: string }
+  | { type: 'file'; query: string; candidates: string[]; ranked: FuzzyMatch[]; selectedIdx: number }
   | { type: 'saveAs'; query: string; thenQuit?: boolean }
   | { type: 'commit'; message: string }
   | { type: 'model'; query: string; candidates: string[]; selected: number }
 
 type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
+
+type ChatStreamingState = { committedLines: string[]; tail: string }
 
 type LspTarget = { path?: string; row?: number; col?: number }
 
@@ -586,7 +590,7 @@ function filterBuffers(buffers: EditorBuffer[], query: string): EditorBuffer[] {
 // ── Shell pane ────────────────────────────────────────────────────────────────
 
 function ShellPane({
-  lines, rows, focused, mode, input, running, height, scrollOffset,
+  lines, rows, focused, mode, input, running, height, scrollOffset, dangerPrompt,
 }: {
   lines: ShellLine[]
   rows: number
@@ -596,6 +600,7 @@ function ShellPane({
   running: boolean
   height: number
   scrollOffset: number
+  dangerPrompt: { cmd: string; reason: string } | null
 }) {
   const maxVisible = Math.max(1, rows - 1)
   const clampedOffset = Math.min(scrollOffset, Math.max(0, lines.length - maxVisible))
@@ -614,11 +619,17 @@ function ShellPane({
             <Text key={i} color={l.isError ? C.red : C.fg} wrap="truncate">{l.text || ' '}</Text>
           ))
       }
-      {mode === 'runner' && (
+      {mode === 'runner' && !dangerPrompt && (
         <Box flexDirection="row">
           <Text color={C.cyan}>{'$ '}</Text>
           <Text color={C.fg}>{input}</Text>
           {focused && <Text color={C.grey}>_</Text>}
+        </Box>
+      )}
+      {mode === 'runner' && dangerPrompt && (
+        <Box flexDirection="row">
+          <Text backgroundColor={C.red} color={C.bg}>{` Dangerous: ${dangerPrompt.reason} `}</Text>
+          <Text color={C.grey}>{`  Enter=run  Esc=cancel`}</Text>
         </Box>
       )}
       {mode === 'pty' && focused && <Text color={C.grey}>Enter=tracked run  Esc=editor</Text>}
@@ -689,17 +700,19 @@ function fixOverlayCoversMessages(fixState: CodeClawFixState): boolean {
 }
 
 function AiPanel({
-  messages, input, streaming, focused, width, height, navHint, shellHint, fixState, reviewState, scrollOffset, thinkingTick,
+  messages, input, streaming, chatStreaming, focused, width, height, navHint, shellHint, fixState, clawProgressChars, reviewState, scrollOffset, thinkingTick,
 }: {
   messages: AiMessage[]
   input: string
   streaming: boolean
+  chatStreaming: ChatStreamingState | null
   focused: boolean
   width: number
   height: number
   navHint?: string
   shellHint?: string
   fixState: CodeClawFixState
+  clawProgressChars: number
   reviewState: ReviewState
   scrollOffset: number
   /** Incremented on an interval while the AI panel is busy (stream / CodeClaw). */
@@ -710,7 +723,7 @@ function AiPanel({
   const sliceEnd = clampedOffset === 0 ? undefined : -clampedOffset
   const visible = messages.slice(-msgAreaRows - clampedOffset, sliceEnd)
   const hiddenAbove = Math.max(0, messages.length - msgAreaRows - clampedOffset)
-  const fixLines = codeClawFixLines(fixState, msgAreaRows, thinkingTick)
+  const fixLines = codeClawFixLines(fixState, msgAreaRows, thinkingTick, clawProgressChars)
   const reviewLns = reviewLines(reviewState, msgAreaRows, thinkingTick)
   const fixOverlay = fixOverlayCoversMessages(fixState)
   /** Active fix/review overlays beat chat; terminal success (`done`) does not — `error` uses fix overlay so it isn’t hidden by stale review. */
@@ -752,24 +765,40 @@ function AiPanel({
               {(() => {
                 const sepLen = Math.max(12, Math.min(Math.max(4, width - 6), 72))
                 const sepLine = '─'.repeat(sepLen)
-                return visible.map((msg, i) => (
-                  <React.Fragment key={i}>
-                    <Box flexDirection="column" marginBottom={1}>
-                      <Text bold color={msg.role === 'user' ? C.cyan : msg.error ? C.red : C.green}>
-                        {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
-                      </Text>
-                      <Text color={msg.error ? C.red : C.fg} wrap="wrap">
-                        {msg.content}
-                        {streaming && i === visible.length - 1
-                          ? (msg.content ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`)
-                          : ''}
-                      </Text>
-                    </Box>
-                    {msg.role === 'assistant' && visible[i + 1] !== undefined && (
-                      <Text color={C.grey}>{sepLine}</Text>
-                    )}
-                  </React.Fragment>
-                ))
+                const isLastMsg = (i: number) => i === visible.length - 1
+                return visible.map((msg, i) => {
+                  const isLast = isLastMsg(i)
+                  const isStreamingLast = isLast && streaming && chatStreaming !== null && msg.role === 'assistant'
+                  return (
+                    <React.Fragment key={i}>
+                      <Box flexDirection="column" marginBottom={1}>
+                        <Text bold color={msg.role === 'user' ? C.cyan : msg.error ? C.red : C.green}>
+                          {msg.role === 'user' ? 'You' : msg.error ? 'Error' : 'AI'}
+                        </Text>
+                        {isStreamingLast ? (
+                          <Box flexDirection="column">
+                            {chatStreaming.committedLines.map((line, li) => (
+                              <Text key={li} color={C.fg} wrap="wrap">{line}</Text>
+                            ))}
+                            <Text color={C.fg} wrap="wrap">
+                              {chatStreaming.tail}{chatStreaming.tail ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`}
+                            </Text>
+                          </Box>
+                        ) : (
+                          <Text color={msg.error ? C.red : C.fg} wrap="wrap">
+                            {msg.content}
+                            {streaming && isLast && !chatStreaming
+                              ? (msg.content ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : `${thinkingSpinnerGlyph(thinkingTick)} ▋`)
+                              : ''}
+                          </Text>
+                        )}
+                      </Box>
+                      {msg.role === 'assistant' && visible[i + 1] !== undefined && (
+                        <Text color={C.grey}>{sepLine}</Text>
+                      )}
+                    </React.Fragment>
+                  )
+                })
               })()}
             </>
         }
@@ -795,12 +824,14 @@ function codeClawFixLines(
   state: CodeClawFixState,
   maxRows: number,
   thinkingTick: number,
+  progressChars = 0,
 ): Array<{ text: string; color: ThemeColor; wrap?: 'wrap' | 'truncate' }> {
   if (state.status === 'idle') return []
   if (state.status === 'generating') {
+    const prog = progressChars > 0 ? `  ${progressChars} chars streamed…` : ''
     return [
       { text: thinkingPrefixedLine(thinkingTick, 'CodeClaw fix'), color: C.cyan },
-      { text: thinkingPrefixedLine(thinkingTick, 'Building session context and asking AI for a structured patch…'), color: C.grey, wrap: 'wrap' },
+      { text: thinkingPrefixedLine(thinkingTick, `Streaming AI response…${prog}`), color: C.grey, wrap: 'wrap' },
     ]
   }
   if (state.status === 'applying') {
@@ -1318,6 +1349,37 @@ function EditorPane({
   return (
     <Box flexDirection="column" width={paneWidth} height={paneHeight}>
       <Box flexDirection="column">
+        {prompt?.type === 'file' && (() => {
+          const windowSize = 10
+          const scrollStart = Math.max(0, Math.min(prompt.selectedIdx - Math.floor(windowSize / 2), prompt.ranked.length - windowSize))
+          const visible = prompt.ranked.slice(scrollStart, scrollStart + windowSize)
+          return (
+            <Box flexDirection="column">
+              <Box flexDirection="row">
+                <Text backgroundColor={C.violet} color={C.bg}> find file </Text>
+                <Text color={C.grey}>{`  ${prompt.query || '(type to filter)'}_  ↑↓=navigate  Enter=open  Esc=cancel`}</Text>
+              </Box>
+              {visible.length === 0
+                ? <Text color={C.grey}>  no files match</Text>
+                : visible.map((match, index) => {
+                    const isSelected = scrollStart + index === prompt.selectedIdx
+                    const chars = match.path.split('')
+                    const indexSet = new Set(match.indices)
+                    return (
+                      <Box key={match.path} flexDirection="row">
+                        <Text color={isSelected ? C.bg : C.grey} backgroundColor={isSelected ? C.violet : undefined}>{' '}</Text>
+                        <Box flexDirection="row" backgroundColor={isSelected ? C.bg : undefined}>
+                          {chars.map((ch, ci) => (
+                            <Text key={ci} color={indexSet.has(ci) ? C.cyan : (isSelected ? C.fg : C.grey)}>{ch}</Text>
+                          ))}
+                        </Box>
+                      </Box>
+                    )
+                  })}
+              {scrollStart > 0 && <Text color={C.grey}>{`  ↑ ${scrollStart} more`}</Text>}
+            </Box>
+          )
+        })()}
         {prompt?.type === 'model' && (() => {
           const q = prompt.query.toLowerCase()
           const filtered = prompt.candidates.filter(m => !q || m.toLowerCase().includes(q))
@@ -1388,6 +1450,51 @@ function EditorPane({
   )
 }
 
+// ── Fuzzy file finder helpers ─────────────────────────────────────────────────
+
+function fuzzyScore(needle: string, haystack: string): { score: number; indices: number[] } | null {
+  const n = needle.toLowerCase(), h = haystack.toLowerCase()
+  if (!n) return { score: 0, indices: [] }
+  const indices: number[] = []
+  let hi = 0
+  for (let ni = 0; ni < n.length; ni++) {
+    const found = h.indexOf(n[ni]!, hi)
+    if (found === -1) return null
+    indices.push(found)
+    hi = found + 1
+  }
+  const span = indices[indices.length - 1]! - indices[0]!
+  const prefixBonus = h.startsWith(n) ? -100 : 0
+  return { score: span + prefixBonus, indices }
+}
+
+function fuzzyRank(needle: string, candidates: string[]): FuzzyMatch[] {
+  return candidates
+    .map(path => { const r = fuzzyScore(needle, path); return r ? { path, score: r.score, indices: r.indices } : null })
+    .filter((x): x is FuzzyMatch => x !== null)
+    .sort((a, b) => a.score - b.score)
+}
+
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', '__pycache__', '.cache'])
+
+function collectFiles(dir: string, depth: number, base: string, out: string[]): void {
+  if (depth > 4) return
+  let entries: string[]
+  try { entries = readdirSync(dir) } catch { return }
+  for (const entry of entries) {
+    if (entry.startsWith('.') && entry !== '.') continue
+    if (SKIP_DIRS.has(entry)) continue
+    const full = join(dir, entry)
+    let st
+    try { st = statSync(full) } catch { continue }
+    if (st.isDirectory()) {
+      collectFiles(full, depth + 1, base, out)
+    } else {
+      out.push(full.slice(base.length + 1))
+    }
+  }
+}
+
 // ── Main app component ────────────────────────────────────────────────────────
 
 function App({
@@ -1442,15 +1549,18 @@ function App({
 
   const [aiModelLabel,   setAiModelLabel]   = React.useState(() => getProviderLabel())
   const [aiMessages,     setAiMessages]     = React.useState<AiMessage[]>([])
+  const [chatStreaming,  setChatStreaming]   = React.useState<ChatStreamingState | null>(null)
   const [aiInput,        setAiInput]        = React.useState('')
   const [aiStreaming,    setAiStreaming]     = React.useState(false)
   const [aiScrollOffset, setAiScrollOffset] = React.useState(0)
   const [fixState, setFixState] = React.useState<CodeClawFixState>({ status: 'idle' })
+  const [clawProgressChars, setClawProgressChars] = React.useState(0)
   const [reviewState, setReviewState] = React.useState<ReviewState>({ status: 'idle' })
   const [thinkingTick, setThinkingTick] = React.useState(0)
   const [shellInput, setShellInput] = React.useState('')
   const [shellRunning, setShellRunning] = React.useState(false)
   const [shellScrollOffset, setShellScrollOffset] = React.useState(0)
+  const [dangerPrompt, setDangerPrompt] = React.useState<{ cmd: string; reason: string } | null>(null)
 
   const aiPanelBusy =
     aiStreaming
@@ -1585,7 +1695,10 @@ function App({
       },
       openFilePrompt: () => {
         enterNormal()
-        setPrompt({ type: 'file', query: '' })
+        const base = process.cwd()
+        const candidates: string[] = []
+        collectFiles(base, 0, base, candidates)
+        setPrompt({ type: 'file', query: '', candidates, ranked: candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] })), selectedIdx: 0 })
       },
       next: actions.nextBuffer,
       previous: actions.previousBuffer,
@@ -1695,24 +1808,31 @@ function App({
       projectMemory: memory || undefined,
     }
 
+    setChatStreaming({ committedLines: [], tail: '' })
     void (async () => {
+      let fullContent = ''
       try {
         for await (const chunk of streamChat([...aiMessages, userMsg], ctx, ctrl.signal)) {
-          setAiMessages(prev => {
-            const msgs = [...prev]
-            const last = msgs[msgs.length - 1]
-            if (last?.role === 'assistant') {
-              msgs[msgs.length - 1] = { ...last, content: last.content + chunk }
-            }
-            return msgs
+          fullContent += chunk
+          setChatStreaming(prev => {
+            const combined = (prev?.tail ?? '') + chunk
+            const parts = combined.split('\n')
+            const tail = parts.pop() ?? ''
+            const newLines = parts.map(l => l + '\n')
+            return { committedLines: [...(prev?.committedLines ?? []), ...newLines], tail }
           })
         }
+        setAiMessages(prev => {
+          const msgs = [...prev]
+          const last = msgs[msgs.length - 1]
+          if (last?.role === 'assistant') msgs[msgs.length - 1] = { ...last, content: fullContent }
+          return msgs
+        })
       } catch (err) {
         if (ctrl.signal.aborted) {
-          // Remove the trailing assistant bubble only if it received no content
           setAiMessages(prev => {
             const last = prev[prev.length - 1]
-            return last?.role === 'assistant' && !last.content ? prev.slice(0, -1) : prev
+            return last?.role === 'assistant' && !last.content && !fullContent ? prev.slice(0, -1) : prev
           })
         } else {
           const msg = err instanceof Error ? err.message : String(err)
@@ -1728,6 +1848,7 @@ function App({
           })
         }
       }
+      setChatStreaming(null)
       setAiStreaming(false)
       setAiScrollOffset(0)
     })()
@@ -1737,6 +1858,7 @@ function App({
     aiAbortRef.current?.abort()
     aiAbortRef.current = null
     setAiStreaming(false)
+    setChatStreaming(null)
     setAiMessages([])
     setAiScrollOffset(0)
     setAiInput('')
@@ -1860,10 +1982,14 @@ function App({
     const ctrl = new AbortController()
     aiAbortRef.current = ctrl
 
+    setClawProgressChars(0)
     void (async () => {
       try {
         const tasks = loadTasks(process.cwd())
-        const proposal = await generatePatchProposal(context, ctrl.signal, tasks, process.cwd(), { traceId })
+        const proposal = await generatePatchProposal(
+          context, ctrl.signal, tasks, process.cwd(), { traceId },
+          (chars) => setClawProgressChars(chars),
+        )
         setFixState({ status: 'proposal', traceId, startedAt, context, proposal, risk: assessPatchRisk(proposal), mediumConfirm: false })
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
@@ -2429,22 +2555,37 @@ function App({
 
     // ── Shell panel ──────────────────────────────────────────────────────────
     if (panel?.type === 'shell') {
-      if (key.escape)                                  { setShellScrollOffset(0); setPanel(null); return }
+      if (key.escape) {
+        if (dangerPrompt) { setDangerPrompt(null); return }
+        setShellScrollOffset(0); setPanel(null); return
+      }
       if (shell.mode === 'runner') {
         if (key.upArrow)   { setShellScrollOffset(prev => prev + 1); return }
         if (key.downArrow) { setShellScrollOffset(prev => Math.max(0, prev - 1)); return }
         if (key.return) {
+          if (dangerPrompt) {
+            const cmd = dangerPrompt.cmd
+            setDangerPrompt(null)
+            setShellScrollOffset(0)
+            setShellRunning(true)
+            void shell.runTracked(cmd).finally(() => setShellRunning(false))
+            return
+          }
           const cmd = shellInput.trim()
           if (!cmd || shellRunning) return
+          const danger = checkCommandDanger(cmd)
+          if (danger.dangerous) { setDangerPrompt({ cmd, reason: danger.reason }); return }
           setShellInput('')
           setShellScrollOffset(0)
           setShellRunning(true)
           void shell.runTracked(cmd).finally(() => setShellRunning(false))
           return
         }
-        if (key.backspace || key.delete) { setShellInput(prev => prev.slice(0, -1)); return }
-        if (key.ctrl && input === 'c') { shell.cancelRunner(); setShellRunning(false); return }
-        if (!key.ctrl && !key.meta && printableText(input)) { setShellInput(prev => prev + input); return }
+        if (!dangerPrompt) {
+          if (key.backspace || key.delete) { setShellInput(prev => prev.slice(0, -1)); return }
+          if (key.ctrl && input === 'c') { shell.cancelRunner(); setShellRunning(false); return }
+          if (!key.ctrl && !key.meta && printableText(input)) { setShellInput(prev => prev + input); return }
+        }
         return
       }
       if (input === 'o') {
@@ -2524,17 +2665,37 @@ function App({
     if (prompt?.type === 'file') {
       if (key.escape) { enterNormal(); return }
       if (key.return) {
-        const path = prompt.query.trim()
-        if (path) actions.openFile(path)
+        const chosen = prompt.ranked[prompt.selectedIdx]?.path ?? prompt.query.trim()
+        if (chosen) actions.openFile(resolvePath(process.cwd(), chosen))
         enterNormal()
         return
       }
+      if (key.upArrow) {
+        setPrompt(prev => prev?.type === 'file' ? { ...prev, selectedIdx: Math.max(0, prev.selectedIdx - 1) } : prev)
+        return
+      }
+      if (key.downArrow) {
+        setPrompt(prev => prev?.type === 'file'
+          ? { ...prev, selectedIdx: Math.min(Math.max(0, prev.ranked.length - 1), prev.selectedIdx + 1) }
+          : prev)
+        return
+      }
       if (key.backspace || key.delete) {
-        setPrompt(prev => prev?.type === 'file' ? { ...prev, query: prev.query.slice(0, -1) } : prev)
+        setPrompt(prev => {
+          if (prev?.type !== 'file') return prev
+          const query = prev.query.slice(0, -1)
+          const ranked = query ? fuzzyRank(query, prev.candidates).slice(0, 50) : prev.candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] }))
+          return { ...prev, query, ranked, selectedIdx: 0 }
+        })
         return
       }
       if (!key.ctrl && !key.meta && printable(input)) {
-        setPrompt(prev => prev?.type === 'file' ? { ...prev, query: prev.query + input } : prev)
+        setPrompt(prev => {
+          if (prev?.type !== 'file') return prev
+          const query = prev.query + input
+          const ranked = fuzzyRank(query, prev.candidates).slice(0, 50)
+          return { ...prev, query, ranked, selectedIdx: 0 }
+        })
         return
       }
       return
@@ -3036,12 +3197,14 @@ function App({
           messages={aiMessages}
           input={aiInput}
           streaming={aiStreaming}
+          chatStreaming={chatStreaming}
           focused={panel.focused}
           width={aiWidth}
           height={totalRows}
           navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
           shellHint={aiShellCmd ? aiShellCmd.split('\n')[0] : undefined}
           fixState={fixState}
+          clawProgressChars={clawProgressChars}
           reviewState={reviewState}
           scrollOffset={aiScrollOffset}
           thinkingTick={thinkingTick}
@@ -3099,6 +3262,7 @@ function App({
           running={shellRunning}
           height={panelRows}
           scrollOffset={shellScrollOffset}
+          dangerPrompt={dangerPrompt}
         />
       )}
       {panel?.type === 'dired' && (

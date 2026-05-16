@@ -15,6 +15,33 @@ import {
 } from './codeclaw-trace-recorder.js'
 import { getActiveProvider } from './ai-registry.js'
 
+class StreamingJsonExtractor {
+  private buf = ''
+  private depth = 0
+  private inString = false
+  private escape = false
+  private started = false
+
+  push(chunk: string): string | null {
+    for (const ch of chunk) {
+      if (this.escape) { this.buf += ch; this.escape = false; continue }
+      if (ch === '\\' && this.inString) { this.buf += ch; this.escape = true; continue }
+      if (ch === '"') this.inString = !this.inString
+      if (!this.inString) {
+        if (ch === '{') { this.depth++; this.started = true }
+        else if (ch === '}') this.depth--
+      }
+      if (this.started) this.buf += ch
+      if (this.started && this.depth === 0) {
+        const result = this.buf
+        this.buf = ''; this.depth = 0; this.started = false; this.inString = false; this.escape = false
+        return result
+      }
+    }
+    return null
+  }
+}
+
 /** Limits for the fix prompt only — keeps Ollama RAM/context down; traces still use full `FixContext` where saved separately. */
 const FIX_PROMPT_MAX_RULES = 8000
 const FIX_PROMPT_MAX_GIT_STATUS = 4000
@@ -323,6 +350,7 @@ export async function generatePatchProposal(
   tasks: CodeClawTask[] = [],
   cwd: string = process.cwd(),
   recording?: CodeClawOllamaRecording,
+  onProgress?: (chars: number) => void,
 ): Promise<PatchProposal> {
   const system = buildProposalSystemPrompt(context, tasks)
   const user = buildProposalUserMessage(context, cwd)
@@ -334,7 +362,16 @@ export async function generatePatchProposal(
 
   let raw: string
   try {
-    raw = await getActiveProvider().complete(system, [{ role: 'user', content: user }], { format: 'json', temperature: 0.05 }, signal)
+    const extractor = new StreamingJsonExtractor()
+    let totalChars = 0
+    let extracted: string | null = null
+    for await (const chunk of getActiveProvider().streamChatMessages(system, [{ role: 'user', content: user }], signal)) {
+      totalChars += chunk.length
+      onProgress?.(totalChars)
+      extracted = extractor.push(chunk)
+      if (extracted !== null) break
+    }
+    raw = extracted ?? ''
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
     if (recording?.traceId) {
