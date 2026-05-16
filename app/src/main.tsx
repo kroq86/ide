@@ -1,5 +1,6 @@
 import React from 'react'
-import { realpathSync, readdirSync, statSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
+import { readdir } from 'node:fs/promises'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -1477,22 +1478,19 @@ function fuzzyRank(needle: string, candidates: string[]): FuzzyMatch[] {
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', '__pycache__', '.cache'])
 
-function collectFiles(dir: string, depth: number, base: string, out: string[]): void {
-  if (depth > 4) return
-  let entries: string[]
-  try { entries = readdirSync(dir) } catch { return }
-  for (const entry of entries) {
-    if (entry.startsWith('.') && entry !== '.') continue
-    if (SKIP_DIRS.has(entry)) continue
-    const full = join(dir, entry)
-    let st
-    try { st = statSync(full) } catch { continue }
-    if (st.isDirectory()) {
-      collectFiles(full, depth + 1, base, out)
-    } else {
-      out.push(full.slice(base.length + 1))
-    }
-  }
+async function collectFilesAsync(dir: string, depth: number, base: string): Promise<string[]> {
+  if (depth > 4) return []
+  let entries: import('node:fs').Dirent[]
+  try { entries = await readdir(dir, { withFileTypes: true, encoding: 'utf8' }) } catch { return [] }
+  const results = await Promise.all(
+    entries
+      .filter(e => !e.name.startsWith('.') && !SKIP_DIRS.has(e.name))
+      .map(async e => {
+        if (e.isDirectory()) return collectFilesAsync(join(dir, e.name), depth + 1, base)
+        return [join(dir, e.name).slice(base.length + 1)]
+      }),
+  )
+  return results.flat()
 }
 
 // ── Main app component ────────────────────────────────────────────────────────
@@ -1568,6 +1566,10 @@ function App({
     || fixState.status === 'applying'
     || reviewState.status === 'generating'
     || completionStreaming
+
+  React.useEffect(() => {
+    if (panel?.type !== 'shell') setDangerPrompt(null)
+  }, [panel])
 
   React.useEffect(() => {
     if (!aiPanelBusy) return
@@ -1696,9 +1698,16 @@ function App({
       openFilePrompt: () => {
         enterNormal()
         const base = process.cwd()
-        const candidates: string[] = []
-        collectFiles(base, 0, base, candidates)
-        setPrompt({ type: 'file', query: '', candidates, ranked: candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] })), selectedIdx: 0 })
+        setPrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0 })
+        collectFilesAsync(base, 0, base).then(candidates => {
+          setPrompt(prev => {
+            if (prev?.type !== 'file') return prev
+            const ranked = prev.query
+              ? fuzzyRank(prev.query, candidates).slice(0, 50)
+              : candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] }))
+            return { ...prev, candidates, ranked }
+          })
+        }).catch(() => {})
       },
       next: actions.nextBuffer,
       previous: actions.previousBuffer,
