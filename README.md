@@ -76,6 +76,8 @@ Root [`package.json`](package.json): `dev` = `build:native` + `npm --prefix app 
 
 Press **`SPC p e`** to open or create a starter config. For a new TypeScript config, `qe` also creates `~/.config/qe/config-api.ts` beside it, so the generated config is portable across machines and does not depend on this repo living at a hardcoded path.
 
+The behavioral contract for loading, actions, hooks, command overrides, generated typing helpers, and prompt cancellation lives in [`docs/config-spec.md`](docs/config-spec.md).
+
 Example:
 
 ```ts
@@ -114,7 +116,7 @@ export default defineConfig({
     onSave: async (ctx) => {
       if (ctx.filename?.endsWith('.ts')) await ctx.commands.run('code.format')
     },
-    // onChange is debounced. Keep it quick; prefer commands/directives over prompts.
+    // onChange fires only after content revision changes and is debounced by 250ms.
   },
 })
 ```

@@ -20,6 +20,7 @@ export class CommandRegistry {
   #commands = new Map<string, RegisteredCommand>()
 
   register(id: string, label: string, run: CommandHandler): void {
+    // User config intentionally uses the same registry as built-ins: last registration wins.
     this.#commands.set(id, { id, label, run })
   }
 
@@ -81,7 +82,7 @@ export async function executeActionResult(
   registry: CommandRegistry,
 ): Promise<void> {
   const resolved = await result
-  if (!resolved) return
+  if (!resolved || typeof resolved !== 'object') return
   if (Array.isArray(resolved)) {
     await executeDirectives(resolved, ctx, registry)
   } else {
@@ -131,6 +132,11 @@ export async function executeDirective(
     case 'ui.notify':
       ctx.ui.notify(directive.message, directive.level)
       break
+    default: {
+      const unknownType = String((directive as { type?: unknown }).type)
+      ctx.ui.notify(`unknown directive: ${unknownType}`, 'error')
+      break
+    }
   }
 }
 
@@ -139,6 +145,7 @@ function isCommandInvocation(value: ConfigAction): value is ConfigCommand {
     value
     && typeof value === 'object'
     && !Array.isArray(value)
+    && !('type' in value)
     && 'command' in value
     && typeof (value as ConfigCommand).command === 'string',
   )

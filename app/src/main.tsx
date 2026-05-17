@@ -49,6 +49,9 @@ import {
   type ConfigPickItem, type EditorContext, type LeaderTree, type QeConfig,
 } from './config.js'
 import { CommandRegistry, registerConfigCommands, runConfigAction } from './config-runtime.js'
+import { configApiTemplate, starterConfigTemplate } from './config-api-template.js'
+import { onChangeDecision } from './config-hooks.js'
+import { configPromptCancelValue, isConfigPromptType } from './config-ui.js'
 import {
   loadGitStatus, loadFileHunks, getGitRepoRoot, hunkNewStartRow, resolveRepoFilePath, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
   getGitLog, buildGitDisplayLines,
@@ -122,6 +125,7 @@ type EditorBuffer = {
   status: string
   lastUsedAt: number
   jumpTo?: { row: number; col: number }
+  openHookFired?: boolean
 }
 
 type FuzzyMatch = { path: string; score: number; indices: number[] }
@@ -135,6 +139,12 @@ type PromptState =
   | { type: 'configPick'; id: number; title: string; query: string; items: NormalizedPickItem[]; selected: number }
   | { type: 'configInput'; id: number; title: string; value: string }
   | { type: 'configConfirm'; id: number; title: string; body?: string }
+
+type ConfigPromptState = Extract<PromptState, { type: 'configPick' | 'configInput' | 'configConfirm' }>
+
+function isConfigPrompt(prompt: PromptState | null): prompt is ConfigPromptState {
+  return Boolean(prompt && isConfigPromptType(prompt.type))
+}
 
 type AiMessage = { role: 'user' | 'assistant'; content: string; error?: boolean }
 
@@ -1735,6 +1745,19 @@ function App({
   const [prompt,         setPrompt]         = React.useState<PromptState | null>(null)
   const uiPromptIdRef = React.useRef(1)
   const uiPromptResolversRef = React.useRef(new Map<number, (value: unknown) => void>())
+  const replacePrompt = React.useCallback((next: PromptState | null) => {
+    setPrompt(prev => {
+      if (isConfigPrompt(prev)) {
+        const sameConfigPrompt = isConfigPrompt(next) && next.id === prev.id
+        if (!sameConfigPrompt) {
+          const resolver = uiPromptResolversRef.current.get(prev.id)
+          uiPromptResolversRef.current.delete(prev.id)
+          resolver?.(configPromptCancelValue(prev.type))
+        }
+      }
+      return next
+    })
+  }, [])
 
   const [aiModelLabel,   setAiModelLabel]   = React.useState(() => getProviderLabel())
   const [aiMessages,     setAiMessages]     = React.useState<AiMessage[]>([])
@@ -1781,7 +1804,7 @@ function App({
     abortRef.current = null
     setCompletionStreaming(false)
     setGhostTextSync(null)
-    setPrompt(null)
+    replacePrompt(null)
     pendingKeyRef.current = null
     setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
     setMode('normal')
@@ -1790,7 +1813,7 @@ function App({
     visualExpandHistoryRef.current = []
     setCmdBuf('')
     setSearchBuf('')
-  }, [setGhostTextSync])
+  }, [replacePrompt, setGhostTextSync])
 
   const yankText = React.useCallback((text: string, lineWise: boolean) => {
     yankRegisterRef.current = { text, lineWise }
@@ -1806,8 +1829,8 @@ function App({
       return
     }
     enterNormal()
-    setPrompt({ type: 'saveAs', query: '', thenQuit: false })
-  }, [activeBuffer.filename, enterNormal, sidecar, snapshot?.filename])
+    replacePrompt({ type: 'saveAs', query: '', thenQuit: false })
+  }, [activeBuffer.filename, enterNormal, replacePrompt, sidecar, snapshot?.filename])
 
   const saveBufferAndQuit = React.useCallback(() => {
     const path = snapshot?.filename ?? activeBuffer.filename ?? null
@@ -1817,8 +1840,8 @@ function App({
       return
     }
     enterNormal()
-    setPrompt({ type: 'saveAs', query: '', thenQuit: true })
-  }, [actions, activeBuffer.filename, enterNormal, sidecar, snapshot?.filename])
+    replacePrompt({ type: 'saveAs', query: '', thenQuit: true })
+  }, [actions, activeBuffer.filename, enterNormal, replacePrompt, sidecar, snapshot?.filename])
 
   // Reset editor state whenever the active buffer changes
   React.useEffect(() => {
@@ -1826,7 +1849,7 @@ function App({
     abortRef.current = null
     setCompletionStreaming(false)
     setGhostTextSync(null)
-    setPrompt(null)
+    replacePrompt(null)
     pendingKeyRef.current = null
     setMode('normal')
     setVisualAnchor(null)
@@ -1841,7 +1864,7 @@ function App({
     setAiScrollOffset(0)
     setPanel(prev => prev?.type === 'ai' ? { type: 'ai', focused: false } : null)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bufferKey])
+  }, [bufferKey, replacePrompt])
 
   // Parse first navigable location from last AI response (recomputed when streaming ends)
   const aiNavLoc = React.useMemo<ParsedLocation | null>(() => {
@@ -1866,7 +1889,7 @@ function App({
 
   const openFilePromptFromRoot = React.useCallback((root: string) => {
     enterNormal()
-    setPrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0, base: root })
+    replacePrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0, base: root })
     collectFilesAsync(root, 0, root).then(candidates => {
       setPrompt(prev => {
         if (prev?.type !== 'file') return prev
@@ -1876,7 +1899,7 @@ function App({
         return { ...prev, candidates, ranked }
       })
     }).catch(() => {})
-  }, [enterNormal])
+  }, [enterNormal, replacePrompt])
 
   const setStatus = React.useCallback((message: string) => {
     actions.setActiveBufferStatus(message)
@@ -1975,25 +1998,25 @@ function App({
     const normalized = normalizePickItems(items)
     return new Promise(resolve => {
       uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
-      setPrompt({ type: 'configPick', id, title, query: '', items: normalized, selected: 0 })
+      replacePrompt({ type: 'configPick', id, title, query: '', items: normalized, selected: 0 })
     })
-  }, [])
+  }, [replacePrompt])
 
   const uiInput = React.useCallback((title: string, initial = ''): Promise<string | null> => {
     const id = uiPromptIdRef.current++
     return new Promise(resolve => {
       uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
-      setPrompt({ type: 'configInput', id, title, value: initial })
+      replacePrompt({ type: 'configInput', id, title, value: initial })
     })
-  }, [])
+  }, [replacePrompt])
 
   const uiConfirm = React.useCallback((title: string, body?: string): Promise<boolean> => {
     const id = uiPromptIdRef.current++
     return new Promise(resolve => {
       uiPromptResolversRef.current.set(id, resolve as (value: unknown) => void)
-      setPrompt({ type: 'configConfirm', id, title, body })
+      replacePrompt({ type: 'configConfirm', id, title, body })
     })
-  }, [])
+  }, [replacePrompt])
 
   const openNamedPanel = React.useCallback((name: ConfigPanelName) => {
     if (name === 'shell') setPanel({ type: 'shell' })
@@ -2014,7 +2037,7 @@ function App({
     registry.register('buffer.switch', 'buffer: switch', () => {
       const sorted = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
       const selected = Math.max(0, sorted.findIndex(buffer => buffer.id === activeId))
-      setPrompt({ type: 'buffer', query: '', selected })
+      replacePrompt({ type: 'buffer', query: '', selected })
     })
     registry.register('shell.run', 'shell: run command', (ctx, args) => {
       const command = typeof args?.command === 'string' ? args.command : ''
@@ -2053,7 +2076,7 @@ function App({
     return registry
   }, [
     activeBuffer.filename, activeId, buffers, config, currentGitHunk, jumpToDiagnostic, openDiagnosticsPanel,
-    openFilePromptFromRoot, openGitPanelForHunk, saveCurrentBuffer, setStatus, sidecar, snapshot,
+    openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveCurrentBuffer, setStatus, sidecar, snapshot,
   ])
 
   const makeCtx = React.useCallback((): EditorContext => ({
@@ -2129,7 +2152,7 @@ function App({
         enterNormal()
         const sorted = [...buffers].sort((a, b) => b.lastUsedAt - a.lastUsedAt)
         const selected = Math.max(0, sorted.findIndex(buffer => buffer.id === activeId))
-        setPrompt({ type: 'buffer', query: '', selected })
+        replacePrompt({ type: 'buffer', query: '', selected })
       },
       openFilePrompt: () => {
         openFilePromptFromRoot(detectProjectRoot({ filename: snapshot?.filename ?? activeBuffer.filename, cwd: process.cwd() }))
@@ -2277,7 +2300,7 @@ function App({
         })
       },
     })),
-  ), [actions, activeBuffer.filename, activeId, buffers, commandRegistry, currentGitHunk, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
+  ), [actions, activeBuffer.filename, activeId, buffers, commandRegistry, currentGitHunk, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
 
   leaderMapRef.current = leaderMap
 
@@ -2390,9 +2413,9 @@ function App({
     enterNormal()
     const ctrl = new AbortController()
     listAvailableModels(ctrl.signal).then(candidates => {
-      setPrompt({ type: 'model', query: '', candidates, selected: 0 })
+      replacePrompt({ type: 'model', query: '', candidates, selected: 0 })
     }).catch(() => {
-      setPrompt({ type: 'model', query: '', candidates: [getProviderLabel().split('/').slice(1).join('/')], selected: 0 })
+      replacePrompt({ type: 'model', query: '', candidates: [getProviderLabel().split('/').slice(1).join('/')], selected: 0 })
     })
   }
 
@@ -2932,7 +2955,7 @@ function App({
         setPanel(prev => prev?.type === 'git' ? { ...prev, pendingKey: null } : prev)
         if (pk === 'c' && input === 'c') {
           setPanel(null)
-          setPrompt({ type: 'commit', message: '' })
+          replacePrompt({ type: 'commit', message: '' })
           return
         }
         if (pk === 'l' && input === 'l') {
@@ -3244,18 +3267,18 @@ function App({
 
     // ── Commit prompt ────────────────────────────────────────────────────────
     if (prompt?.type === 'commit') {
-      if (key.escape) { setPrompt(null); return }
+      if (key.escape) { replacePrompt(null); return }
       if (key.return) {
         const msg = prompt.message.trim()
         if (msg) {
           const result = commitGit(process.cwd(), msg)
-          setPrompt(null)
+          replacePrompt(null)
           openGitPanel()
           if (!result.ok) {
             setPanel(prev => prev?.type === 'git' ? { ...prev, gitError: result.error } : prev)
           }
         } else {
-          setPrompt(null)
+          replacePrompt(null)
         }
         return
       }
@@ -3984,6 +4007,7 @@ async function main() {
   let quitting = false
   let lspOverlay: LspOverlay | null = null
   const changeHookTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const changeHookRevisions = new Map<string, number>()
 
   const refresh = () => instance?.rerender(view())
 
@@ -4099,7 +4123,15 @@ async function main() {
           buffer.filename = message.filename
           buffer.name = bufferName(message.filename)
           buffer.status = message.status
-          scheduleChangeHook(buffer)
+          {
+            const decision = onChangeDecision(changeHookRevisions.get(buffer.id), message.revision)
+            if (decision.revision !== null) changeHookRevisions.set(buffer.id, decision.revision)
+            if (decision.schedule) scheduleChangeHook(buffer)
+          }
+          if (!buffer.openHookFired) {
+            buffer.openHookFired = true
+            if (cfg.hooks?.onOpen) runHookAction(cfg.hooks.onOpen, buffer)
+          }
           break
         case 'saved':
           buffer.status = 'saved'
@@ -4216,6 +4248,7 @@ async function main() {
     const timer = changeHookTimers.get(id)
     if (timer) clearTimeout(timer)
     changeHookTimers.delete(id)
+    changeHookRevisions.delete(id)
     buffers = buffers.filter(b => b.id !== id)
 
     if (activeId === id) {
@@ -4263,7 +4296,6 @@ async function main() {
     const buffer = createBuffer(resolved)
     if (jump) buffer.jumpTo = jump
     activateBuffer(buffer)
-    if (cfg.hooks?.onOpen) runHookAction(cfg.hooks.onOpen, buffer)
     refresh()
   }
 
@@ -4271,6 +4303,7 @@ async function main() {
     quitting = true
     for (const timer of changeHookTimers.values()) clearTimeout(timer)
     changeHookTimers.clear()
+    changeHookRevisions.clear()
     if (activeSidecar) { activeSidecar.kill(); activeSidecar = null }
     shell.kill()
     instance?.unmount()
@@ -4301,94 +4334,9 @@ async function main() {
         mkdirSync(configDir, { recursive: true })
         const apiTarget = join(configDir, 'config-api.ts')
         if (!existsSync(apiTarget)) {
-          const apiTemplate = [
-            `// Local qe config typing helper. Generated next to config.ts so this setup is portable.`,
-            `export type QeExtra = 'typescript' | 'rust' | 'git' | 'ai' | 'formatting' | 'debug'`,
-            `export type ConfigNotifyLevel = 'info' | 'warn' | 'error'`,
-            `export type ConfigPanelName = 'shell' | 'ai' | 'git' | 'diagnostics' | 'commandPalette'`,
-            `export type ConfigPickItem = string | { label: string; value?: string; description?: string }`,
-            `export type ConfigDirective =`,
-            `  | { type: 'shell.run'; command: string }`,
-            `  | { type: 'panel.open'; panel: ConfigPanelName; options?: Record<string, unknown> }`,
-            `  | { type: 'openFile'; path: string; row?: number; col?: number }`,
-            `  | { type: 'editor.insert'; text: string }`,
-            `  | { type: 'editor.move'; direction: string }`,
-            `  | { type: 'command.run'; command: string; args?: Record<string, unknown> }`,
-            `  | { type: 'ui.notify'; message: string; level?: ConfigNotifyLevel }`,
-            `export type ConfigActionResult = void | ConfigDirective | ConfigDirective[] | Promise<void | ConfigDirective | ConfigDirective[]>`,
-            `export type EditorContext = {`,
-            `  readonly filename: string | null`,
-            `  readonly lines: string[]`,
-            `  readonly cursor: { row: number; col: number }`,
-            `  save: () => void`,
-            `  quit: () => void`,
-            `  insert: (text: string) => void`,
-            `  move: (dir: string) => void`,
-            `  openFile: (path: string, jump?: { row: number; col: number }) => void`,
-            `  shell: { run: (cmd: string) => void; lines: () => string[] }`,
-            `  buffers: { list: () => unknown[]; current: () => unknown | null; switch: (id: string) => void; kill: (id?: string) => void; next: () => void; previous: () => void }`,
-            `  commands: { run: (id: string, args?: Record<string, unknown>) => Promise<void> }`,
-            `  ui: { pick: (title: string, items: ConfigPickItem[]) => Promise<string | null>; input: (title: string, initial?: string) => Promise<string | null>; confirm: (title: string, body?: string) => Promise<boolean>; notify: (message: string, level?: ConfigNotifyLevel) => void; panel: (name: ConfigPanelName, options?: Record<string, unknown>) => void }`,
-            `  git: { status: () => void; stageCurrentFile: () => void; stageHunk: () => void; previewHunk: () => void }`,
-            `  lsp: { hover: () => void; definition: () => void; format: () => void }`,
-            `  diagnostics: { list: () => void; next: () => void; line: () => void }`,
-            `}`,
-            `export type ConfigAction = string | { command: string; args?: Record<string, unknown>; label?: string } | ConfigDirective | ConfigDirective[] | ((ctx: EditorContext) => ConfigActionResult)`,
-            `export type QeConfig = {`,
-            `  preset?: 'web' | 'rust' | 'minimal'`,
-            `  extras?: QeExtra[]`,
-            `  theme?: Partial<Record<'bg' | 'fg' | 'grey' | 'red' | 'orange' | 'green' | 'yellow' | 'blue' | 'magenta' | 'cyan' | 'violet', string>>`,
-            `  leader?: { [key: string]: ConfigAction | QeConfig['leader'] }`,
-            `  hooks?: { onSave?: ConfigAction; onOpen?: ConfigAction; onChange?: ConfigAction }`,
-            `  commands?: Record<string, ConfigAction>`,
-            `}`,
-            `export function defineConfig<const T extends QeConfig>(config: T): T { return config }`,
-          ].join('\n')
-          writeFileSync(apiTarget, `${apiTemplate}\n`, 'utf8')
+          writeFileSync(apiTarget, `${configApiTemplate()}\n`, 'utf8')
         }
-        const template = [
-          `// ~/.config/qe/config.ts - qe programmable editor config`,
-          `// This file is trusted local code. It can use command IDs, directives, or functions.`,
-          `import { defineConfig } from './config-api.ts'`,
-          ``,
-          `export default defineConfig({`,
-          `  preset: 'web',`,
-          `  extras: ['typescript', 'git', 'ai', 'formatting'],`,
-          ``,
-          `  commands: {`,
-          `    'tasks.pickAndRun': async (ctx) => {`,
-          `      const task = await ctx.ui.pick('Run task', [`,
-          `        'npm run typecheck',`,
-          `        'npm --prefix app run test',`,
-          `        'cargo test --manifest-path native/editor-core/Cargo.toml',`,
-          `      ])`,
-          `      if (task) return [`,
-          `        { type: 'shell.run', command: task },`,
-          `        { type: 'panel.open', panel: 'shell' },`,
-          `      ]`,
-          `    },`,
-          `  },`,
-          ``,
-          `  leader: {`,
-          `    p: { t: 'tasks.pickAndRun' },`,
-          `    x: { t: [`,
-          `      { type: 'shell.run', command: 'npm test' },`,
-          `      { type: 'panel.open', panel: 'shell' },`,
-          `    ] },`,
-          `    z: { r: (ctx) => ctx.shell.run('cargo test') },`,
-          `  },`,
-          ``,
-          `  hooks: {`,
-          `    // Hooks support commands/directives. Interactive UI prompts are only available from leader commands.`,
-          `    onSave: async (ctx) => {`,
-          `      if (ctx.filename?.endsWith('.ts')) await ctx.commands.run('code.format')`,
-          `    },`,
-          `    // onChange is debounced. Prefer quick commands/directives here.`,
-          `    // onChange: { type: 'ui.notify', message: 'buffer changed' },`,
-          `  },`,
-          `})`,
-        ].join('\n')
-        writeFileSync(target, template, 'utf8')
+        writeFileSync(target, starterConfigTemplate(), 'utf8')
         openFile(target)
       })
     })

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { CommandRegistry, registerConfigCommands, runConfigAction } from '../src/config-runtime.ts'
-import type { EditorContext } from '../src/config.ts'
+import { CommandRegistry, executeDirectives, registerConfigCommands, runConfigAction } from '../src/config-runtime.ts'
+import type { ConfigDirective, EditorContext } from '../src/config.ts'
 
 function makeCtx(events: string[]): EditorContext {
   return {
@@ -89,6 +89,19 @@ describe('CommandRegistry', () => {
     assert.deepEqual(events, ['notify:error:unknown command: missing.command'])
   })
 
+  it('reports unknown directives through ctx.ui.notify and continues directive arrays', async () => {
+    const events: string[] = []
+    const ctx = makeCtx(events)
+    const registry = new CommandRegistry()
+
+    await executeDirectives([
+      { type: 'bad.directive' } as unknown as ConfigDirective,
+      { type: 'shell.run', command: 'npm test' },
+    ], ctx, registry)
+
+    assert.deepEqual(events, ['notify:error:unknown directive: bad.directive', 'shell:npm test'])
+  })
+
   it('registers user commands from config', async () => {
     const events: string[] = []
     const ctx = makeCtx(events)
@@ -104,5 +117,31 @@ describe('CommandRegistry', () => {
 
     await registry.run('tasks.test', ctx)
     assert.deepEqual(events, ['shell:npm test', 'panel:shell'])
+  })
+
+  it('lets later registrations override earlier command IDs', async () => {
+    const events: string[] = []
+    const ctx = makeCtx(events)
+    const registry = new CommandRegistry()
+    registry.register('file.find', 'builtin find', () => events.push('builtin'))
+    registry.register('file.find', 'user find', () => events.push('user'))
+
+    await registry.run('file.find', ctx)
+    assert.deepEqual(events, ['user'])
+  })
+
+  it('lets user config commands override built-in command IDs', async () => {
+    const events: string[] = []
+    const ctx = makeCtx(events)
+    const registry = new CommandRegistry()
+    registry.register('git.status', 'builtin git status', () => events.push('builtin'))
+    registerConfigCommands({
+      commands: {
+        'git.status': { type: 'shell.run', command: 'git status --short' },
+      },
+    }, registry)
+
+    await registry.run('git.status', ctx)
+    assert.deepEqual(events, ['shell:git status --short'])
   })
 })
