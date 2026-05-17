@@ -18,10 +18,13 @@ jobs:
         include:
           - os: macos-14
             platform: darwin-arm64
-          - os: macos-13
+            rust_target: aarch64-apple-darwin
+          - os: macos-14
             platform: darwin-x86_64
+            rust_target: x86_64-apple-darwin
           - os: ubuntu-22.04
             platform: linux-x86_64
+            rust_target: x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
 
@@ -34,10 +37,23 @@ jobs:
           cache: 'npm'
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - run: npm ci
 
-      - run: npm run build
+      - name: Build JS bundle
+        run: npm --workspace qe-react-editor-app run build
+
+      - name: Build native binary
+        run: cargo build --release --target ${{ matrix.rust_target }}
+        working-directory: native/editor-core
+
+      - name: Stage native binary for packaging
+        run: |
+          mkdir -p native/editor-core/target/release
+          cp native/editor-core/target/${{ matrix.rust_target }}/release/editor-core \
+             native/editor-core/target/release/editor-core
 
       - name: Package tarball
         run: node scripts/package.mjs ${{ github.ref_name }} ${{ matrix.platform }}
