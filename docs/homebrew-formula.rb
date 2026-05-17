@@ -16,6 +16,7 @@ class Qe < Formula
   desc "Terminal editor: Vim keybindings, Git, LSP, AI (optional)"
   homepage "https://github.com/kroq86/ide"
   license "MIT"
+  version "0.1.0"
 
   on_macos do
     on_arm do
@@ -34,8 +35,6 @@ class Qe < Formula
       sha256 "PLACEHOLDER_linux_x86_64"
     end
   end
-
-  version "0.1.0"
 
   depends_on "node"
 
