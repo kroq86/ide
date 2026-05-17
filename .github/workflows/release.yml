@@ -99,14 +99,34 @@ jobs:
       - name: Install packaging tools
         run: sudo apt-get install -y dpkg-dev apt-utils fakeroot
 
-      - name: Extract tarball and build .deb
+      - name: Build .deb
         run: |
+          set -e
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           TARBALL="tarballs/qe-${{ github.ref_name }}-linux-x86_64.tar.gz"
-          mkdir -p release-staging
-          tar -xzf "$TARBALL" -C release-staging
-          sh scripts/make-deb.sh "$VERSION"
+          PKG="qe_${VERSION}_amd64"
+
+          tar -xzf "$TARBALL"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/lib/qe"
+
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: qe
+          Version: $VERSION
+          Architecture: amd64
+          Maintainer: KO <djkroq@gmail.com>
+          Depends: nodejs (>= 22)
+          Description: Terminal editor with Vim keybindings, Git, LSP, and AI support
+          EOF
+
+          cp "qe-${{ github.ref_name }}-linux-x86_64/libexec/main.js"     "$PKG/usr/lib/qe/main.js"
+          cp "qe-${{ github.ref_name }}-linux-x86_64/libexec/editor-core" "$PKG/usr/lib/qe/editor-core"
+          chmod 755 "$PKG/usr/lib/qe/editor-core"
+
+          printf '#!/bin/sh\nexec node /usr/lib/qe/main.js "$@"\n' > "$PKG/usr/bin/qe"
+          chmod 755 "$PKG/usr/bin/qe"
+
+          fakeroot dpkg-deb --build "$PKG" "qe_${VERSION}_amd64.deb"
 
       - name: Publish to apt repository on gh-pages
         env:
