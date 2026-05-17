@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html><head><title>qe apt repository</title></head>
+<body>
+<h1>qe apt repository</h1>
+<pre>
+deb [trusted=yes] https://kroq86.github.io/ide stable main
+</pre>
+<p>Or with GPG signing (after key is set up):</p>
+<pre>
+curl -fsSL https://kroq86.github.io/ide/pubkey.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/qe.gpg
+echo "deb [signed-by=/etc/apt/keyrings/qe.gpg] https://kroq86.github.io/ide stable main" | sudo tee /etc/apt/sources.list.d/qe.list
+sudo apt update
+sudo apt install qe
+</pre>
+</body></html>
