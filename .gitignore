@@ -40,6 +40,7 @@ mcp-data/
 # release packaging output
 release-staging/
 qe-*.tar.gz
+qe_*.deb
 
 # local scratch files
 /f
