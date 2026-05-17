@@ -1,0 +1,12 @@
+Package: qe
+Version: 0.1.0
+Architecture: amd64
+Maintainer: KO <djkroq@gmail.com>
+Depends: nodejs (>= 22)
+Filename: pool/main/qe_0.1.0_amd64.deb
+Size: 1218054
+MD5sum: 0a084fd0ca771cf817cf9b6d5491d6c4
+SHA1: be6042dd5c100422b44c75cd717a930fd3d44f76
+SHA256: dd87d02f814b5f27db7cc9fb64741351734a584ff306e2d54482e40ff53beea3
+Description: Terminal editor with Vim keybindings, Git, LSP, and AI support
+
