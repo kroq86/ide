@@ -11,6 +11,7 @@
     "dev:debug": "npm run build:native && npm --prefix app run dev:debug --",
     "typecheck": "npm --prefix app run typecheck",
     "test": "npm --prefix app run test && node app/test/protocol-smoke.mjs",
+    "test:e2e": "npm run build && npm --prefix app run test:e2e",
     "test:protocol": "npm run build:native && node app/test/protocol-smoke.mjs",
     "test:codeclaw": "cd app && npm exec tsx test/codeclaw.test.ts"
   }

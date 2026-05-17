@@ -259,11 +259,14 @@ Scripts from root [`package.json`](package.json):
 ```sh
 npm run typecheck          # tsc in app/
 npm run test               # app/unit tests + app/test/protocol-smoke.mjs
+npm run test:e2e           # build native/app + terminal E2E contract
 npm run test:codeclaw      # CodeClaw tests only (tsx)
 npm run test:protocol      # build native + protocol smoke
 npm run build              # native release + app esbuild bundle
 cargo test --manifest-path native/editor-core/Cargo.toml
 ```
+
+Terminal E2E expectations are specified in [`docs/e2e-spec.md`](docs/e2e-spec.md).
 
 Fixture failure (for the demo narrative):
 

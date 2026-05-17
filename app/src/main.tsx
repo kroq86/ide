@@ -2830,7 +2830,7 @@ function App({
       if (key.escape) { setPanel(null); return }
       const entry = panel.node[input]
       if (!entry) { setPanel(null); return }
-      if (isLeafAction(entry)) { entry(); setPanel(prev => prev?.type === 'whichkey' ? null : prev); return }
+      if (isLeafAction(entry)) { setPanel(null); entry(); return }
       setPanel({ type: 'whichkey', node: entry as LeaderNode, path: panel.path + input + ' ' })
       return
     }
