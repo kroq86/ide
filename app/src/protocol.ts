@@ -1,17 +1,26 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** Prefer newest Rust editor-core (release vs debug) so dev `cargo build` matches TS protocol; fallback to legacy qe-protocol. */
+export function editorCoreBinaryCandidates(repoRoot: string): string[] {
+  // Installed layout (Homebrew/apt/tarball): editor-core sits next to the bundle.
+  const bundleDir = dirname(fileURLToPath(import.meta.url))
+  return [
+    resolve(bundleDir, 'editor-core'),
+    resolve(repoRoot, 'native/editor-core/target/release/editor-core'),
+    resolve(repoRoot, 'native/editor-core/target/debug/editor-core'),
+  ]
+}
+
+/** Prefer newest Rust editor-core (release vs debug) so dev `cargo build` matches TS protocol. */
 export function resolveEditorCoreBinary(repoRoot: string): string {
-  const debugPath = join(repoRoot, 'native/editor-core/target/debug/editor-core')
-  const releasePath = join(repoRoot, 'native/editor-core/target/release/editor-core')
-  const legacyPath = join(repoRoot, 'native/qe-core/qe-protocol')
+  const envPath = process.env['QE_EDITOR_CORE']
+  if (envPath && existsSync(envPath)) return envPath
 
   let choice: { path: string; mtime: number } | null = null
-  for (const path of [releasePath, debugPath]) {
+  for (const path of editorCoreBinaryCandidates(repoRoot)) {
     if (!existsSync(path)) continue
     try {
       const mtime = statSync(path).mtimeMs
@@ -20,7 +29,7 @@ export function resolveEditorCoreBinary(repoRoot: string): string {
       /* unreadable */
     }
   }
-  return choice?.path ?? legacyPath
+  return choice?.path ?? editorCoreBinaryCandidates(repoRoot)[0]!
 }
 
 export type Cursor = {
@@ -110,12 +119,12 @@ export class QeSidecar extends EventEmitter {
     super()
 
     const appDir = dirname(fileURLToPath(import.meta.url))
-    const root = join(appDir, '../..')
+    const root = resolve(appDir, '../..')
     const binary = resolveEditorCoreBinary(root)
     const args = filename ? [filename] : []
 
     this.#child = spawn(binary, args, {
-      cwd: root,
+      cwd: process.cwd(),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 

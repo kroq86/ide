@@ -1,0 +1,56 @@
+{
+  "name": "terminal-react-core",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "demo": "tsx demo/index.tsx",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "dependencies": {
+    "@alcalzone/ansi-tokenize": "*",
+    "auto-bind": "*",
+    "bidi-js": "^1.0.3",
+    "chalk": "*",
+    "cli-boxes": "*",
+    "code-excerpt": "*",
+    "emoji-regex": "*",
+    "get-east-asian-width": "*",
+    "indent-string": "*",
+    "lodash-es": "*",
+    "react-reconciler": "*",
+    "semver": "*",
+    "signal-exit": "*",
+    "stack-utils": "*",
+    "strip-ansi": "*",
+    "supports-hyperlinks": "*",
+    "type-fest": "*",
+    "usehooks-ts": "*",
+    "wrap-ansi": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

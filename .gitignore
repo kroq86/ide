@@ -37,8 +37,14 @@ mcp-data/
 .env
 .env.*
 
+# release packaging output
+release-staging/
+qe-*.tar.gz
+
 # local scratch files
 /f
 
-# working notes / design drafts
-docs/
+# working notes / design drafts (keep tracked files in docs/)
+docs/*.md
+!docs/install-spec.md
+!docs/homebrew-formula.rb

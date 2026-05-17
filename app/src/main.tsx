@@ -1,5 +1,5 @@
 import React from 'react'
-import { realpathSync } from 'node:fs'
+import { realpathSync, statSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1693,6 +1693,7 @@ async function collectFilesAsync(dir: string, depth: number, base: string): Prom
 
 function App({
   buffers, activeId, bufferKey, sidecar, shell, shellLines, config, userLeader, lspOverlay, actions,
+  initialPanel,
 }: {
   buffers: EditorBuffer[]
   activeId: string
@@ -1703,6 +1704,7 @@ function App({
   config: QeConfig
   userLeader: LeaderTree
   lspOverlay: LspOverlay | null
+  initialPanel?: Panel
   actions: {
     openFile: (path: string, jump?: { row: number; col: number }) => void
     switchBuffer: (id: string) => void
@@ -1734,7 +1736,7 @@ function App({
   }, [])
   const [completionStreaming, setCompletionStreaming] = React.useState(false)
   const [scrollOffset,   setScrollOffset]   = React.useState(0)
-  const [panel,          setPanel]          = React.useState<Panel>(null)
+  const [panel,          setPanel]          = React.useState<Panel>(initialPanel ?? null)
   const [visualAnchor,   setVisualAnchor]   = React.useState<{ row: number; col: number } | null>(null)
   const [visualLineMode, setVisualLineMode] = React.useState(false)
   /** Stack of selections before each expand (contract pops). Not react state — avoids stale handlers. */
@@ -3986,8 +3988,17 @@ async function main() {
     codeclawReviewTracesDir: join(codeclawTracesDir, 'review'),
     node: process.version,
   })
-  const filename = process.argv[2]
   const cwd  = process.cwd()
+  const arg  = process.argv[2]
+  let filename: string | undefined
+  let initialDiredPath: string | undefined
+  if (arg) {
+    const resolved = resolvePath(cwd, arg)
+    let isDir = false
+    try { isDir = statSync(resolved).isDirectory() } catch { /* new file — fall through */ }
+    if (isDir) initialDiredPath = resolved
+    else filename = arg
+  }
   const cols = process.stdout.columns || 80
   const rows = process.stdout.rows    || 24
 
@@ -4366,6 +4377,7 @@ async function main() {
           config={cfg}
           userLeader={cfg.leader ?? {}}
           lspOverlay={lspOverlay}
+          initialPanel={initialDiredPath ? { type: 'dired', path: initialDiredPath, cursor: 0 } : undefined}
           actions={{
             openFile,
             switchBuffer,
