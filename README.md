@@ -1,8 +1,6 @@
 # qe-react-editor
 
-Terminal-first **IDE**: React UI on **terminal-react-core**, editor backed by a **Rust** JSONL sidecar, **git** and **shell** in the same UI. **CodeClaw** is the built-in AI workflow (Ollama HTTP): fix loop from a failed tracked shell run, review loop over git diff + rules, optional **raw trace** capture via `CODECLAW_TRACE_RAW`, summarized traces as JSON under `.codeclaw/traces/`.
-
-**In one line:** bounded proposals (patch / review findings), verify hooks, and written traces—not silent repo rewrites.
+Terminal-first **IDE**: React UI on the vendored **terminal-react-core** workspace, editor backed by a **Rust** JSONL sidecar, **git** and **shell** in the same UI. **CodeClaw** is the optional built-in AI workflow: fix loop from a failed tracked shell run, review loop over git diff + rules, optional **raw trace** capture via `CODECLAW_TRACE_RAW`, summarized traces as JSON under `.codeclaw/traces/`.
 
 ---
 
@@ -11,12 +9,12 @@ Terminal-first **IDE**: React UI on **terminal-react-core**, editor backed by a 
 Fixture: [`examples/broken-counter/`](examples/broken-counter/).
 
 ```sh
-npm --prefix app install
-npm run build:native
-bash scripts/dev.sh examples/broken-counter/src/counter.ts
+npm install
+npm run build
+npm run dev -- examples/broken-counter/src/counter.ts
 ```
 
-`scripts/dev.sh` runs `npm --prefix app run build` then `node app/dist/main.js` with the file argument (see [`scripts/dev.sh`](scripts/dev.sh)).
+For CLI install testing, use `npm link` after `npm run build`, then run `qe examples/broken-counter/src/counter.ts`.
 
 In the app (normal mode, `SPC` leader):
 
@@ -45,22 +43,38 @@ In the app (normal mode, `SPC` leader):
 - **Node.js** 22+ (the app bundle targets `node22`; see [`app/package.json`](app/package.json) `build` script).
 - **npm**
 - **Rust / Cargo** for [`native/editor-core/`](native/editor-core/)
-- **`terminal-react-core`** as a **sibling directory** of this repo so [`app/package.json`](app/package.json) can resolve `file:../../terminal-react-core`
-- **Ollama** (optional) on the host for AI — env vars below
+- **Git**
+- **Ollama/OpenAI-compatible endpoint** (optional) for AI — core editor, Git, shell, and config work without AI
 
 ---
 
-## Run locally
+## Install Locally
+
+First milestone install path from a fresh clone:
 
 From repo root:
 
 ```sh
-npm --prefix app install
-npm run build:native
-npm run dev -- README.md
+npm install
+npm run build
+npm link
+qe README.md
 ```
 
-Root [`package.json`](package.json): `dev` = `build:native` + `npm --prefix app run dev --` (forwards args to `node dist/main.js`).
+The installability contract is documented in [`docs/install-spec.md`](docs/install-spec.md). This repo vendors `terminal-react-core` as `packages/terminal-react-core`, so no sibling checkout is required.
+
+Useful checks:
+
+```sh
+npm run install:check
+npm run test:install
+```
+
+For development without linking:
+
+```sh
+npm run dev -- README.md
+```
 
 ---
 
@@ -167,7 +181,17 @@ Env is loaded from a `.env` file at the repo root at startup (no shell flag need
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `AI_PROVIDER` | `ollama` | Set to `openai` or `openai-compat` to use an OpenAI-compatible endpoint |
+| `AI_PROVIDER` | `ollama` | Set to `openai` / `openai-compat` for an OpenAI-compatible endpoint, or `none` to disable AI |
+
+### Use without AI
+
+`qe` does not require Ollama, OpenAI, or any AI network service. To force no-AI mode:
+
+```sh
+AI_PROVIDER=none qe README.md
+```
+
+In this mode the editor starts normally and AI commands/panels report `AI disabled`. File editing, Git, shell, leader keys, diagnostics, and programmable config remain available.
 
 #### Ollama
 
@@ -260,6 +284,8 @@ Scripts from root [`package.json`](package.json):
 npm run typecheck          # tsc in app/
 npm run test               # app/unit tests + app/test/protocol-smoke.mjs
 npm run test:e2e           # build native/app + terminal E2E contract
+npm run install:check      # verify built CLI install readiness
+npm run test:install       # isolated clone/build/link installability contract
 npm run test:codeclaw      # CodeClaw tests only (tsx)
 npm run test:protocol      # build native + protocol smoke
 npm run build              # native release + app esbuild bundle
@@ -278,7 +304,7 @@ npm --prefix examples/broken-counter test
 
 ## Editor sidecar binary
 
-[`resolveEditorCoreBinary`](app/src/protocol.ts) picks the **newer** of `native/editor-core/target/release/editor-core` and `native/editor-core/target/debug/editor-core` if they exist; otherwise it falls back to **`native/qe-core/qe-protocol`**.
+[`resolveEditorCoreBinary`](app/src/protocol.ts) picks the **newer** of `native/editor-core/target/release/editor-core` and `native/editor-core/target/debug/editor-core` if they exist. The sidecar runs in the user’s current working directory so `qe file.ts` resolves files relative to where the command was launched.
 
 ---
 

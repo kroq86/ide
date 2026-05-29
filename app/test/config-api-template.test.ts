@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { spawnSync } from 'node:child_process'
 import {
   CONFIG_API_DIRECTIVE_TYPES,
   CONFIG_API_EXTRA_NAMES,
@@ -31,7 +31,6 @@ describe('generated config-api.ts template', () => {
   })
 
   it('loads a sample config.ts through tsx using ./config-api.ts', async () => {
-    const { tsImport } = await import('tsx/esm/api')
     const root = mkdtempSync(join(tmpdir(), 'qe-config-api-template-'))
     mkdirSync(root, { recursive: true })
     writeFileSync(join(root, 'config-api.ts'), `${configApiTemplate()}\n`, 'utf8')
@@ -45,8 +44,13 @@ describe('generated config-api.ts template', () => {
       `})`,
     ].join('\n'), 'utf8')
 
-    const mod = await tsImport(pathToFileURL(join(root, 'config.ts')).href, import.meta.url) as { default?: { preset?: string } | { default?: { preset?: string } } }
-    const value = mod.default && 'default' in mod.default ? mod.default.default : mod.default
-    assert.equal(value?.preset, 'web')
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { pathToFileURL } from 'node:url'
+      import { tsImport } from 'tsx/esm/api'
+      const mod = await tsImport(pathToFileURL(${JSON.stringify(join(root, 'config.ts'))}).href, import.meta.url)
+      const value = mod.default && 'default' in mod.default ? mod.default.default : mod.default
+      if (value?.preset !== 'web') process.exit(2)
+    `], { encoding: 'utf8' })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
   })
 })

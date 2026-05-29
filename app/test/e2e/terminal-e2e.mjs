@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { spawnQe, sleep } from './harness.mjs'
+import { spawnQe, spawnQeCli, sleep } from './harness.mjs'
 
 const openTerms = new Set()
 
@@ -23,12 +23,30 @@ function launch(args, options) {
   return app
 }
 
+function launchCli(args, options) {
+  const app = spawnQeCli(args, options)
+  openTerms.add(app)
+  return app
+}
+
 afterEach(() => {
   for (const app of openTerms) app.kill()
   openTerms.clear()
 })
 
 describe('terminal e2e', () => {
+  it('boots through the qe CLI wrapper', async () => {
+    const { home, cwd } = tempWorkspace('cli')
+    const file = join(cwd, 'cli.ts')
+    writeFileSync(file, 'export const launched = true\n')
+
+    const app = launchCli([file], { cwd, home })
+    await app.waitForText('cli.ts')
+    await app.waitForText('exportconstlaunched')
+    await app.quitQe()
+    openTerms.delete(app)
+  })
+
   it('boots, renders a file, and quits through leader keys', async () => {
     const { home, cwd } = tempWorkspace('boot')
     const file = join(cwd, 'fixture.ts')
@@ -184,6 +202,31 @@ describe('terminal e2e', () => {
     await app.sendKeys(' gg')
     await app.waitForText('*git*')
     await app.waitForText('tracked.txt')
+    await app.quitQe()
+    openTerms.delete(app)
+  })
+
+  it('boots, edits, saves, and opens git with AI_PROVIDER=none', async () => {
+    const { home, cwd } = tempWorkspace('no-ai')
+    spawnSync('git', ['init'], { cwd, stdio: 'ignore' })
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd, stdio: 'ignore' })
+    spawnSync('git', ['config', 'user.name', 'Test User'], { cwd, stdio: 'ignore' })
+    const file = join(cwd, 'no-ai.ts')
+    writeFileSync(file, 'const before = true\n')
+    spawnSync('git', ['add', 'no-ai.ts'], { cwd, stdio: 'ignore' })
+    spawnSync('git', ['commit', '-m', 'initial'], { cwd, stdio: 'ignore' })
+
+    const app = launchCli([file], { cwd, home, env: { AI_PROVIDER: 'none' } })
+    await app.waitForText('no-ai.ts')
+    await app.waitForText(/AI\s*disabled/)
+    await app.sendKeys('o')
+    await app.sendKeys('const after = true')
+    await app.sendKeys('\x1b')
+    await app.sendKeys(' fs')
+    await app.waitForFile(file, text => text.includes('const after = true'))
+    await app.sendKeys(' gg')
+    await app.waitForText('*git*')
+    await app.waitForText('no-ai.ts')
     await app.quitQe()
     openTerms.delete(app)
   })

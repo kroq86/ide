@@ -2,6 +2,8 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { extname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { applyPluginsToConfig, PLUGIN_DIR } from './config-plugins.js'
+import type { ShellRun } from './shell.js'
 
 // ── Public types — what users write in their config file ─────────────────────
 
@@ -9,6 +11,8 @@ export type EditorContext = {
   readonly filename: string | null
   readonly lines: string[]
   readonly cursor: { row: number; col: number }
+  /** Set during `onShellDone` to the finished tracked run; otherwise `null`. */
+  readonly lastShellRun: ShellRun | null
   save: () => void
   quit: () => void
   insert: (text: string) => void
@@ -35,6 +39,7 @@ export type EditorContext = {
     confirm: (title: string, body?: string) => Promise<boolean>
     notify: (message: string, level?: ConfigNotifyLevel) => void
     panel: (name: ConfigPanelName, options?: Record<string, unknown>) => void
+    splash: (options: { title: string; message?: string; hint?: string }) => void
   }
   git: {
     status: () => void
@@ -106,6 +111,7 @@ export type ConfigDirective =
   | { type: 'editor.move'; direction: string }
   | { type: 'command.run'; command: string; args?: Record<string, unknown> }
   | { type: 'ui.notify'; message: string; level?: ConfigNotifyLevel }
+  | { type: 'ui.splash'; title: string; message?: string; hint?: string }
 
 export type ConfigCommand = {
   command: string
@@ -143,9 +149,11 @@ export type QeConfig = {
   }>
   leader?: LeaderTree
   hooks?: {
-    onSave?:   ConfigAction
-    onOpen?:   ConfigAction
-    onChange?: ConfigAction
+    onSave?:      ConfigAction
+    onOpen?:      ConfigAction
+    onChange?:    ConfigAction
+    onBufEnter?:  ConfigAction
+    onShellDone?: ConfigAction
   }
   commands?: Record<string, ConfigAction>
 }
@@ -172,18 +180,28 @@ export const CONFIG_PATHS = [
 
 let _config: QeConfig = {}
 let _configPath: string | null = null
+let _configImportSeq = 0
 
 export function getConfigPath(): string | null { return _configPath }
 
 async function importConfig(path: string): Promise<{ default?: QeConfig }> {
   const [file = path, query] = path.split('?')
   const ext = extname(file)
+  const cacheKey = query ?? `t=${Date.now()}-${++_configImportSeq}`
+  const specifier = `${pathToFileURL(file).href}?${cacheKey}`
   if (ext === '.ts' || ext === '.mts') {
+    try {
+      return await import(specifier) as { default?: QeConfig }
+    } catch (error) {
+      const message = String((error as Error | undefined)?.message ?? error)
+      const code = String((error as { code?: unknown } | undefined)?.code ?? '')
+      if (!message.includes('Unknown file extension') && code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw error
+      // In the bundled app Node cannot import .ts directly; use tsx's API.
+    }
     const { tsImport } = await import('tsx/esm/api')
-    const specifier = `${pathToFileURL(file).href}${query ? `?${query}` : ''}`
     return await tsImport(specifier, import.meta.url) as { default?: QeConfig }
   }
-  return await import(path) as { default?: QeConfig }
+  return await import(specifier) as { default?: QeConfig }
 }
 
 function configFromModule(mod: { default?: QeConfig | { default?: QeConfig } }): QeConfig {
@@ -203,7 +221,7 @@ export async function loadConfigFromPaths(paths: readonly string[]): Promise<QeC
     if (!existsSync(p)) continue
     try {
       const mod = await importConfig(p)
-      _config = configFromModule(mod)
+      _config = await applyPluginsToConfig(configFromModule(mod))
       _configPath = p
       return _config
     } catch (e) {
@@ -217,15 +235,30 @@ export async function loadConfigFromPaths(paths: readonly string[]): Promise<QeC
 export async function reloadConfig(): Promise<QeConfig> {
   const p = _configPath
   if (!p || !existsSync(p)) return _config
+  return reloadConfigFromPath(p)
+}
+
+export async function reloadConfigFromPath(path: string): Promise<QeConfig> {
+  if (!existsSync(path)) {
+    throw new Error(`config not found: ${path}`)
+  }
+  return reloadConfigFromImportPath(path, path)
+}
+
+/** Import config module from `importPath` (may be a temp file) and set active path to `logicalPath`. */
+export async function reloadConfigFromImportPath(importPath: string, logicalPath: string): Promise<QeConfig> {
   try {
-    const mod = await importConfig(`${p}?t=${Date.now()}`)
-    _config = configFromModule(mod)
+    const mod = await importConfig(`${importPath}?t=${Date.now()}`)
+    _config = await applyPluginsToConfig(configFromModule(mod))
+    _configPath = logicalPath
     return _config
   } catch (e) {
-    process.stderr.write(`qe: config reload error in ${p}: ${String(e)}\n`)
-    return _config
+    process.stderr.write(`qe: config reload error in ${logicalPath}: ${String(e)}\n`)
+    throw e
   }
 }
+
+export { PLUGIN_DIR, loadPluginCommands, loadPluginStartupActions, registerPlugins } from './config-plugins.js'
 
 export function getConfig(): QeConfig {
   return _config

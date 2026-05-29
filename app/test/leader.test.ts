@@ -36,11 +36,11 @@ const mockDiagnostics = {
 }
 const mockSearch = { buffer: noop, replace: noop }
 const mockUi = { toggleWrap: noop }
-const mockCfg   = { open: noop, reload: noop }
+const mockCfg   = { open: noop, reload: noop, evalFile: noop, evalExpression: noop, evalRegion: noop }
 const mockMode  = { testFile: noop, testAll: noop }
 const emptyLeader: LeaderTree = {}
 const makeCtx = (): EditorContext => ({
-  filename: null, lines: [], cursor: { row: 0, col: 0 },
+  filename: null, lines: [], cursor: { row: 0, col: 0 }, lastShellRun: null,
   save: noop, quit: noop, insert: noop, move: noop,
   shell: { run: noop, lines: () => [] },
   buffers: { list: () => [], current: () => null, switch: noop, kill: noop, next: noop, previous: noop },
@@ -52,6 +52,7 @@ const makeCtx = (): EditorContext => ({
     confirm: async () => false,
     notify: noop,
     panel: noop,
+    splash: noop,
   },
   git: { status: noop, stageCurrentFile: noop, stageHunk: noop, previewHunk: noop },
   lsp: { hover: noop, definition: noop, format: noop },

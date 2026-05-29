@@ -44,13 +44,19 @@ import {
   type TraceSummary,
 } from './codeclaw.js'
 import {
-  loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS,
+  loadConfig, reloadConfig, getConfigPath, CONFIG_PATHS, registerPlugins, loadPluginStartupActions,
   type BufferInfo, type ConfigAction, type ConfigNotifyLevel, type ConfigPanelName,
   type ConfigPickItem, type EditorContext, type LeaderTree, type QeConfig,
 } from './config.js'
-import { CommandRegistry, registerConfigCommands, runConfigAction } from './config-runtime.js'
+import { CommandRegistry, registerCommandActions, registerConfigCommands, runConfigAction } from './config-runtime.js'
 import { configApiTemplate, starterConfigTemplate } from './config-api-template.js'
 import { onChangeDecision } from './config-hooks.js'
+import { createEditorContext, hookUiStubs } from './editor-context.js'
+import {
+  evalCurrentFile as evalCurrentFileAtPath,
+  evalExpression as runEvalExpression,
+  evalRegion as runEvalRegion,
+} from './config-eval.js'
 import { configPromptCancelValue, isConfigPromptType } from './config-ui.js'
 import {
   loadGitStatus, loadFileHunks, getGitRepoRoot, hunkNewStartRow, resolveRepoFilePath, stageEntry, unstageEntry, commitGit, pullGit, pushGit,
@@ -178,6 +184,7 @@ type Panel =
   | { type: 'ai'; focused: boolean }
   | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string; view: GitPanelView }
   | { type: 'dired'; path: string; cursor: number }
+  | { type: 'splash'; title: string; message?: string; hint?: string }
 
 type SelBounds = {
   startRow: number; startCol: number
@@ -424,6 +431,33 @@ function writeClipboard(text: string): boolean {
   return false
 }
 
+function readClipboardText(): string | null {
+  const commands =
+    process.platform === 'darwin'
+      ? [['pbpaste']]
+      : process.platform === 'win32'
+        ? [['powershell', '-NoProfile', '-Command', 'Get-Clipboard -Raw']]
+        : [['wl-paste'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '--clipboard', '--output']]
+
+  for (const command of commands) {
+    const result = spawnSync(command[0]!, command.slice(1), {
+      encoding: 'utf8',
+      timeout: 1000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    if (result.status === 0 && typeof result.stdout === 'string') return result.stdout
+  }
+  return null
+}
+
+function normalizePromptPaste(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+}
+
+function promptPasteText(input: string): boolean {
+  return input.length > 0 && /^[\x09\x0a\x20-\x7e]+$/.test(input)
+}
+
 function findMatches(lines: string[], query: string): Array<{ row: number; col: number }> {
   if (!query) return []
   const out: Array<{ row: number; col: number }> = []
@@ -483,16 +517,18 @@ function lineSegs(
 ): Seg[] {
   const isCursor = row === cursor.row
 
-  // Ghost inline completion (+ spinner while Ollama streams, same tick as AI panel)
-  if (isCursor && ghostText !== null && (ghostText.length > 0 || completionStreaming)) {
+  // Ghost inline completion (+ spinner while Ollama streams)
+  if (isCursor && (completionStreaming || (ghostText !== null && ghostText.length > 0))) {
     const pre = line.slice(0, cursor.col)
-    const post = line.slice(cursor.col)
-    const spin = completionStreaming ? ` ${thinkingSpinnerGlyph(thinkingTick)}` : ''
+    const at = line[cursor.col] ?? ' '
+    const post = line.slice(cursor.col + 1)
+    const spin = completionStreaming ? thinkingSpinnerGlyph(thinkingTick) : ''
     return [
-      { text: `${pre}|`, fg: C.blue },
-      ...(ghostText.length > 0 ? [{ text: ghostText, fg: C.grey }] : []),
+      ...(pre ? [{ text: pre, fg: C.green }] : []),
+      { text: at, fg: C.bg, bg: C.green },
+      ...(ghostText && ghostText.length > 0 ? [{ text: ghostText, fg: C.grey }] : []),
       ...(spin ? [{ text: spin, fg: C.grey }] : []),
-      { text: post || ' ', fg: C.blue },
+      ...(post ? [{ text: post, fg: C.green }] : []),
     ]
   }
 
@@ -513,6 +549,18 @@ function lineSegs(
     ]
   }
 
+  // Block cursor (insert mode) — highlight char at cursor; never insert a | column
+  if (isCursor && mode === 'insert') {
+    const pre  = line.slice(0, cursor.col)
+    const at   = line[cursor.col] ?? ' '
+    const post = line.slice(cursor.col + 1)
+    return [
+      ...(pre  ? [{ text: pre,  fg: C.green }] : []),
+      { text: at,   fg: C.bg,   bg: C.green },
+      ...(post ? [{ text: post, fg: C.green }] : []),
+    ]
+  }
+
   // Block cursor (normal / command / search modes)
   if (isCursor && mode !== 'insert') {
     const pre  = line.slice(0, cursor.col)
@@ -523,13 +571,6 @@ function lineSegs(
       { text: at,   fg: C.bg,   bg: C.cyan },
       ...(post ? [{ text: post, fg: C.blue }] : []),
     ]
-  }
-
-  // Thin cursor (insert mode)
-  if (isCursor) {
-    const pre  = line.slice(0, cursor.col)
-    const post = line.slice(cursor.col)
-    return [{ text: `${pre}|${post || ' '}`, fg: C.green }]
   }
 
   // Search highlights
@@ -786,6 +827,44 @@ function ShellPane({
         </Box>
       )}
       {mode === 'pty' && focused && <Text color={C.grey}>Enter=tracked run  Esc=editor</Text>}
+    </Box>
+  )
+}
+
+// ── Splash panel (startup welcome) ───────────────────────────────────────────
+
+function SplashPanel({
+  title, message, hint, totalRows, totalCols,
+}: {
+  title: string
+  message?: string
+  hint?: string
+  totalRows: number
+  totalCols: number
+}) {
+  const hintText = hint ?? 'Press Enter to continue'
+  const titlePad = Math.max(0, Math.floor((totalCols - title.length) / 2))
+  const messagePad = message ? Math.max(0, Math.floor((totalCols - message.length) / 2)) : 0
+  const hintPad = Math.max(0, Math.floor((totalCols - hintText.length) / 2))
+  const topPad = Math.max(0, Math.floor(totalRows / 2) - (message ? 3 : 2))
+
+  return (
+    <Box flexDirection="column" width={totalCols} height={totalRows}>
+      {Array.from({ length: topPad }, (_, i) => <Box key={i} />)}
+      <Box flexDirection="row">
+        <Text>{' '.repeat(titlePad)}</Text>
+        <Text bold color={C.cyan}>{title}</Text>
+      </Box>
+      {message && (
+        <Box flexDirection="row" marginTop={1}>
+          <Text>{' '.repeat(messagePad)}</Text>
+          <Text color={C.fg}>{message}</Text>
+        </Box>
+      )}
+      <Box flexDirection="row" marginTop={2}>
+        <Text>{' '.repeat(hintPad)}</Text>
+        <Text color={C.yellow}>{hintText}</Text>
+      </Box>
     </Box>
   )
 }
@@ -1431,12 +1510,13 @@ type EditorPaneProps = {
   cmdBuf: string
   searchBuf: string
   aiModelLabel: string
+  flashMessage?: string | null
 }
 
 function EditorPane({
   filename, snapshot, status, bufferName, bufferIndex, bufferCount, buffers, prompt,
   activeBufferId, ghostText, completionStreaming, thinkingTick, mode, scrollOffset, panelRows, paneWidth, panel,
-  paneHeight, sel, searchQuery, cmdBuf, searchBuf, aiModelLabel,
+  paneHeight, sel, searchQuery, cmdBuf, searchBuf, aiModelLabel, flashMessage,
 }: EditorPaneProps) {
   const lines  = snapshot?.lines  ?? ['']
   const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
@@ -1481,7 +1561,7 @@ function EditorPane({
   } else if (prompt?.type === 'configPick') {
     hintLine = `${prompt.title}: ${prompt.query}_  j/k=navigate  Ret=choose  Esc=cancel`
   } else if (prompt?.type === 'configInput') {
-    hintLine = `${prompt.title}: ${prompt.value}_`
+    hintLine = `${prompt.title}: ${prompt.value}_  paste: ⌘V/Ctrl+V`
   } else if (prompt?.type === 'configConfirm') {
     hintLine = `${prompt.title}  y=confirm  n/Esc=cancel`
   } else if (mode === 'command') {
@@ -1491,7 +1571,9 @@ function EditorPane({
   } else if (mode === 'insert') {
     hintLine = 'Tab=complete  Esc=normal'
   } else if (mode === 'visual') {
-    hintLine = 'y=yank  d=delete  o=swap  v=expand  V=contract  hjkl/arrows=extend  Esc=normal'
+    hintLine = 'SPC=menu (p s=eval)  y=yank  d=delete  v=expand  V=contract  hjkl=extend  Esc=normal'
+  } else if (flashMessage) {
+    hintLine = flashMessage
   } else {
     hintLine = 'SPC/C-SPC=menu  v=expand-region  V=line-visual  -=dired  [/]=block  i=insert  /=search  :=cmd'
   }
@@ -1635,7 +1717,7 @@ function EditorPane({
       </Box>
 
       <Box flexDirection="row">
-        <Text color={prompt || mode === 'command' || mode === 'search' ? C.yellow : C.grey}>
+        <Text color={prompt || flashMessage || mode === 'command' || mode === 'search' ? C.yellow : C.grey}>
           {hintLine}
         </Text>
       </Box>
@@ -1691,6 +1773,23 @@ async function collectFilesAsync(dir: string, depth: number, base: string): Prom
 
 // ── Main app component ────────────────────────────────────────────────────────
 
+function withEvalNotifyTracking(ctx: EditorContext): { ctx: EditorContext; userNotified: () => boolean } {
+  let notified = false
+  return {
+    ctx: {
+      ...ctx,
+      ui: {
+        ...ctx.ui,
+        notify: (message, level) => {
+          notified = true
+          ctx.ui.notify(message, level)
+        },
+      },
+    },
+    userNotified: () => notified,
+  }
+}
+
 function App({
   buffers, activeId, bufferKey, sidecar, shell, shellLines, config, userLeader, lspOverlay, actions,
   initialPanel,
@@ -1714,6 +1813,7 @@ function App({
     newScratch: () => void
     quitAll: () => void
     reloadConfig: () => Promise<void>
+    applyConfig: (config: QeConfig) => void
     openConfig: () => void
     clearLspOverlay: () => void
     /** Mutates active buffer status + triggers rerender (for completion errors etc.). */
@@ -1741,9 +1841,20 @@ function App({
   const [visualLineMode, setVisualLineMode] = React.useState(false)
   /** Stack of selections before each expand (contract pops). Not react state — avoids stale handlers. */
   const visualExpandHistoryRef = React.useRef<VisualSnap[]>([])
+  /** Last visual selection — kept after Esc so SPC p s can eval without staying in visual mode. */
+  const lastVisualSelectionRef = React.useRef<{
+    anchor: { row: number; col: number }
+    cursor: { row: number; col: number }
+    lineMode: boolean
+    lines: string[]
+  } | null>(null)
   const [cmdBuf,         setCmdBuf]         = React.useState('')
   const [searchBuf,      setSearchBuf]      = React.useState('')
   const [searchQuery,    setSearchQuery]    = React.useState('')
+  const [commandEpoch,   setCommandEpoch]   = React.useState(0)
+  const [evalCommands,   setEvalCommands]   = React.useState<Record<string, ConfigAction>>({})
+  const [flashMessage,   setFlashMessage]   = React.useState<string | null>(null)
+  const flashTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const [prompt,         setPrompt]         = React.useState<PromptState | null>(null)
   const uiPromptIdRef = React.useRef(1)
   const uiPromptResolversRef = React.useRef(new Map<number, (value: unknown) => void>())
@@ -2028,8 +2139,21 @@ function App({
     else if (name === 'commandPalette') setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: flattenLeader(leaderMapRef.current) })
   }, [openDiagnosticsPanel])
 
+  const openSplash = React.useCallback((options: { title: string; message?: string; hint?: string }) => {
+    setPanel({ type: 'splash', title: options.title, message: options.message, hint: options.hint })
+  }, [])
+
+  React.useEffect(() => () => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
+  }, [])
+
   const notify = React.useCallback((message: string, level: ConfigNotifyLevel = 'info') => {
-    setStatus(level === 'info' ? message : `${level}: ${message}`)
+    const text = level === 'info' ? message : `${level}: ${message}`
+    setStatus(text)
+    setFlashMessage(text)
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
+    flashTimerRef.current = setTimeout(() => setFlashMessage(null), 8000)
+    if (level !== 'info') process.stderr.write(`qe: ${text}\n`)
   }, [setStatus])
 
   const commandRegistry = React.useMemo(() => {
@@ -2075,13 +2199,15 @@ function App({
     registry.register('diagnostics.line', 'diagnostics: current line', () => jumpToDiagnostic(diagnosticAtCursor(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 })))
     registry.register('ai.chat', 'ai: chat', () => setPanel({ type: 'ai', focused: true }))
     registerConfigCommands(config, registry)
+    registerCommandActions(evalCommands, registry)
     return registry
   }, [
-    activeBuffer.filename, activeId, buffers, config, currentGitHunk, jumpToDiagnostic, openDiagnosticsPanel,
+    activeBuffer.filename, activeId, buffers, commandEpoch, config, currentGitHunk, evalCommands, jumpToDiagnostic, openDiagnosticsPanel,
     openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveCurrentBuffer, setStatus, sidecar, snapshot,
   ])
 
-  const makeCtx = React.useCallback((): EditorContext => ({
+  const makeCtx = React.useCallback((): EditorContext => createEditorContext({
+      mode: 'interactive',
       filename: snapshot?.filename ?? null,
       lines:    snapshot?.lines   ?? [],
       cursor:   snapshot?.cursor  ?? { row: 0, col: 0 },
@@ -2108,6 +2234,7 @@ function App({
         confirm: uiConfirm,
         notify,
         panel: openNamedPanel,
+        splash: openSplash,
       },
       git: {
         status: openGitPanel,
@@ -2142,9 +2269,134 @@ function App({
       },
     }), [
       actions, bufferInfos, commandRegistry, currentGitHunk, jumpToDiagnostic, notify, openDiagnosticsPanel,
-      openGitPanelForHunk, openNamedPanel, saveCurrentBuffer, setStatus, shell, shellLines, sidecar, snapshot,
+      openGitPanelForHunk, openNamedPanel, openSplash, saveCurrentBuffer, setStatus, shell, shellLines, sidecar, snapshot,
       uiConfirm, uiInput, uiPick,
     ])
+
+  const pluginStartupRanRef = React.useRef(false)
+
+  React.useEffect(() => {
+    void (async () => {
+      await registerPlugins(commandRegistry)
+      registerCommandActions(evalCommands, commandRegistry)
+      if (pluginStartupRanRef.current) return
+      const startups = await loadPluginStartupActions()
+      if (startups.length === 0) return
+      pluginStartupRanRef.current = true
+      const ctx = makeCtx()
+      for (const action of startups) {
+        await runConfigAction(action, ctx, commandRegistry)
+      }
+    })()
+  }, [commandRegistry, evalCommands, makeCtx])
+
+  const bumpCommandEpoch = React.useCallback(() => {
+    setCommandEpoch(n => n + 1)
+  }, [])
+
+  const evalCurrentFile = React.useCallback(async () => {
+    enterNormal()
+    setPanel(null)
+    const baseCtx = makeCtx()
+    const { ctx, userNotified } = withEvalNotifyTracking(baseCtx)
+    const result = await evalCurrentFileAtPath(
+      commandRegistry,
+      ctx,
+      snapshot?.filename ?? activeBuffer.filename,
+      { lines: snapshot?.lines ?? null },
+    )
+    if (result.kind === 'config') {
+      actions.applyConfig(result.config)
+      setEvalCommands(result.config.commands ?? {})
+      bumpCommandEpoch()
+      notify(result.message, result.ok ? 'info' : 'error')
+      return
+    }
+    if (result.ok && result.commands && Object.keys(result.commands).length > 0) {
+      setEvalCommands(prev => ({ ...prev, ...result.commands! }))
+    }
+    if (result.ok && result.commandIds && result.commandIds.length > 0) {
+      for (const id of result.commandIds) {
+        await commandRegistry.run(id, ctx)
+      }
+    }
+    bumpCommandEpoch()
+    if (!result.ok) notify(result.message, 'error')
+    else if (!userNotified()) notify(result.message, 'info')
+  }, [
+    actions, activeBuffer.filename, bumpCommandEpoch, commandRegistry, enterNormal, makeCtx, notify, snapshot?.filename, snapshot?.lines,
+  ])
+
+  const evalExpression = React.useCallback(async () => {
+    enterNormal()
+    setPanel(null)
+    const body = await uiInput('Eval expression', '')
+    if (body === null) return
+    try {
+      const baseCtx = makeCtx()
+      const { ctx, userNotified } = withEvalNotifyTracking(baseCtx)
+      const result = await runEvalExpression(commandRegistry, ctx, body)
+      if (result.ok && result.commands && Object.keys(result.commands).length > 0) {
+        setEvalCommands(prev => ({ ...prev, ...result.commands! }))
+      }
+      if (result.ok && result.commandIds && result.commandIds.length > 0) {
+        for (const id of result.commandIds) {
+          await commandRegistry.run(id, ctx)
+        }
+      }
+      if (result.ok) bumpCommandEpoch()
+      if (!result.ok) notify(result.message, 'error')
+      else if (result.displayed && !userNotified()) notify(result.message, 'info')
+      else if (!userNotified()) notify(result.message, 'info')
+    } catch (error) {
+      notify(`eval expression failed: ${String(error)}`, 'error')
+    }
+  }, [bumpCommandEpoch, commandRegistry, enterNormal, makeCtx, notify, uiInput])
+
+  const evalRegion = React.useCallback(async () => {
+    let sel: SelBounds | null = null
+    let lines: string[] = []
+
+    if (mode === 'visual' && visualAnchor && snapshot) {
+      sel = selectionBounds(visualAnchor, snapshot.cursor, visualLineMode, snapshot.lines)
+      lines = snapshot.lines
+    } else {
+      const stored = lastVisualSelectionRef.current
+      if (stored) {
+        sel = selectionBounds(stored.anchor, stored.cursor, stored.lineMode, stored.lines)
+        lines = stored.lines
+      }
+    }
+
+    if (!sel || lines.length === 0) {
+      notify('eval selection: select text (v), then SPC p s', 'warn')
+      return
+    }
+
+    const text = getVisualText(lines, sel)
+    if (!text.trim()) {
+      notify('eval selection: selection is empty', 'warn')
+      return
+    }
+
+    enterNormal()
+    setPanel(null)
+    const baseCtx = makeCtx()
+    const { ctx, userNotified } = withEvalNotifyTracking(baseCtx)
+    const result = await runEvalRegion(commandRegistry, ctx, text)
+    if (result.ok && result.commands && Object.keys(result.commands).length > 0) {
+      setEvalCommands(prev => ({ ...prev, ...result.commands! }))
+    }
+    if (result.ok && result.commandIds && result.commandIds.length > 0) {
+      for (const id of result.commandIds) {
+        await commandRegistry.run(id, ctx)
+      }
+    }
+    if (result.ok) bumpCommandEpoch()
+    if (!result.ok) notify(result.message, 'error')
+    else if (result.displayed && !userNotified()) notify(result.message, 'info')
+    else if (!userNotified()) notify(result.message, 'info')
+  }, [bumpCommandEpoch, commandRegistry, enterNormal, makeCtx, mode, notify, snapshot, visualAnchor, visualLineMode])
 
   const leaderMap = React.useMemo(() => buildLeaderMap(
     { save: saveCurrentBuffer, saveAndQuit: saveBufferAndQuit },
@@ -2270,6 +2522,9 @@ function App({
     {
       open:   actions.openConfig,
       reload: () => { void actions.reloadConfig() },
+      evalFile: () => { void evalCurrentFile() },
+      evalExpression: () => { void evalExpression() },
+      evalRegion: () => { void evalRegion() },
     },
     {
       testFile: () => {
@@ -2302,9 +2557,19 @@ function App({
         })
       },
     })),
-  ), [actions, activeBuffer.filename, activeId, buffers, commandRegistry, currentGitHunk, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
+  ), [actions, activeBuffer.filename, activeId, buffers, commandEpoch, commandRegistry, currentGitHunk, evalCurrentFile, evalExpression, evalRegion, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
 
   leaderMapRef.current = leaderMap
+
+  React.useEffect(() => {
+    if (mode !== 'visual' || !visualAnchor || !snapshot) return
+    lastVisualSelectionRef.current = {
+      anchor: { ...visualAnchor },
+      cursor: { ...snapshot.cursor },
+      lineMode: visualLineMode,
+      lines: snapshot.lines,
+    }
+  }, [mode, visualAnchor, visualLineMode, snapshot])
 
   const totalRows  = process.stdout.rows    || 24
   const totalCols  = process.stdout.columns || 80
@@ -2693,7 +2958,7 @@ function App({
     const controller = new AbortController()
     abortRef.current = controller
     setCompletionStreaming(true)
-    setGhostTextSync('')
+    setGhostTextSync(null)
     debugLog('completion', 'trigger_begin', {
       logFile: getDebugLogPath(),
       filename: fname,
@@ -2710,7 +2975,7 @@ function App({
         )) {
           acc += chunk
           const cleaned = sanitizeInlineCompletion(acc, loose)
-          setGhostTextSync(cleaned.length > 0 ? cleaned : '')
+          setGhostTextSync(cleaned.length > 0 ? cleaned : null)
         }
         const finalClean = sanitizeInlineCompletion(acc, loose)
         debugLog('completion', 'trigger_finish', {
@@ -2781,6 +3046,96 @@ function App({
     }
     if (lspOverlay && (key.escape || input === 'q')) {
       actions.clearLspOverlay()
+      return
+    }
+
+    // Config UI prompts must run before panels (AI/shell otherwise steal keystrokes).
+    if (prompt?.type === 'configPick') {
+      if (key.escape) {
+        resolveUiPrompt(prompt.id, null)
+        enterNormal()
+        return
+      }
+      const q = prompt.query.toLowerCase()
+      const filtered = prompt.items.filter(item =>
+        !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
+      )
+      const selected = Math.min(prompt.selected, Math.max(0, filtered.length - 1))
+      if (key.return) {
+        resolveUiPrompt(prompt.id, filtered[selected]?.value ?? null)
+        enterNormal()
+        return
+      }
+      if (key.upArrow || input === 'k') {
+        setPrompt(prev => prev?.type === 'configPick'
+          ? { ...prev, selected: Math.max(0, prev.selected - 1) }
+          : prev)
+        return
+      }
+      if (key.downArrow || input === 'j') {
+        setPrompt(prev => prev?.type === 'configPick'
+          ? { ...prev, selected: Math.min(Math.max(0, filtered.length - 1), prev.selected + 1) }
+          : prev)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
+        return
+      }
+      return
+    }
+
+    if (prompt?.type === 'configInput') {
+      if (key.escape) {
+        resolveUiPrompt(prompt.id, null)
+        enterNormal()
+        return
+      }
+      if (key.return) {
+        resolveUiPrompt(prompt.id, prompt.value)
+        enterNormal()
+        return
+      }
+      if ((key.ctrl || key.meta || key.super) && (input === 'v' || input === 'V')) {
+        const clip = readClipboardText()
+        if (clip) {
+          const pasted = normalizePromptPaste(clip)
+          setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value + pasted } : prev)
+        }
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value.slice(0, -1) } : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && promptPasteText(input)) {
+        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value + input } : prev)
+        return
+      }
+      return
+    }
+
+    if (prompt?.type === 'configConfirm') {
+      if (key.escape || input === 'n' || input === 'N') {
+        resolveUiPrompt(prompt.id, false)
+        enterNormal()
+        return
+      }
+      if (input === 'y' || input === 'Y' || key.return) {
+        resolveUiPrompt(prompt.id, true)
+        enterNormal()
+        return
+      }
+      return
+    }
+
+    // ── Splash panel (startup welcome) ────────────────────────────────────────
+    if (panel?.type === 'splash') {
+      if (key.return || key.escape) { setPanel(null); return }
       return
     }
 
@@ -3192,81 +3547,6 @@ function App({
       return
     }
 
-    if (prompt?.type === 'configPick') {
-      if (key.escape) {
-        resolveUiPrompt(prompt.id, null)
-        enterNormal()
-        return
-      }
-      const q = prompt.query.toLowerCase()
-      const filtered = prompt.items.filter(item =>
-        !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
-      )
-      const selected = Math.min(prompt.selected, Math.max(0, filtered.length - 1))
-      if (key.return) {
-        resolveUiPrompt(prompt.id, filtered[selected]?.value ?? null)
-        enterNormal()
-        return
-      }
-      if (key.upArrow || input === 'k') {
-        setPrompt(prev => prev?.type === 'configPick'
-          ? { ...prev, selected: Math.max(0, Math.min(prev.selected, filtered.length - 1) - 1) }
-          : prev)
-        return
-      }
-      if (key.downArrow || input === 'j') {
-        setPrompt(prev => prev?.type === 'configPick'
-          ? { ...prev, selected: Math.min(Math.max(0, filtered.length - 1), prev.selected + 1) }
-          : prev)
-        return
-      }
-      if (key.backspace || key.delete) {
-        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
-        return
-      }
-      if (!key.ctrl && !key.meta && printable(input)) {
-        setPrompt(prev => prev?.type === 'configPick' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
-        return
-      }
-      return
-    }
-
-    if (prompt?.type === 'configInput') {
-      if (key.escape) {
-        resolveUiPrompt(prompt.id, null)
-        enterNormal()
-        return
-      }
-      if (key.return) {
-        resolveUiPrompt(prompt.id, prompt.value)
-        enterNormal()
-        return
-      }
-      if (key.backspace || key.delete) {
-        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value.slice(0, -1) } : prev)
-        return
-      }
-      if (!key.ctrl && !key.meta && printable(input)) {
-        setPrompt(prev => prev?.type === 'configInput' ? { ...prev, value: prev.value + input } : prev)
-        return
-      }
-      return
-    }
-
-    if (prompt?.type === 'configConfirm') {
-      if (key.escape || input === 'n' || input === 'N') {
-        resolveUiPrompt(prompt.id, false)
-        enterNormal()
-        return
-      }
-      if (input === 'y' || input === 'Y' || key.return) {
-        resolveUiPrompt(prompt.id, true)
-        enterNormal()
-        return
-      }
-      return
-    }
-
     // ── Commit prompt ────────────────────────────────────────────────────────
     if (prompt?.type === 'commit') {
       if (key.escape) { replacePrompt(null); return }
@@ -3531,12 +3811,26 @@ function App({
         }
         return
       }
-      if (!key.ctrl && !key.meta && printable(input)) { sidecar.insert(input) }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        if (ghostTextRef.current !== null || completionStreaming) {
+          abortRef.current?.abort()
+          abortRef.current = null
+          setGhostTextSync(null)
+          setCompletionStreaming(false)
+        }
+        sidecar.insert(input)
+      }
       return
     }
 
     // ── Visual mode ───────────────────────────────────────────────────────────
     if (mode === 'visual') {
+      if (input === ' ' && !key.ctrl && !key.meta) {
+        pendingKeyRef.current = null
+        setPanel({ type: 'whichkey', node: leaderMap, path: '' })
+        return
+      }
+
       if (input === '/') {
         visualExpandHistoryRef.current = []
         setVisualAnchor(null)
@@ -3806,6 +4100,20 @@ function App({
     : null
   const diredEntries = panel?.type === 'dired' ? readDiredEntries(panel.path) : []
 
+  if (panel?.type === 'splash') {
+    return (
+      <Box flexDirection="column" width={totalCols} height={totalRows}>
+        <SplashPanel
+          title={panel.title}
+          message={panel.message}
+          hint={panel.hint}
+          totalRows={totalRows}
+          totalCols={totalCols}
+        />
+      </Box>
+    )
+  }
+
   if (panel?.type === 'git') {
     return (
       <Box flexDirection="column" width={totalCols} height={totalRows}>
@@ -3872,6 +4180,7 @@ function App({
       cmdBuf={cmdBuf}
       searchBuf={searchBuf}
       aiModelLabel={aiModelLabel}
+      flashMessage={flashMessage}
     />
   )
 
@@ -4024,7 +4333,7 @@ async function main() {
 
   const bufferInfos = () => buffers.map(buffer => toBufferInfo(buffer, activeId))
 
-  const makeHookRegistry = (buffer: EditorBuffer): CommandRegistry => {
+  const createHookRegistry = (): CommandRegistry => {
     const registry = new CommandRegistry()
     registry.register('file.save', 'file: save', () => activeSidecar?.save())
     registry.register('shell.run', 'shell: run command', (ctx, args) => {
@@ -4040,10 +4349,20 @@ async function main() {
     return registry
   }
 
-  const makeCtx = (buffer: EditorBuffer): EditorContext => ({
+  let hookRegistry = createHookRegistry()
+  void registerPlugins(hookRegistry)
+
+  const hookNotify = (buffer: EditorBuffer, message: string, level: ConfigNotifyLevel = 'info') => {
+    buffer.status = level === 'info' ? message : `${level}: ${message}`
+    refresh()
+  }
+
+  const makeCtx = (buffer: EditorBuffer, shellRun: ShellRun | null = null): EditorContext => createEditorContext({
+    mode: 'hook',
     filename: buffer.snapshot?.filename ?? buffer.filename,
     lines:    buffer.snapshot?.lines   ?? [],
     cursor:   buffer.snapshot?.cursor  ?? { row: 0, col: 0 },
+    lastShellRun: shellRun,
     save:     () => activeSidecar?.save(),
     quit:     quitAll,
     insert:   (text) => activeSidecar?.insert(text),
@@ -4059,18 +4378,9 @@ async function main() {
     },
     openFile,
     commands: {
-      run: async (id, args) => makeHookRegistry(buffer).run(id, makeCtx(buffer), args),
+      run: async (id, args) => hookRegistry.run(id, makeCtx(buffer), args),
     },
-    ui: {
-      pick: async () => null,
-      input: async () => null,
-      confirm: async () => false,
-      notify: (message, level = 'info') => {
-        buffer.status = level === 'info' ? message : `${level}: ${message}`
-        refresh()
-      },
-      panel: () => {},
-    },
+    ui: hookUiStubs((message, level) => hookNotify(buffer, message, level)),
     git: {
       status: () => {},
       stageCurrentFile: () => {},
@@ -4095,9 +4405,9 @@ async function main() {
     },
   })
 
-  function runHookAction(action: ConfigAction, buffer: EditorBuffer): void {
-    const ctx = makeCtx(buffer)
-    void runConfigAction(action, ctx, makeHookRegistry(buffer)).catch(error => {
+  function runHookAction(action: ConfigAction, buffer: EditorBuffer, shellRun: ShellRun | null = null): void {
+    const ctx = makeCtx(buffer, shellRun)
+    void runConfigAction(action, ctx, hookRegistry).catch(error => {
       buffer.status = `config hook failed: ${String(error)}`
       refresh()
     })
@@ -4213,10 +4523,14 @@ async function main() {
 
   function activateBuffer(buffer: EditorBuffer): void {
     if (activeSidecar) { activeSidecar.kill(); activeSidecar = null }
+    const previousId = activeId
     activeId = buffer.id
     buffer.lastUsedAt = Date.now()
     bufferSwitchCount++
     activeSidecar = createSidecarForBuffer(buffer)
+    if (previousId !== buffer.id && cfg.hooks?.onBufEnter) {
+      runHookAction(cfg.hooks.onBufEnter, buffer)
+    }
   }
 
   function ensureScratch(): void {
@@ -4355,6 +4669,16 @@ async function main() {
 
   async function reloadCfg() {
     cfg = await reloadConfig()
+    hookRegistry = createHookRegistry()
+    await registerPlugins(hookRegistry)
+    if (cfg.theme) C = { ...C, ...(cfg.theme as Partial<Theme>) }
+    refresh()
+  }
+
+  function applyCfg(next: QeConfig) {
+    cfg = next
+    hookRegistry = createHookRegistry()
+    void registerPlugins(hookRegistry).then(() => refresh())
     if (cfg.theme) C = { ...C, ...(cfg.theme as Partial<Theme>) }
     refresh()
   }
@@ -4387,6 +4711,7 @@ async function main() {
             newScratch,
             quitAll,
             reloadConfig: reloadCfg,
+            applyConfig: applyCfg,
             openConfig,
             clearLspOverlay: () => {
               lspOverlay = null
@@ -4407,6 +4732,10 @@ async function main() {
 
   // Throttle shell redraws to ~60fps to avoid sticky editor feel
   let shellUpdateTimer: ReturnType<typeof setTimeout> | null = null
+  shell.on('done', (run: ShellRun) => {
+    if (!run.command.trim() || quitting) return
+    if (cfg.hooks?.onShellDone) runHookAction(cfg.hooks.onShellDone, activeBuffer(), run)
+  })
   shell.on('line', (line: ShellLine) => {
     shellLines = [...shellLines, line]
     if (shellLines.length > 500) shellLines = shellLines.slice(-500)

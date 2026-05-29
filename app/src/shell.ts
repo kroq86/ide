@@ -238,7 +238,9 @@ export class ShellSidecar extends EventEmitter {
       const timer = setTimeout(() => {
         this.#tracked.delete(id)
         run.endedAt = new Date().toISOString()
-        resolve({ ...run })
+        const result = { ...run }
+        this.emit('done', result)
+        resolve(result)
       }, 120000)
 
       this.#tracked.set(id, { run, timer, resolve })
@@ -292,7 +294,9 @@ export class ShellSidecar extends EventEmitter {
         run.endedAt = new Date().toISOString()
         this.#pushLine(`exit ${run.exitCode ?? 'unknown'}`, run.exitCode !== 0)
         this.emit('update')
-        resolve({ ...run })
+        const result = { ...run }
+        this.emit('done', result)
+        resolve(result)
       })
     })
   }
@@ -323,7 +327,9 @@ export class ShellSidecar extends EventEmitter {
     this.#tracked.delete(match[1]!)
     tracked.run.exitCode = parseInt(match[2]!, 10)
     tracked.run.endedAt = new Date().toISOString()
-    tracked.resolve({ ...tracked.run })
+    const result = { ...tracked.run }
+    this.emit('done', result)
+    tracked.resolve(result)
     return true
   }
 

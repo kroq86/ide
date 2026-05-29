@@ -11,6 +11,7 @@ const pty = require('node-pty')
 export const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 export const repoRoot = resolve(appRoot, '..')
 export const qeEntry = join(appRoot, 'dist/main.js')
+export const qeCli = join(repoRoot, 'bin/qe.mjs')
 const bridgePath = join(appRoot, 'test/e2e/pty-bridge.py')
 
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g
@@ -21,7 +22,15 @@ export function stripAnsi(text) {
 
 export function spawnQe(args = [], options = {}) {
   assert.ok(existsSync(qeEntry), `Missing ${qeEntry}. Run npm --prefix app run build first.`)
+  return spawnCommand(process.execPath, [qeEntry, ...args], options)
+}
 
+export function spawnQeCli(args = [], options = {}) {
+  assert.ok(existsSync(qeCli), `Missing ${qeCli}.`)
+  return spawnCommand(process.execPath, [qeCli, ...args], options)
+}
+
+export function spawnCommand(file, args = [], options = {}) {
   const cwd = options.cwd ?? repoRoot
   const home = options.home ?? cwd
   const cols = options.cols ?? 100
@@ -30,13 +39,14 @@ export function spawnQe(args = [], options = {}) {
   const keys = []
   let raw = ''
 
-  const term = createPtyProcess(process.execPath, [qeEntry, ...args], {
+  const term = createPtyProcess(file, args, {
     name: 'xterm-256color',
     cols,
     rows,
     cwd,
     env: {
       ...process.env,
+      ...(options.env ?? {}),
       HOME: home,
       TERM: 'xterm-256color',
       FORCE_COLOR: '0',

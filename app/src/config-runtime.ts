@@ -42,14 +42,24 @@ export class CommandRegistry {
   }
 }
 
-export function registerConfigCommands(config: QeConfig, registry: CommandRegistry): void {
-  for (const [id, action] of Object.entries(config.commands ?? {})) {
+export function registerCommandActions(
+  commands: Record<string, ConfigAction>,
+  registry: CommandRegistry,
+): string[] {
+  const ids: string[] = []
+  for (const [id, action] of Object.entries(commands)) {
     if (!isConfigAction(action)) continue
     const label = commandLabel(action) ?? id
     registry.register(id, label, async (ctx) => {
       await runConfigAction(action, ctx, registry)
     })
+    ids.push(id)
   }
+  return ids
+}
+
+export function registerConfigCommands(config: QeConfig, registry: CommandRegistry): void {
+  registerCommandActions(config.commands ?? {}, registry)
 }
 
 export async function runConfigAction(
@@ -131,6 +141,13 @@ export async function executeDirective(
       break
     case 'ui.notify':
       ctx.ui.notify(directive.message, directive.level)
+      break
+    case 'ui.splash':
+      ctx.ui.splash({
+        title: directive.title,
+        message: directive.message,
+        hint: directive.hint,
+      })
       break
     default: {
       const unknownType = String((directive as { type?: unknown }).type)

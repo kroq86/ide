@@ -92,6 +92,9 @@ export const COMMAND_LABELS: Record<string, string> = {
   'u d': 'ui: toggle diagnostics',
   'p e': 'config: edit config file',
   'p r': 'config: reload config',
+  'p f': 'config: eval file',
+  'p ;': 'config: eval expression',
+  'p s': 'config: eval selection',
   'm t f': 'mode: test current file',
   'm t a': 'mode: test all',
   ':': 'command palette',
@@ -190,6 +193,9 @@ export function buildLeaderMap(
   config: {
     open: () => void
     reload: () => void
+    evalFile: () => void
+    evalExpression: () => void
+    evalRegion: () => void
   },
   mode: {
     testFile: () => void
@@ -281,6 +287,9 @@ export function buildLeaderMap(
     p: {
       e: config.open,
       r: config.reload,
+      f: config.evalFile,
+      ';': config.evalExpression,
+      s: config.evalRegion,
     },
     m: {
       t: {
