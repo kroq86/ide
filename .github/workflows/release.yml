@@ -40,7 +40,9 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      - run: npm install --no-audit --no-fund
+      - run: npm run build:terminal-core
 
       - name: Build JS bundle
         run: npm --workspace qe-react-editor-app run build

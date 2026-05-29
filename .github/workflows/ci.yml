@@ -18,7 +18,11 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - run: npm ci
+      # ignore-scripts: terminal-react-core must not build during ci (rollup native
+      # optional deps are platform-specific; lockfile may come from macOS).
+      - run: npm ci --ignore-scripts
+      - run: npm install --no-audit --no-fund
+      - run: npm run build:terminal-core
 
       - run: npm run typecheck
 
