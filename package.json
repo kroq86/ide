@@ -24,10 +24,5 @@
     "test:install": "node --test scripts/install-contract.test.mjs",
     "test:protocol": "npm run build:native && node app/test/protocol-smoke.mjs",
     "test:codeclaw": "npm --workspace qe-react-editor-app run test:codeclaw"
-  },
-  "optionalDependencies": {
-    "@rollup/rollup-darwin-arm64": "4.60.4",
-    "@rollup/rollup-darwin-x64": "4.60.4",
-    "@rollup/rollup-linux-x64-gnu": "4.60.4"
   }
 }

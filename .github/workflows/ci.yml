@@ -18,11 +18,11 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      # ignore-scripts: terminal-react-core must not build during install (tsup/rollup).
-      # Lockfile lists platform rollup binaries; rm node_modules so npm ci resolves
-      # the correct optional native module for this runner (not a stale macOS tree).
+      # Do not use npm ci: lockfile is generated on macOS and omits Linux optional
+      # native packages (@esbuild/linux-x64, @rollup/rollup-linux-x64-gnu, etc.).
+      # npm install resolves platform optionals for the current runner.
       - run: rm -rf node_modules
-      - run: npm ci --ignore-scripts
+      - run: npm install --no-audit --no-fund
       - run: npm run build:terminal-core
 
       - run: npm run typecheck
