@@ -40,8 +40,8 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - run: rm -rf node_modules
       - run: npm ci --ignore-scripts
-      - run: npm install --no-audit --no-fund
       - run: npm run build:terminal-core
 
       - name: Build JS bundle
