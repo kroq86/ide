@@ -207,7 +207,7 @@ jobs:
             -e "s/PLACEHOLDER_darwin_arm64/${{ steps.sha.outputs.arm64 }}/g" \
             -e "s/PLACEHOLDER_darwin_x86_64/${{ steps.sha.outputs.x86 }}/g" \
             -e "s/PLACEHOLDER_linux_x86_64/${{ steps.sha.outputs.linux }}/g" \
-            -e "s/version \"0.1.0\"/version \"$VERSION\"/g" \
+            -e "s/version \"[0-9][0-9.]*\"/version \"$VERSION\"/g" \
             docs/homebrew-formula.rb > tap/Formula/qe.rb  || \
           { echo "Formula template missing — skipping homebrew update"; exit 0; }
 
