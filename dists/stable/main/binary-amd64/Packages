@@ -10,3 +10,15 @@ SHA1: be6042dd5c100422b44c75cd717a930fd3d44f76
 SHA256: dd87d02f814b5f27db7cc9fb64741351734a584ff306e2d54482e40ff53beea3
 Description: Terminal editor with Vim keybindings, Git, LSP, and AI support
 
+Package: qe
+Version: 0.1.1
+Architecture: amd64
+Maintainer: KO <djkroq@gmail.com>
+Depends: nodejs (>= 22)
+Filename: pool/main/qe_0.1.1_amd64.deb
+Size: 1224110
+MD5sum: 916842cf65764fb3b314b4913ce25dcc
+SHA1: 94c0328aca0cc530a278f0b913b7083871208e4c
+SHA256: 60b2b3f33a6ebc37a57e1acdc375c18938cbfe8700ced02a36fa3f67158d9d07
+Description: Terminal editor with Vim keybindings, Git, LSP, and AI support
+
