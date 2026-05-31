@@ -154,7 +154,7 @@ jobs:
 
           # Build Packages index
           (cd gh-pages && dpkg-scanpackages --multiversion pool/main /dev/null > dists/stable/main/binary-amd64/Packages)
-          gzip -k gh-pages/dists/stable/main/binary-amd64/Packages
+          gzip -kf gh-pages/dists/stable/main/binary-amd64/Packages
 
           # Build Release
           (cd gh-pages/dists/stable && apt-ftparchive release . > Release)
