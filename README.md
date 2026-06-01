@@ -255,12 +255,16 @@ Press **`SPC`** in normal mode for which-key. Bindings are defined in [`app/src/
 | `SPC a e` | ai: explain last error |
 | `SPC a l` | ai: rerun last shell command |
 | `SPC a k` | ai: clear chat |
-| `SPC t t` | terminal: toggle shell |
+| `SPC t t` | terminal: toggle shell **panel** (strip under editor) |
 | `SPC t a` | workspace: AI tab |
-| `SPC t p` | workspace: process tab |
+| `SPC t p` | workspace: **process** tab (full-screen shell) |
 | `SPC t c` | workspace: code tab |
+
+Shell **panel** vs **process** tab: same sidecar, different layout — see [`docs/workspace-ui.md`](docs/workspace-ui.md).
 | `SPC m t` | tasks: pick and run |
 | `Option-1..9` | switch to numbered tab shown as `⌥N` |
+| `Option-[` / `Option-]` | previous / next workflow tab (buffers, then process, then AI); macOS may send `«` / `»` |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | same, when Option+[ does not register as Meta |
 | `SPC g g` | git: status — ll commit log (Magit) |
 | `SPC g s` | git: stage current |
 | `SPC g h n/p` | git: next / previous hunk |
@@ -299,9 +303,11 @@ npm run install:check      # verify built CLI install readiness
 npm run test:install       # isolated clone/build/link installability contract
 npm run test:codeclaw      # CodeClaw tests only (tsx)
 npm run test:protocol      # build native + protocol smoke
-npm run build              # native release + app esbuild bundle
+npm run build              # native release + minified app bundle (~600kb; see docs/build.md)
 cargo test --manifest-path native/editor-core/Cargo.toml
 ```
+
+Bundle size and `dist/main.js … ⚠️` meaning: [`docs/build.md`](docs/build.md).
 
 Terminal E2E expectations are specified in [`docs/e2e-spec.md`](docs/e2e-spec.md).
 

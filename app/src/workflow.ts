@@ -1,5 +1,39 @@
 export type WorkspaceTab = 'code' | 'process' | 'ai'
 
+/** macOS Option+[ / Option+] when the terminal does not send ESC-prefix meta. */
+const WORKFLOW_TAB_PREV_CHARS = new Set(['\u00ab', '«'])
+const WORKFLOW_TAB_NEXT_CHARS = new Set(['\u00bb', '»'])
+
+const WORKFLOW_TAB_PREV_SEQUENCES = new Set(['\x1b[', '\x1b{', '\x1b[91;3u', '\x1b[27;3;91~'])
+const WORKFLOW_TAB_NEXT_SEQUENCES = new Set(['\x1b]', '\x1b}', '\x1b[93;3u', '\x1b[27;3;93~'])
+
+export function isWorkflowTabPrevInput(
+  input: string,
+  key: { meta?: boolean; pageUp?: boolean; ctrl?: boolean },
+  sequence?: string,
+): boolean {
+  if (sequence && WORKFLOW_TAB_PREV_SEQUENCES.has(sequence)) return true
+  if (WORKFLOW_TAB_PREV_CHARS.has(input)) return true
+  if (key.ctrl && key.pageUp) return true
+  return Boolean(key.meta && (input === '[' || input === '{'))
+}
+
+export function isWorkflowTabNextInput(
+  input: string,
+  key: { meta?: boolean; pageDown?: boolean; ctrl?: boolean },
+  sequence?: string,
+): boolean {
+  if (sequence && WORKFLOW_TAB_NEXT_SEQUENCES.has(sequence)) return true
+  if (WORKFLOW_TAB_NEXT_CHARS.has(input)) return true
+  if (key.ctrl && key.pageDown) return true
+  return Boolean(key.meta && (input === ']' || input === '}'))
+}
+
+/** After a lone Esc, the next `[` / `]` may be Option+[ / Option+] split across reads. */
+export function shouldArmWorkflowTabBracket(key: { escape?: boolean }, input: string): boolean {
+  return Boolean(key.escape && input === '')
+}
+
 export type QeTask = {
   name: string
   command: string
@@ -36,6 +70,30 @@ export type WorkflowSession = {
 export function normalizeWorkspaceTab(value: unknown): WorkspaceTab {
   if (value === 'ai') return 'ai'
   return value === 'process' ? 'process' : 'code'
+}
+
+/** Resolve a config task for hook/plugin runs (no interactive pick). */
+export function resolveHookTask(
+  tasks: readonly QeTask[] | undefined,
+  args?: Record<string, unknown>,
+): { task: QeTask } | { error: string } {
+  const normalized = normalizeTasks(tasks)
+  if (normalized.length === 0) return { error: 'tasks: no tasks configured' }
+
+  const name = typeof args?.task === 'string'
+    ? args.task
+    : typeof args?.name === 'string'
+      ? args.name
+      : undefined
+
+  if (name) {
+    const task = normalized.find(candidate => candidate.name === name)
+    if (!task) return { error: `tasks: unknown task: ${name}` }
+    return { task }
+  }
+
+  if (normalized.length === 1) return { task: normalized[0]! }
+  return { error: 'tasks: pass args.task when multiple tasks are configured' }
 }
 
 export function normalizeTasks(tasks: readonly QeTask[] | undefined): QeTask[] {

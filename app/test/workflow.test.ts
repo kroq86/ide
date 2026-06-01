@@ -2,11 +2,30 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildBufferTabSegments,
+  isWorkflowTabNextInput,
+  isWorkflowTabPrevInput,
+  shouldArmWorkflowTabBracket,
   normalizeTasks,
   normalizeWorkspaceTab,
   parseWorkflowSession,
+  resolveHookTask,
   sessionFromBuffers,
 } from '../src/workflow.ts'
+
+describe('workflow tab keys', () => {
+  it('recognizes meta brackets and macOS option glyphs', () => {
+    assert.equal(isWorkflowTabPrevInput('[', { meta: true }), true)
+    assert.equal(isWorkflowTabNextInput(']', { meta: true }), true)
+    assert.equal(isWorkflowTabPrevInput('[', { meta: false }), false)
+    assert.equal(isWorkflowTabPrevInput('«', { meta: false }), true)
+    assert.equal(isWorkflowTabNextInput('»', { meta: false }), true)
+    assert.equal(isWorkflowTabPrevInput('', { ctrl: true, pageUp: true }), true)
+    assert.equal(isWorkflowTabNextInput('', { ctrl: true, pageDown: true }), true)
+    assert.equal(isWorkflowTabPrevInput('[', { meta: false }, '\x1b['), true)
+    assert.equal(shouldArmWorkflowTabBracket({ escape: true }, ''), true)
+    assert.equal(shouldArmWorkflowTabBracket({ escape: true }, 'q'), false)
+  })
+})
 
 describe('workflow buffer tabs', () => {
   it('keeps the active buffer visible and marks dirty buffers', () => {
@@ -117,5 +136,37 @@ describe('workflow session', () => {
   it('parses restored AI workspace sessions', () => {
     const session = parseWorkflowSession({ files: [], activeFile: null, workspaceTab: 'ai' })
     assert.equal(session?.workspaceTab, 'ai')
+  })
+})
+
+describe('resolveHookTask', () => {
+  const tasks = [
+    { name: 'dev', command: 'npm run dev', tab: 'process' as const },
+    { name: 'test', command: 'npm test', tab: 'shell' as const },
+  ]
+
+  it('resolves by args.task', () => {
+    const result = resolveHookTask(tasks, { task: 'test' })
+    assert.ok('task' in result)
+    assert.equal(result.task.name, 'test')
+  })
+
+  it('uses the only task when args omitted', () => {
+    const single = [{ name: 'only', command: 'echo hi' }]
+    const result = resolveHookTask(single, {})
+    assert.ok('task' in result)
+    assert.equal(result.task.name, 'only')
+  })
+
+  it('requires args.task when multiple tasks configured', () => {
+    const result = resolveHookTask(tasks, {})
+    assert.ok('error' in result)
+    assert.match(result.error, /args\.task/)
+  })
+
+  it('reports unknown task name', () => {
+    const result = resolveHookTask(tasks, { task: 'missing' })
+    assert.ok('error' in result)
+    assert.match(result.error, /unknown task/)
   })
 })

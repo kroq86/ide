@@ -117,6 +117,14 @@ export function hunkNewStartRow(header: string): number | null {
   return Math.max(0, n - 1)
 }
 
+export function updateGitEntry(
+  entries: GitFileEntry[],
+  path: string,
+  fn: (e: GitFileEntry) => GitFileEntry,
+): GitFileEntry[] {
+  return entries.map(e => (e.path === path ? fn(e) : e))
+}
+
 export function loadGitStatus(cwd: string): GitStatusData {
   const root = getGitRepoRoot(cwd)
   const data: GitStatusData = {

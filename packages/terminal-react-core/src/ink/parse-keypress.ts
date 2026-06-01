@@ -9,7 +9,8 @@ import { PASTE_END, PASTE_START } from './termio/csi.js'
 import { createTokenizer, type Tokenizer } from './termio/tokenize.js'
 
 // eslint-disable-next-line no-control-regex
-const META_KEY_CODE_RE = /^(?:\x1b)([a-zA-Z0-9])$/
+// Alt/Meta + printable (incl. [ ] { } for Option+[ ] on US layouts).
+const META_KEY_CODE_RE = /^(?:\x1b)([a-zA-Z0-9\[\]{}])$/
 
 // eslint-disable-next-line no-control-regex
 const FN_KEY_RE =
