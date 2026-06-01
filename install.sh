@@ -5,7 +5,7 @@
 
 set -e
 
-VERSION="0.1.0"
+VERSION="0.1.3"
 REPO="kroq86/ide"
 PREFIX="${1:---prefix}"
 if [ "$PREFIX" = "--prefix" ]; then PREFIX="${2:-/usr/local}"; fi

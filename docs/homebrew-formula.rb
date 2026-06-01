@@ -16,7 +16,7 @@ class Qe < Formula
   desc "Terminal editor: Vim keybindings, Git, LSP, AI (optional)"
   homepage "https://github.com/kroq86/ide"
   license "MIT"
-  version "0.1.1"
+  version "0.1.3"
 
   on_macos do
     on_arm do

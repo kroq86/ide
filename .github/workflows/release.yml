@@ -121,8 +121,7 @@ jobs:
           Description: Terminal editor with Vim keybindings, Git, LSP, and AI support
           EOF
 
-          cp "qe-${{ github.ref_name }}-linux-x86_64/libexec/main.js"     "$PKG/usr/lib/qe/main.js"
-          cp "qe-${{ github.ref_name }}-linux-x86_64/libexec/editor-core" "$PKG/usr/lib/qe/editor-core"
+          cp -R "qe-${{ github.ref_name }}-linux-x86_64/libexec/." "$PKG/usr/lib/qe/"
           chmod 755 "$PKG/usr/lib/qe/editor-core"
 
           printf '#!/bin/sh\nexec node /usr/lib/qe/main.js "$@"\n' > "$PKG/usr/bin/qe"

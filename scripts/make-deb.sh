@@ -37,8 +37,7 @@ if [ ! -d "$TARDIR" ]; then
   exit 1
 fi
 
-cp "$TARDIR/libexec/main.js"     "$PKG/usr/lib/qe/main.js"
-cp "$TARDIR/libexec/editor-core" "$PKG/usr/lib/qe/editor-core"
+cp -R "$TARDIR/libexec/." "$PKG/usr/lib/qe/"
 chmod 755 "$PKG/usr/lib/qe/editor-core"
 
 cat > "$PKG/usr/bin/qe" <<'SH'
