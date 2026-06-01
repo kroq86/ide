@@ -1,5 +1,5 @@
 import React from 'react'
-import { realpathSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -68,6 +68,15 @@ import { debugLog, getDebugLogPath } from './debug-log.js'
 import { detectProjectRoot } from './root.js'
 import { diagnosticAtCursor, formatDiagnostic, nextDiagnostic, sortDiagnostics } from './diagnostics.js'
 import { nearestIdentifierPosition } from './lsp-position.js'
+import {
+  buildBufferTabSegments,
+  normalizeTasks,
+  normalizeWorkspaceTab,
+  parseWorkflowSession,
+  sessionFromBuffers,
+  type WorkspaceTab,
+  type WorkflowSession,
+} from './workflow.js'
 
 
 /** Keep header readable on narrow terminals (avoid path/status/search overlapping). */
@@ -227,6 +236,9 @@ type LspOverlay = {
   title: string
   lines: string[]
 }
+
+const PROCESS_TAB_ID = '__qe_process__'
+const AI_TAB_ID = '__qe_ai__'
 
 type NormalizedPickItem = {
   label: string
@@ -627,7 +639,7 @@ function CmdPalettePanel({
     <Box flexDirection="column" width={width}>
       <Box flexDirection="row">
         <Text backgroundColor={C.violet} color={C.bg}> M-x </Text>
-        <Text color={C.grey}>  j/k=navigate  Enter=run  Esc=close</Text>
+        <Text color={C.grey}>{query ? `  ${query}  Enter=run  Esc=close` : '  j/k=navigate  Enter=run  Esc=close'}</Text>
       </Box>
       <Box flexDirection="row" marginTop={1}>
         <Text color={C.yellow}>{'> '}</Text>
@@ -779,6 +791,88 @@ function filterBuffers(buffers: EditorBuffer[], query: string): EditorBuffer[] {
     const filename = buffer.snapshot?.filename ?? buffer.filename ?? ''
     return buffer.name.toLowerCase().includes(q) || filename.toLowerCase().includes(q)
   })
+}
+
+function WorkflowTabBar({
+  buffers, activeBufferId, workspaceTab, width,
+}: {
+  buffers: EditorBuffer[]
+  activeBufferId: string
+  workspaceTab: WorkspaceTab
+  width: number
+}) {
+  const processActive = workspaceTab === 'process'
+  const aiActive = workspaceTab === 'ai'
+  const tabSegments = buildBufferTabSegments(
+    [
+      ...buffers.map(buffer => ({
+        id: buffer.id,
+        name: buffer.name,
+        filename: buffer.snapshot?.filename ?? buffer.filename,
+        dirty: isDirty(buffer),
+        active: !processActive && !aiActive && buffer.id === activeBufferId,
+        lastUsedAt: buffer.lastUsedAt,
+      })),
+      {
+        id: PROCESS_TAB_ID,
+        name: 'process',
+        filename: null,
+        dirty: false,
+        active: processActive,
+        lastUsedAt: Number.MIN_SAFE_INTEGER,
+      },
+      {
+        id: AI_TAB_ID,
+        name: 'ai',
+        filename: null,
+        dirty: false,
+        active: aiActive,
+        lastUsedAt: Number.MIN_SAFE_INTEGER,
+      },
+    ],
+    Math.max(8, width),
+  )
+
+  return (
+    <Box flexDirection="row">
+      {tabSegments.length === 0
+        ? <Text backgroundColor="#21252b" color={C.grey}>{' tabs '}</Text>
+        : tabSegments.map((segment, index) => {
+            if (segment.kind === 'overflow') {
+              return <Text key={`overflow-${index}`} backgroundColor="#21252b" color={C.grey}>{segment.label}</Text>
+            }
+            const isProcess = segment.id === PROCESS_TAB_ID
+            const isAi = segment.id === AI_TAB_ID
+            const bg = segment.active ? C.cyan : '#21252b'
+            const fg = segment.active ? C.bg : isAi ? C.magenta : isProcess ? C.green : segment.dirty ? C.yellow : C.grey
+            return <Text key={segment.id} backgroundColor={bg} color={fg}>{segment.label}</Text>
+          })}
+    </Box>
+  )
+}
+
+function workflowSessionPath(cwd: string): string {
+  return join(cwd, '.qe', 'session.json')
+}
+
+function loadWorkflowSession(cwd: string): WorkflowSession | null {
+  const path = workflowSessionPath(cwd)
+  if (!existsSync(path)) return null
+  try {
+    return parseWorkflowSession(JSON.parse(readFileSync(path, 'utf8')))
+  } catch {
+    return null
+  }
+}
+
+function saveWorkflowSession(cwd: string, session: WorkflowSession): void {
+  const path = workflowSessionPath(cwd)
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, `${JSON.stringify(session, null, 2)}\n`, 'utf8')
+  } catch {
+    // Session restore is a convenience feature; never block quitting on it.
+  }
 }
 
 // ── Shell pane ────────────────────────────────────────────────────────────────
@@ -1355,7 +1449,7 @@ function GitPanel({ data, cursor, pendingKey, logEntries, gitError, view, displa
       : 'j/k  TAB=expand  Ret=open  s/u=stage  ll=log  cc=commit  F=pull  P=push  q/Esc=close'
   const hintColor: ThemeColor = gitError ? C.red : C.grey
 
-  const gitTitleLeft = ` *git*  ${data.branch} `
+  const gitTitleLeft = ` *git*  *git*  ${data.branch} `
   const gitTitlePad = ' '.repeat(Math.max(0, totalCols - gitTitleLeft.length - hint.length - 2))
   return (
     <Box flexDirection="column" width={totalCols} height={totalRows}>
@@ -1505,6 +1599,7 @@ type EditorPaneProps = {
   paneHeight: number
   paneWidth?: number
   panel: Panel
+  workspaceTab: WorkspaceTab
   sel: SelBounds | null
   searchQuery: string
   cmdBuf: string
@@ -1515,7 +1610,7 @@ type EditorPaneProps = {
 
 function EditorPane({
   filename, snapshot, status, bufferName, bufferIndex, bufferCount, buffers, prompt,
-  activeBufferId, ghostText, completionStreaming, thinkingTick, mode, scrollOffset, panelRows, paneWidth, panel,
+  activeBufferId, ghostText, completionStreaming, thinkingTick, mode, scrollOffset, panelRows, paneWidth, panel, workspaceTab,
   paneHeight, sel, searchQuery, cmdBuf, searchBuf, aiModelLabel, flashMessage,
 }: EditorPaneProps) {
   const lines  = snapshot?.lines  ?? ['']
@@ -1532,7 +1627,7 @@ function EditorPane({
   const titleMax = Math.max(12, headerBarW - 46)
   const pathShown = editorHeaderPath(title, titleMax)
   const metaShown = editorHeaderMeta(status, searchQuery, matchCount, headerBarW)
-  const visibleRows = Math.max(1, paneHeight - 2)
+  const visibleRows = Math.max(1, paneHeight - 3)
   const lineNumWidth = Math.max(2, String(Math.max(1, lines.length)).length)
   const lineGutterCols = lineNumWidth + 1
   const visibleCols = Math.max(20, effectiveCols - 4 - lineGutterCols)
@@ -1590,6 +1685,7 @@ function EditorPane({
   return (
     <Box flexDirection="column" width={paneWidth} height={paneHeight}>
       <Box flexDirection="column">
+        <WorkflowTabBar buffers={buffers} activeBufferId={activeBufferId} workspaceTab={workspaceTab} width={effectiveCols} />
         {prompt?.type === 'file' && (() => {
           const windowSize = 10
           const scrollStart = Math.max(0, Math.min(prompt.selectedIdx - Math.floor(windowSize / 2), prompt.ranked.length - windowSize))
@@ -1792,7 +1888,7 @@ function withEvalNotifyTracking(ctx: EditorContext): { ctx: EditorContext; userN
 
 function App({
   buffers, activeId, bufferKey, sidecar, shell, shellLines, config, userLeader, lspOverlay, actions,
-  initialPanel,
+  initialPanel, initialWorkspaceTab, onWorkspaceTabChange,
 }: {
   buffers: EditorBuffer[]
   activeId: string
@@ -1804,6 +1900,8 @@ function App({
   userLeader: LeaderTree
   lspOverlay: LspOverlay | null
   initialPanel?: Panel
+  initialWorkspaceTab: WorkspaceTab
+  onWorkspaceTabChange: (tab: WorkspaceTab) => void
   actions: {
     openFile: (path: string, jump?: { row: number; col: number }) => void
     switchBuffer: (id: string) => void
@@ -1837,6 +1935,24 @@ function App({
   const [completionStreaming, setCompletionStreaming] = React.useState(false)
   const [scrollOffset,   setScrollOffset]   = React.useState(0)
   const [panel,          setPanel]          = React.useState<Panel>(initialPanel ?? null)
+  const [workspaceTab, setWorkspaceTabState] = React.useState<WorkspaceTab>(initialWorkspaceTab)
+  const setWorkspaceTab = React.useCallback((tab: WorkspaceTab) => {
+    setWorkspaceTabState(tab)
+    onWorkspaceTabChange(tab)
+    if (tab === 'process' || tab === 'ai') setPanel(null)
+  }, [onWorkspaceTabChange])
+  const switchWorkflowTabByIndex = React.useCallback((index: number) => {
+    if (index < 0) return
+    if (index < buffers.length) {
+      const target = buffers[index]
+      if (!target) return
+      setWorkspaceTab('code')
+      if (target.id !== activeId) actions.switchBuffer(target.id)
+      return
+    }
+    if (index === buffers.length) setWorkspaceTab('process')
+    if (index === buffers.length + 1) setWorkspaceTab('ai')
+  }, [actions, activeId, buffers, setWorkspaceTab])
   const [visualAnchor,   setVisualAnchor]   = React.useState<{ row: number; col: number } | null>(null)
   const [visualLineMode, setVisualLineMode] = React.useState(false)
   /** Stack of selections before each expand (contract pops). Not react state — avoids stale handlers. */
@@ -2133,11 +2249,11 @@ function App({
 
   const openNamedPanel = React.useCallback((name: ConfigPanelName) => {
     if (name === 'shell') setPanel({ type: 'shell' })
-    else if (name === 'ai') setPanel({ type: 'ai', focused: true })
+    else if (name === 'ai') setWorkspaceTab('ai')
     else if (name === 'git') openGitPanel()
     else if (name === 'diagnostics') openDiagnosticsPanel('buffer')
     else if (name === 'commandPalette') setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: flattenLeader(leaderMapRef.current) })
-  }, [openDiagnosticsPanel])
+  }, [openDiagnosticsPanel, setWorkspaceTab])
 
   const openSplash = React.useCallback((options: { title: string; message?: string; hint?: string }) => {
     setPanel({ type: 'splash', title: options.title, message: options.message, hint: options.hint })
@@ -2197,13 +2313,33 @@ function App({
     registry.register('diagnostics.list', 'diagnostics: list', () => openDiagnosticsPanel('buffer'))
     registry.register('diagnostics.next', 'diagnostics: next', () => jumpToDiagnostic(nextDiagnostic(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 }, 1)))
     registry.register('diagnostics.line', 'diagnostics: current line', () => jumpToDiagnostic(diagnosticAtCursor(snapshot?.diagnostics ?? [], snapshot?.cursor ?? { row: 0, col: 0 })))
-    registry.register('ai.chat', 'ai: chat', () => setPanel({ type: 'ai', focused: true }))
+    registry.register('ai.chat', 'ai: chat', () => setWorkspaceTab('ai'))
+    registry.register('workspace.code', 'workspace: code tab', () => setWorkspaceTab('code'))
+    registry.register('workspace.process', 'workspace: process tab', () => setWorkspaceTab('process'))
+    registry.register('workspace.ai', 'workspace: AI tab', () => setWorkspaceTab('ai'))
+    registry.register('tasks.pickAndRun', 'tasks: pick and run', async (ctx) => {
+      const tasks = normalizeTasks(config.tasks)
+      if (tasks.length === 0) {
+        ctx.ui.notify('tasks: no tasks configured', 'warn')
+        return
+      }
+      const picked = await ctx.ui.pick('Run task', tasks.map(task => ({
+        label: task.name,
+        value: task.name,
+        description: task.command,
+      })))
+      const task = tasks.find(candidate => candidate.name === picked)
+      if (!task) return
+      ctx.shell.run(task.command)
+      if (task.tab === 'process') setWorkspaceTab('process')
+      else setPanel({ type: 'shell' })
+    })
     registerConfigCommands(config, registry)
     registerCommandActions(evalCommands, registry)
     return registry
   }, [
     activeBuffer.filename, activeId, buffers, commandEpoch, config, currentGitHunk, evalCommands, jumpToDiagnostic, openDiagnosticsPanel,
-    openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveCurrentBuffer, setStatus, sidecar, snapshot,
+    openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveCurrentBuffer, setStatus, setWorkspaceTab, sidecar, snapshot,
   ])
 
   const makeCtx = React.useCallback((): EditorContext => createEditorContext({
@@ -2418,7 +2554,7 @@ function App({
       quitAll: actions.quitAll,
     },
     {
-      openChat: () => setPanel({ type: 'ai', focused: true }),
+      openChat: () => setWorkspaceTab('ai'),
       triggerCompletion: () => triggerCompletion(),
       explainError: () => explainLastError(),
       fixFailure: () => runCodeClawFix(),
@@ -2520,6 +2656,18 @@ function App({
       toggleWrap: () => setStatus('wrap: terminal renderer wraps by pane width'),
     },
     {
+      code: () => setWorkspaceTab('code'),
+      process: () => setWorkspaceTab('process'),
+      ai: () => setWorkspaceTab('ai'),
+    },
+    {
+      pickAndRun: () => {
+        void commandRegistry.run('tasks.pickAndRun', makeCtx()).catch(error => {
+          notify(`task failed: ${String(error)}`, 'error')
+        })
+      },
+    },
+    {
       open:   actions.openConfig,
       reload: () => { void actions.reloadConfig() },
       evalFile: () => { void evalCurrentFile() },
@@ -2557,7 +2705,7 @@ function App({
         })
       },
     })),
-  ), [actions, activeBuffer.filename, activeId, buffers, commandEpoch, commandRegistry, currentGitHunk, evalCurrentFile, evalExpression, evalRegion, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, shell, sidecar, snapshot, userLeader])
+  ), [actions, activeBuffer.filename, activeId, buffers, commandEpoch, commandRegistry, currentGitHunk, evalCurrentFile, evalExpression, evalRegion, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, setWorkspaceTab, shell, sidecar, snapshot, userLeader])
 
   leaderMapRef.current = leaderMap
 
@@ -2701,7 +2849,7 @@ function App({
           ...lastErr.stdout.split('\n').slice(-20),
         ].join('\n')
       : 'No shell error detected yet. What can I help with?'
-    setPanel({ type: 'ai', focused: false })
+    setWorkspaceTab('ai')
     sendAiMessage(text)
   }
 
@@ -2780,14 +2928,14 @@ function App({
           ? 'Could not build fix context from this finding (internal error).'
           : 'No failed tracked shell run yet. Run a command from the shell pane first.',
       })
-      setPanel({ type: 'ai', focused: false })
+      setWorkspaceTab('ai')
       return
     }
 
     const startedAt = new Date().toISOString()
     const traceId = makeTraceId(new Date(startedAt))
     setFixState({ status: 'generating', traceId, startedAt, context })
-    setPanel({ type: 'ai', focused: false })
+    setWorkspaceTab('ai')
     setAiStreaming(true)
 
     aiAbortRef.current?.abort()
@@ -2834,7 +2982,7 @@ function App({
     }
 
     setReviewState({ status: 'generating' })
-    setPanel({ type: 'ai', focused: false })
+    setWorkspaceTab('ai')
     setAiStreaming(true)
 
     aiAbortRef.current?.abort()
@@ -2932,7 +3080,7 @@ function App({
 
   function showLastTrace() {
     setFixState({ status: 'trace', latest: readLatestTrace(process.cwd()) })
-    setPanel({ type: 'ai', focused: false })
+    setWorkspaceTab('ai')
   }
 
   function openGitPanel() {
@@ -3034,6 +3182,10 @@ function App({
 
   useInput((input, key) => {
     if (key.ctrl && input === 'q') { actions.quitAll(); return }
+    if (key.meta && /^[1-9]$/.test(input)) {
+      switchWorkflowTabByIndex(Number(input) - 1)
+      return
+    }
     // Space opens the leader menu in the editor, but Space is also typed into the AI chat — use Ctrl+Space anytime.
     if (key.ctrl && input === ' ') {
       pendingKeyRef.current = null
@@ -3173,7 +3325,7 @@ function App({
           : prev)
         return
       }
-      if (!key.ctrl && !key.meta && printable(input)) {
+      if (!key.ctrl && !key.meta && printableText(input)) {
         setPanel(prev => prev?.type === 'cmdpalette'
           ? { ...prev, query: prev.query + input, cursor: 0 }
           : prev)
@@ -3192,8 +3344,8 @@ function App({
       return
     }
 
-    // ── AI panel (unfocused) — review findings navigation ────────────────────
-    if (panel?.type === 'ai' && !panel.focused && reviewState.status === 'findings') {
+    // ── AI workspace — review findings navigation ───────────────────────────
+    if ((workspaceTab === 'ai' || (panel?.type === 'ai' && !panel.focused)) && reviewState.status === 'findings') {
       if (input === 'j') {
         setReviewState(s => s.status === 'findings' ? { ...s, cursor: Math.min(s.cursor + 1, s.proposal.findings.length - 1) } : s)
         return
@@ -3224,8 +3376,8 @@ function App({
       if (input === 'x') { setReviewState({ status: 'idle' }); return }
     }
 
-    // ── AI panel (unfocused) — dismiss fixState overlay + scroll chat ────────
-    if (panel?.type === 'ai' && !panel.focused) {
+    // ── AI workspace — dismiss overlays + scroll chat ───────────────────────
+    if (workspaceTab === 'ai' || (panel?.type === 'ai' && !panel.focused)) {
       if (input === 'x' && (fixState.status !== 'idle' || reviewState.status !== 'idle')) {
         setFixState({ status: 'idle' })
         setReviewState({ status: 'idle' })
@@ -3237,7 +3389,7 @@ function App({
         } else {
           shell.write(aiShellCmd)
         }
-        setPanel({ type: 'shell' })
+        setWorkspaceTab('process')
         return
       }
       if (reviewState.status === 'idle') {
@@ -3252,20 +3404,24 @@ function App({
       }
     }
 
-    // ── AI panel (focused) ───────────────────────────────────────────────────
-    if (panel?.type === 'ai' && fixState.status === 'proposal' && !aiStreaming) {
+    // ── AI workspace input ───────────────────────────────────────────────────
+    if ((workspaceTab === 'ai' || panel?.type === 'ai') && fixState.status === 'proposal' && !aiStreaming) {
       if (input === 'a') { acceptCodeClawFix(); return }
       if (input === 'r') { rejectCodeClawFix(); return }
       if (input === 'e') {
         setFixState({ ...fixState, status: 'editing' })
         setAiInput(fixState.context.userRequest)
-        setPanel({ type: 'ai', focused: true })
+        setWorkspaceTab('ai')
         return
       }
     }
 
-    if (panel?.type === 'ai' && panel.focused) {
-      if (key.escape)                                  { setPanel({ type: 'ai', focused: false }); return }
+    if (workspaceTab === 'ai' || (panel?.type === 'ai' && panel.focused)) {
+      if (key.escape) {
+        if (workspaceTab === 'ai') setWorkspaceTab('code')
+        else setPanel({ type: 'ai', focused: false })
+        return
+      }
       if (key.ctrl && input === 'c')                   { aiAbortRef.current?.abort(); setAiStreaming(false); return }
       if (key.ctrl && input === 'l')                   { clearAiChat(); return }
       if (input === '!' && !aiInput && aiShellCmd) {
@@ -3274,12 +3430,12 @@ function App({
         } else {
           shell.write(aiShellCmd)
         }
-        setPanel({ type: 'shell' })
+        setWorkspaceTab('process')
         return
       }
       if (key.tab && aiNavLoc) {
         actions.openFile(aiNavLoc.file, { row: aiNavLoc.row, col: aiNavLoc.col })
-        setPanel({ type: 'ai', focused: false })
+        setWorkspaceTab('code')
         return
       }
       if (key.return) {
@@ -3491,11 +3647,14 @@ function App({
       return
     }
 
-    // ── Shell panel ──────────────────────────────────────────────────────────
-    if (panel?.type === 'shell') {
+    // ── Shell panel / process workspace ──────────────────────────────────────
+    if (panel?.type === 'shell' || workspaceTab === 'process') {
       if (key.escape) {
         if (dangerPrompt) { setDangerPrompt(null); return }
-        setShellScrollOffset(0); setPanel(null); return
+        setShellScrollOffset(0)
+        if (workspaceTab === 'process') setWorkspaceTab('code')
+        else setPanel(null)
+        return
       }
       if (shell.mode === 'runner') {
         if (key.upArrow)   { setShellScrollOffset(prev => prev + 1); return }
@@ -3529,7 +3688,11 @@ function App({
       if (input === 'o') {
         // jump to first parsed error location
         const loc = shell.lastLocation
-        if (loc) { actions.openFile(loc.file, { row: loc.row, col: loc.col }); setPanel(null) }
+        if (loc) {
+          actions.openFile(loc.file, { row: loc.row, col: loc.col })
+          setWorkspaceTab('code')
+          setPanel(null)
+        }
         return
       }
       if (key.shift && key.upArrow)   { setShellScrollOffset(prev => prev + 1); return }
@@ -4114,6 +4277,53 @@ function App({
     )
   }
 
+  if (workspaceTab === 'process') {
+    return (
+      <Box flexDirection="column" width={totalCols} height={totalRows}>
+        <WorkflowTabBar buffers={buffers} activeBufferId={activeId} workspaceTab={workspaceTab} width={totalCols} />
+        <Box flexDirection="row">
+          <Text backgroundColor={C.green} color={C.bg}> process </Text>
+          <Text color={C.grey}>  Esc=code  Option+1..9=switch tab  tracked shell output</Text>
+        </Box>
+        <ShellPane
+          lines={shellLines}
+          rows={Math.max(1, totalRows - 2)}
+          focused={true}
+          mode={shell.mode}
+          input={shellInput}
+          running={shellRunning}
+          height={Math.max(1, totalRows - 2)}
+          scrollOffset={shellScrollOffset}
+          dangerPrompt={dangerPrompt}
+        />
+      </Box>
+    )
+  }
+
+  if (workspaceTab === 'ai') {
+    return (
+      <Box flexDirection="column" width={totalCols} height={totalRows}>
+        <WorkflowTabBar buffers={buffers} activeBufferId={activeId} workspaceTab={workspaceTab} width={totalCols} />
+        <AiPanel
+          messages={aiMessages}
+          input={aiInput}
+          streaming={aiStreaming}
+          chatStreaming={chatStreaming}
+          focused={fixState.status === 'idle' && reviewState.status === 'idle'}
+          width={totalCols}
+          height={Math.max(1, totalRows - 1)}
+          navHint={aiNavLoc ? `${aiNavLoc.file}:${aiNavLoc.row + 1}` : undefined}
+          shellHint={aiShellCmd ? aiShellCmd.split('\n')[0] : undefined}
+          fixState={fixState}
+          clawProgressChars={clawProgressChars}
+          reviewState={reviewState}
+          scrollOffset={aiScrollOffset}
+          thinkingTick={thinkingTick}
+        />
+      </Box>
+    )
+  }
+
   if (panel?.type === 'git') {
     return (
       <Box flexDirection="column" width={totalCols} height={totalRows}>
@@ -4150,7 +4360,7 @@ function App({
   const panelRows = (panel === null || panel.type === 'ai' ? 0
     : panel.type === 'shell'      ? 3 + shellRows
     : panel.type === 'dired'      ? totalRows
-    : panel.type === 'cmdpalette' ? 0
+    : panel.type === 'cmdpalette' ? Math.min(14, Math.max(5, totalRows - 4))
     : panel.type === 'lsp'        ? Math.min(10, panel.lines.length + 2)
     : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))) + lspOverlayRows
   const editorHeight = panel?.type === 'dired' ? 0 : Math.max(1, totalRows - panelRows)
@@ -4175,6 +4385,7 @@ function App({
       paneHeight={editorHeight}
       paneWidth={editorWidth}
       panel={panel}
+      workspaceTab={workspaceTab}
       sel={sel}
       searchQuery={searchQuery}
       cmdBuf={cmdBuf}
@@ -4313,6 +4524,8 @@ async function main() {
 
   let cfg = await loadConfig()
   if (cfg.theme) C = { ...C, ...(cfg.theme as Partial<Theme>) }
+  const restoredSession = loadWorkflowSession(cwd)
+  let workspaceTab: WorkspaceTab = normalizeWorkspaceTab(restoredSession?.workspaceTab)
 
   const shell = new ShellSidecar(cwd, cols, Math.floor(rows * 0.3))
 
@@ -4333,12 +4546,29 @@ async function main() {
 
   const bufferInfos = () => buffers.map(buffer => toBufferInfo(buffer, activeId))
 
+  const persistSession = () => {
+    saveWorkflowSession(cwd, sessionFromBuffers(bufferInfos(), workspaceTab))
+  }
+
   const createHookRegistry = (): CommandRegistry => {
     const registry = new CommandRegistry()
     registry.register('file.save', 'file: save', () => activeSidecar?.save())
     registry.register('shell.run', 'shell: run command', (ctx, args) => {
       const command = typeof args?.command === 'string' ? args.command : ''
       if (command) ctx.shell.run(command)
+    })
+    registry.register('workspace.code', 'workspace: code tab', () => { workspaceTab = 'code'; refresh() })
+    registry.register('workspace.process', 'workspace: process tab', () => { workspaceTab = 'process'; refresh() })
+    registry.register('workspace.ai', 'workspace: AI tab', () => { workspaceTab = 'ai'; refresh() })
+    registry.register('tasks.pickAndRun', 'tasks: pick and run', async (ctx) => {
+      const tasks = normalizeTasks(cfg.tasks)
+      if (tasks.length === 0) {
+        ctx.ui.notify('tasks: no tasks configured', 'warn')
+        return
+      }
+      const task = tasks[0]!
+      ctx.shell.run(task.command)
+      if (task.tab === 'process') workspaceTab = 'process'
     })
     registry.register('code.format', 'code: format', () => activeSidecar?.format())
     registry.register('openFile', 'file: open', (_ctx, args) => {
@@ -4626,6 +4856,7 @@ async function main() {
 
   function quitAll(): void {
     quitting = true
+    persistSession()
     for (const timer of changeHookTimers.values()) clearTimeout(timer)
     changeHookTimers.clear()
     changeHookRevisions.clear()
@@ -4644,9 +4875,27 @@ async function main() {
     refresh()
   })
 
-  // Initial buffer
-  const initial = createBuffer(filename ?? null)
-  activateBuffer(initial)
+  // Initial buffers: explicit CLI target wins; otherwise restore the last light session.
+  const restoredFiles = !filename && !initialDiredPath
+    ? (restoredSession?.files ?? []).filter(file => existsSync(resolvePath(file)))
+    : []
+  if (filename || restoredFiles.length === 0) {
+    const initial = createBuffer(filename ?? null)
+    activateBuffer(initial)
+  } else {
+    const activeRestored = restoredSession?.activeFile
+      ? resolvePath(restoredSession.activeFile)
+      : resolvePath(restoredFiles[0]!)
+    let activeBufferToOpen: EditorBuffer | null = null
+    for (const file of restoredFiles) {
+      const buffer = createBuffer(resolvePath(file))
+      if (resolvePath(file) === activeRestored) activeBufferToOpen = buffer
+    }
+    activateBuffer(activeBufferToOpen ?? buffers[0]!)
+    if ((restoredSession?.files.length ?? 0) !== restoredFiles.length) {
+      activeBuffer().status = 'session restored; missing files skipped'
+    }
+  }
 
   function openConfig() {
     const existing = getConfigPath()
@@ -4702,6 +4951,10 @@ async function main() {
           userLeader={cfg.leader ?? {}}
           lspOverlay={lspOverlay}
           initialPanel={initialDiredPath ? { type: 'dired', path: initialDiredPath, cursor: 0 } : undefined}
+          initialWorkspaceTab={workspaceTab}
+          onWorkspaceTabChange={(tab) => {
+            workspaceTab = tab
+          }}
           actions={{
             openFile,
             switchBuffer,

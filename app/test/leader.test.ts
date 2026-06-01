@@ -36,6 +36,8 @@ const mockDiagnostics = {
 }
 const mockSearch = { buffer: noop, replace: noop }
 const mockUi = { toggleWrap: noop }
+const mockWorkspace = { code: noop, process: noop, ai: noop }
+const mockTasks = { pickAndRun: noop }
 const mockCfg   = { open: noop, reload: noop, evalFile: noop, evalExpression: noop, evalRegion: noop }
 const mockMode  = { testFile: noop, testAll: noop }
 const emptyLeader: LeaderTree = {}
@@ -64,7 +66,7 @@ function makeMap(overrides: Partial<typeof mockAi & typeof mockBufs> = {}): Lead
     mockSidecar, mockSetPanel,
     { ...mockBufs, ...overrides },
     { ...mockAi,  ...overrides },
-    mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockCfg, mockMode,
+    mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockWorkspace, mockTasks, mockCfg, mockMode,
     emptyLeader, makeCtx,
   )
 }
@@ -157,12 +159,12 @@ describe('buildLeaderMap — specific key presence', () => {
 
   const required = [
     'SPC a p', 'SPC a c', 'SPC a e', 'SPC a f', 'SPC a t', 'SPC a l', 'SPC a r', 'SPC a k',
-    'SPC m t f', 'SPC m t a',
+    'SPC m t', 'SPC m f', 'SPC m a',
     'SPC g g', 'SPC g s', 'SPC g h n', 'SPC g h p', 'SPC g h s', 'SPC g h u', 'SPC g h v',
     'SPC g b', 'SPC g l', 'SPC g f',
     'SPC b b', 'SPC b k', 'SPC b n', 'SPC b p', 'SPC b s', 'SPC b N',
     'SPC f f', 'SPC f n', 'SPC f s',
-    'SPC t t', 'SPC t a', 'SPC t r',
+    'SPC t t', 'SPC t a', 'SPC t p', 'SPC t c', 'SPC t r',
     'SPC q q', 'SPC q w',
     'SPC c h', 'SPC c d', 'SPC c r', 'SPC c R', 'SPC c a', 'SPC c f', 'SPC c i',
     'SPC s s', 'SPC s r',
@@ -243,7 +245,7 @@ describe('userLeader merge', () => {
     }
     const map = buildLeaderMap(
       mockSidecar, mockSetPanel,
-      mockBufs, mockAi, mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockCfg, mockMode,
+      mockBufs, mockAi, mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockWorkspace, mockTasks, mockCfg, mockMode,
       userLeader, makeCtx,
     )
     const items = flattenLeader(map)
@@ -261,7 +263,7 @@ describe('userLeader merge', () => {
     }
     const map = buildLeaderMap(
       mockSidecar, mockSetPanel,
-      mockBufs, mockAi, mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockCfg, mockMode,
+      mockBufs, mockAi, mockGit, mockLsp, mockDiagnostics, mockSearch, mockUi, mockWorkspace, mockTasks, mockCfg, mockMode,
       userLeader, makeCtx,
       (action) => { seen.push(action) },
     )

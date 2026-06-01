@@ -27,6 +27,20 @@ describe('defineConfig', () => {
     })
     assert.equal(config.leader?.p && typeof config.leader.p, 'object')
   })
+
+  it('accepts first-class workflow tasks and project profiles', () => {
+    const config = defineConfig({
+      tasks: [
+        { name: 'dev', command: 'npm run dev', tab: 'process' },
+        { name: 'test', command: 'npm test', tab: 'shell' },
+      ],
+      projects: [
+        { name: 'editor', root: '.', files: ['README.md'], tasks: [{ name: 'typecheck', command: 'npm run typecheck' }] },
+      ],
+    })
+    assert.equal(config.tasks?.[0]?.tab, 'process')
+    assert.equal(config.projects?.[0]?.files?.[0], 'README.md')
+  })
 })
 
 describe('config loader', () => {

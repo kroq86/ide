@@ -132,6 +132,11 @@ export default defineConfig({
     },
     // onChange fires only after content revision changes and is debounced by 250ms.
   },
+
+  tasks: [
+    { name: 'typecheck', command: 'npm run typecheck', tab: 'process' },
+    { name: 'app tests', command: 'npm --prefix app run test', tab: 'process' },
+  ],
 })
 ```
 
@@ -155,6 +160,8 @@ shell.run          panel.open         ai.chat
 code.hover         code.definition    code.format
 git.status         git.hunk.stage     git.hunk.preview
 diagnostics.list   diagnostics.next   diagnostics.line
+workspace.code     workspace.process  workspace.ai
+tasks.pickAndRun
 ```
 
 Supported directives:
@@ -242,14 +249,18 @@ Press **`SPC`** in normal mode for which-key. Bindings are defined in [`app/src/
 | `SPC a f` | ai: fix failure (CodeClaw) |
 | `SPC a r` | ai: review git diff (CodeClaw) |
 | `SPC a t` | ai: show trace |
-| `SPC a p` | ai: open chat |
+| `SPC a p` | ai: open AI tab |
 | `SPC a m` | ai: select model (model picker, switches provider) |
 | `SPC a c` | ai: trigger completion |
 | `SPC a e` | ai: explain last error |
 | `SPC a l` | ai: rerun last shell command |
 | `SPC a k` | ai: clear chat |
 | `SPC t t` | terminal: toggle shell |
-| `SPC t a` | terminal: toggle AI panel |
+| `SPC t a` | workspace: AI tab |
+| `SPC t p` | workspace: process tab |
+| `SPC t c` | workspace: code tab |
+| `SPC m t` | tasks: pick and run |
+| `Option-1..9` | switch to numbered tab shown as `⌥N` |
 | `SPC g g` | git: status — ll commit log (Magit) |
 | `SPC g s` | git: stage current |
 | `SPC g h n/p` | git: next / previous hunk |

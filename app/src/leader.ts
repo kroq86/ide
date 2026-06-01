@@ -50,7 +50,9 @@ export const COMMAND_LABELS: Record<string, string> = {
   'f n': 'file: new scratch',
   'f s': 'file: save',
   't t': 'terminal: toggle shell',
-  't a': 'terminal: toggle AI panel',
+  't a': 'workspace: AI tab',
+  't p': 'workspace: process tab',
+  't c': 'workspace: code tab',
   't r': 'terminal: rerun last command',
   'a p': 'ai: open chat',
   'a c': 'ai: trigger completion',
@@ -95,8 +97,9 @@ export const COMMAND_LABELS: Record<string, string> = {
   'p f': 'config: eval file',
   'p ;': 'config: eval expression',
   'p s': 'config: eval selection',
-  'm t f': 'mode: test current file',
-  'm t a': 'mode: test all',
+  'm t': 'tasks: pick and run',
+  'm f': 'mode: test current file',
+  'm a': 'mode: test all',
   ':': 'command palette',
 }
 
@@ -190,6 +193,14 @@ export function buildLeaderMap(
   ui: {
     toggleWrap: () => void
   },
+  workspace: {
+    code: () => void
+    process: () => void
+    ai: () => void
+  },
+  tasks: {
+    pickAndRun: () => void
+  },
   config: {
     open: () => void
     reload: () => void
@@ -226,10 +237,9 @@ export function buildLeaderMap(
         const p = prev as { type?: string } | null
         return p?.type === 'shell' ? null : { type: 'shell' }
       }),
-      a: () => setPanel((prev: unknown) => {
-        const p = prev as { type?: string } | null
-        return p?.type === 'ai' ? null : { type: 'ai', focused: true }
-      }),
+      a: workspace.ai,
+      p: workspace.process,
+      c: workspace.code,
       r: ai.rerunLast,
     },
     a: {
@@ -292,10 +302,9 @@ export function buildLeaderMap(
       s: config.evalRegion,
     },
     m: {
-      t: {
-        f: mode.testFile,
-        a: mode.testAll,
-      },
+      t: tasks.pickAndRun,
+      f: mode.testFile,
+      a: mode.testAll,
     },
   }
   const tree = mergeLeaderTree(builtin, userLeader, makeCtx, runAction) as LeaderNode

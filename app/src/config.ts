@@ -4,6 +4,7 @@ import { extname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { applyPluginsToConfig, PLUGIN_DIR } from './config-plugins.js'
 import type { ShellRun } from './shell.js'
+import type { QeProjectProfile, QeTask } from './workflow.js'
 
 // ── Public types — what users write in their config file ─────────────────────
 
@@ -156,6 +157,8 @@ export type QeConfig = {
     onShellDone?: ConfigAction
   }
   commands?: Record<string, ConfigAction>
+  tasks?: QeTask[]
+  projects?: QeProjectProfile[]
 }
 
 export function defineConfig<const T extends QeConfig>(config: T): T {
