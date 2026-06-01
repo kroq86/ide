@@ -43,4 +43,7 @@ try {
   fail('Run npm install first')
 }
 
+const nodePty = resolve(root, 'app/node_modules/node-pty')
+if (!existsSync(nodePty)) fail('Run npm install first (missing app/node_modules/node-pty)')
+
 console.log('install check passed')

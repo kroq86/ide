@@ -20,6 +20,7 @@ import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { vendorRuntimeDeps } from './vendor-runtime-deps.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const version = process.argv[2]
@@ -61,6 +62,9 @@ chmodSync(`${outDir}/bin/qe`, 0o755)
 
 // App bundle
 copyFileSync(resolve(root, 'app/dist/main.js'), `${outDir}/libexec/main.js`)
+
+// Native Node deps (node-pty) — not bundled by esbuild
+vendorRuntimeDeps(`${outDir}/libexec`)
 
 // Native binary
 copyFileSync(
