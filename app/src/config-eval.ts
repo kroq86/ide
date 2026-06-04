@@ -15,8 +15,8 @@ import {
   registerPluginModule,
   runDefaultExportWithContext,
   runPluginEvalSideEffects,
-  collectStartupFromModule,
   extractCommandsFromModule,
+  moduleHasEvaluableShape,
 } from './config-plugins.js'
 import { executeActionResult, type CommandRegistry } from './config-runtime.js'
 
@@ -144,19 +144,13 @@ export async function evalModuleFile(
 ): Promise<EvalResult> {
   const mod = await importPlugin(importPath)
   const commands = extractCommandsFromModule(mod)
-  const startup = collectStartupFromModule(mod)
   const label = labelPath === 'eval selection' || labelPath === 'eval expression'
     ? labelPath
     : isPluginFilePath(labelPath)
       ? 'eval plugin'
       : 'eval file'
-  const hasPluginShape =
-    Object.keys(commands).length > 0
-    || mod.setup != null
-    || startup != null
-    || (mod.default != null && typeof mod.default !== 'function')
 
-  if (hasPluginShape) {
+  if (moduleHasEvaluableShape(mod)) {
     const { commandIds, commands: merged } = await registerPluginModule(mod, registry)
     const sideEffects = await runPluginEvalSideEffects(mod, registry, ctx)
     const ran = [...commandIds, ...sideEffects]

@@ -313,6 +313,22 @@ describe('evalRegion', () => {
     assert.ok(registry.has('plugin.hello'))
   })
 
+  it('runs onShutdown export from selection', async () => {
+    const registry = new CommandRegistry()
+    const messages: string[] = []
+    const ctx = mockCtx(messages)
+    const body = [
+      `export const onShutdown = () => ({`,
+      `  type: 'ui.notify',`,
+      `  message: 'shutdown hook',`,
+      `})`,
+    ].join('\n')
+    const result = await evalRegion(registry, ctx, body)
+    assert.equal(result.ok, true)
+    assert.match(result.message, /onShutdown/)
+    assert.deepEqual(messages, ['shutdown hook'])
+  })
+
   it('runs onStartup export from selection', async () => {
     const registry = new CommandRegistry()
     const splashes: string[] = []

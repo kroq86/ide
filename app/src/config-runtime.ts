@@ -14,14 +14,30 @@ export type RegisteredCommand = {
   id: string
   label: string
   run: CommandHandler
+  source: CommandSource
+  description?: string
+}
+
+export type CommandSource = 'builtin' | 'config' | 'plugin' | 'eval'
+
+export type CommandMetadata = {
+  source?: CommandSource
+  description?: string
 }
 
 export class CommandRegistry {
   #commands = new Map<string, RegisteredCommand>()
+  #sourceStack: CommandSource[] = ['builtin']
 
-  register(id: string, label: string, run: CommandHandler): void {
+  register(id: string, label: string, run: CommandHandler, metadata: CommandMetadata = {}): void {
     // User config intentionally uses the same registry as built-ins: last registration wins.
-    this.#commands.set(id, { id, label, run })
+    this.#commands.set(id, {
+      id,
+      label,
+      run,
+      source: metadata.source ?? this.#sourceStack[this.#sourceStack.length - 1] ?? 'builtin',
+      description: metadata.description,
+    })
   }
 
   has(id: string): boolean {
@@ -30,6 +46,21 @@ export class CommandRegistry {
 
   list(): RegisteredCommand[] {
     return [...this.#commands.values()].sort((a, b) => a.id.localeCompare(b.id))
+  }
+
+  sourceCounts(): Record<CommandSource, number> {
+    const counts: Record<CommandSource, number> = { builtin: 0, config: 0, plugin: 0, eval: 0 }
+    for (const command of this.#commands.values()) counts[command.source]++
+    return counts
+  }
+
+  async withSource<T>(source: CommandSource, fn: () => T | Promise<T>): Promise<T> {
+    this.#sourceStack.push(source)
+    try {
+      return await fn()
+    } finally {
+      this.#sourceStack.pop()
+    }
   }
 
   async run(id: string, ctx: EditorContext, args?: Record<string, unknown>): Promise<void> {
@@ -45,6 +76,7 @@ export class CommandRegistry {
 export function registerCommandActions(
   commands: Record<string, ConfigAction>,
   registry: CommandRegistry,
+  source: CommandSource = 'config',
 ): string[] {
   const ids: string[] = []
   for (const [id, action] of Object.entries(commands)) {
@@ -52,14 +84,14 @@ export function registerCommandActions(
     const label = commandLabel(action) ?? id
     registry.register(id, label, async (ctx) => {
       await runConfigAction(action, ctx, registry)
-    })
+    }, { source })
     ids.push(id)
   }
   return ids
 }
 
 export function registerConfigCommands(config: QeConfig, registry: CommandRegistry): void {
-  registerCommandActions(config.commands ?? {}, registry)
+  registerCommandActions(config.commands ?? {}, registry, 'config')
 }
 
 export async function runConfigAction(

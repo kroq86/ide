@@ -8,6 +8,8 @@ export { lspHoverText, lspHoverLines, lspDefinitionTarget, lspUnavailableText } 
 export { loadWorkflowSession, saveWorkflowSession, workflowSessionPath } from './workflow-session.js'
 export { thinkingSpinnerGlyph, thinkingPrefixedLine } from './spinner.js'
 export { CmdPalettePanel } from './CmdPalettePanel.js'
+export { BuildPanel } from './BuildPanel.js'
+export { TroubleshootingPanel } from './TroubleshootingPanel.js'
 export { DiagnosticsPanel } from './DiagnosticsPanel.js'
 export { LspPanel } from './LspPanel.js'
 export { ShellPane } from './ShellPane.js'

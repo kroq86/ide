@@ -1,6 +1,5 @@
 import React from 'react'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -8,13 +7,14 @@ import { AlternateScreen, Box, Text, render, type Instance } from 'terminal-reac
 import { useEditorInput } from './ui/use-editor-input.js'
 import { createEditorInputHandler } from './ui/editor-input-handler.js'
 import { readClipboardText, normalizePromptPaste, promptPasteText } from './prompt-clipboard.js'
-import { QeSidecar, type Diagnostic, type LspResponse, type Snapshot } from './protocol.js'
+import { QeSidecar, resolveEditorCoreBinary, type Diagnostic, type LspResponse, type Snapshot } from './protocol.js'
 import { ShellSidecar, checkCommandDanger, type ShellLine, type ParsedLocation, type ShellRun } from './shell.js'
 import { streamCompletion, streamChat, sanitizeInlineCompletion, type AiContext } from './ai.js'
 import { getProviderLabel, setActiveModel, listAvailableModels, isOllamaActive } from './ai-registry.js'
 import {
   REPO_ROOT, COMMAND_LABELS, NODE_LABELS,
   buildLeaderMap, flattenLeader, isLeafAction,
+  commandRegistryItems, uniqueCommandPaletteItems,
   findNearestTestScript, extractFirstCodeBlock, extractFirstLocation,
   printable, printableText, bufferName,
   type LeaderNode, type CmdItem,
@@ -53,6 +53,12 @@ import {
 } from './config.js'
 import { CommandRegistry, registerCommandActions, registerConfigCommands, runConfigAction } from './config-runtime.js'
 import { configApiTemplate, starterConfigTemplate } from './config-api-template.js'
+import {
+  directivePickItems,
+  insertTextForDirective,
+  isConfigOrPluginSourceFile,
+  parseConfigDirectiveContext,
+} from './config-completion.js'
 import { onChangeDecision } from './config-hooks.js'
 import { createEditorContext, hookUiStubs } from './editor-context.js'
 import {
@@ -79,11 +85,28 @@ import {
   type WorkspaceTab,
   type WorkflowSession,
 } from './workflow.js'
+import {
+  buildWorkspaceIndexAsync,
+  loadWorkspaceIndex,
+  saveWorkspaceIndex,
+  workspaceIndexCandidates,
+  type WorkspaceIndex,
+} from './workspace-index.js'
+import {
+  createCursorHistoryState,
+  moveCursorHistoryBack,
+  moveCursorHistoryForward,
+  noteCursorLocation as noteCursorHistoryLocation,
+  type CursorHistoryLocation,
+} from './cursor-history.js'
+import { runTaskProfile, firstTaskLocation, taskSucceeded } from './task-runner.js'
+import { markBufferPermanent, shouldReplaceTemporaryBuffer } from './temp-buffer.js'
 
 import {
   applyTheme,
   C,
   CmdPalettePanel,
+  BuildPanel,
   DiagnosticsPanel,
   LspPanel,
   ShellPane,
@@ -94,6 +117,7 @@ import {
   GitPanel,
   DiredPanel,
   EditorPane,
+  TroubleshootingPanel,
   findMatches,
   filterBuffers,
   toBufferInfo,
@@ -124,6 +148,8 @@ import {
   type LspTarget,
 } from './ui/index.js'
 import type { Theme } from './ui/theme.js'
+import { buildErrorAt, buildPanelState, moveBuildErrorCursor, type LastTaskRunState } from './build-panel.js'
+import { troubleshootingRows } from './troubleshooting.js'
 
 type ConfigPromptState = Extract<PromptState, { type: 'configPick' | 'configInput' | 'configConfirm' }>
 
@@ -192,23 +218,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', '__pycache__', '.cache'])
-
-async function collectFilesAsync(dir: string, depth: number, base: string): Promise<string[]> {
-  if (depth > 4) return []
-  let entries: import('node:fs').Dirent[]
-  try { entries = await readdir(dir, { withFileTypes: true, encoding: 'utf8' }) } catch { return [] }
-  const results = await Promise.all(
-    entries
-      .filter(e => !e.name.startsWith('.') && !SKIP_DIRS.has(e.name))
-      .map(async e => {
-        if (e.isDirectory()) return collectFilesAsync(join(dir, e.name), depth + 1, base)
-        return [join(dir, e.name).slice(base.length + 1)]
-      }),
-  )
-  return results.flat()
-}
-
 // ── Main app component ────────────────────────────────────────────────────────
 
 function withEvalNotifyTracking(ctx: EditorContext): { ctx: EditorContext; userNotified: () => boolean } {
@@ -251,6 +260,10 @@ function App({
     nextBuffer: () => void
     previousBuffer: () => void
     newScratch: () => void
+    keepBuffer: () => void
+    cursorBack: () => void
+    cursorForward: () => void
+    noteCursorLocation: () => void
     quitAll: () => void
     reloadConfig: () => Promise<void>
     applyConfig: (config: QeConfig) => void
@@ -356,6 +369,8 @@ function App({
   const [shellRunning, setShellRunning] = React.useState(false)
   const [shellScrollOffset, setShellScrollOffset] = React.useState(0)
   const [dangerPrompt, setDangerPrompt] = React.useState<{ cmd: string; reason: string } | null>(null)
+  const [workspaceIndex, setWorkspaceIndex] = React.useState<WorkspaceIndex | null>(() => loadWorkspaceIndex(process.cwd()))
+  const [lastTaskRun, setLastTaskRun] = React.useState<LastTaskRunState | null>(null)
 
   const aiPanelBusy =
     aiStreaming
@@ -383,12 +398,19 @@ function App({
   const aiAbortRef       = React.useRef<AbortController | null>(null)
   const searchQueryRef   = React.useRef('')
   const searchIdxRef     = React.useRef(0)
+  const commandRegistryRef = React.useRef<CommandRegistry | null>(null)
+  const makeCtxRef = React.useRef<(() => EditorContext) | null>(null)
+  const workspaceScanSeqRef = React.useRef(0)
 
-  const enterNormal = React.useCallback(() => {
+  const dismissInlineCompletion = React.useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
     setCompletionStreaming(false)
     setGhostTextSync(null)
+  }, [setGhostTextSync])
+
+  const enterNormal = React.useCallback(() => {
+    dismissInlineCompletion()
     replacePrompt(null)
     pendingKeyRef.current = null
     setPanel(null)
@@ -398,7 +420,7 @@ function App({
     visualExpandHistoryRef.current = []
     setCmdBuf('')
     setSearchBuf('')
-  }, [replacePrompt, setGhostTextSync])
+  }, [dismissInlineCompletion, replacePrompt])
 
   const yankText = React.useCallback((text: string, lineWise: boolean) => {
     yankRegisterRef.current = { text, lineWise }
@@ -474,17 +496,38 @@ function App({
 
   const openFilePromptFromRoot = React.useCallback((root: string) => {
     enterNormal()
-    replacePrompt({ type: 'file', query: '', candidates: [], ranked: [], selectedIdx: 0, base: root })
-    collectFilesAsync(root, 0, root).then(candidates => {
-      setPrompt(prev => {
-        if (prev?.type !== 'file') return prev
-        const ranked = prev.query
-          ? fuzzyRank(prev.query, candidates).slice(0, 50)
-          : candidates.slice(0, 50).map(path => ({ path, score: 0, indices: [] }))
-        return { ...prev, candidates, ranked }
-      })
+    const candidates = workspaceIndexCandidates(workspaceIndex).filter(path => {
+      const abs = resolvePath(process.cwd(), path)
+      return abs.startsWith(resolvePath(root))
+    })
+    const ranked = candidates.slice(0, 50).map(path => ({ path, score: 0, indices: [] }))
+    replacePrompt({ type: 'file', query: '', candidates, ranked, selectedIdx: 0, base: process.cwd() })
+  }, [enterNormal, replacePrompt, workspaceIndex])
+
+  const rescanWorkspace = React.useCallback(() => {
+    const seq = ++workspaceScanSeqRef.current
+    actions.setActiveBufferStatus('workspace: indexing...')
+    void buildWorkspaceIndexAsync(process.cwd(), config.workspace, workspaceIndex).then(next => {
+      if (seq !== workspaceScanSeqRef.current) return
+      saveWorkspaceIndex(process.cwd(), next)
+      setWorkspaceIndex(next)
+      actions.setActiveBufferStatus(`workspace: indexed ${next.entries.length} files`)
+    }).catch(error => {
+      if (seq !== workspaceScanSeqRef.current) return
+      actions.setActiveBufferStatus(`workspace: index failed: ${String(error)}`)
+    })
+  }, [actions, config.workspace, workspaceIndex])
+
+  React.useEffect(() => {
+    const seq = ++workspaceScanSeqRef.current
+    void buildWorkspaceIndexAsync(process.cwd(), config.workspace, workspaceIndex).then(next => {
+      if (seq !== workspaceScanSeqRef.current) return
+      saveWorkspaceIndex(process.cwd(), next)
+      setWorkspaceIndex(next)
     }).catch(() => {})
-  }, [enterNormal, replacePrompt])
+  // run when workspace config identity changes; workspaceIndex is intentionally not a dependency
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.workspace])
 
   const setStatus = React.useCallback((message: string) => {
     actions.setActiveBufferStatus(message)
@@ -496,8 +539,9 @@ function App({
       return
     }
     sidecar.moveTo(diagnostic.row, diagnostic.startCol)
+    actions.noteCursorLocation()
     setStatus(formatDiagnostic(diagnostic))
-  }, [setStatus, sidecar])
+  }, [actions, setStatus, sidecar])
 
   const openDiagnosticsPanel = React.useCallback((title = 'buffer') => {
     setPanel({
@@ -608,8 +652,17 @@ function App({
     else if (name === 'ai') setWorkspaceTab('ai')
     else if (name === 'git') openGitPanel()
     else if (name === 'diagnostics') openDiagnosticsPanel('buffer')
-    else if (name === 'commandPalette') setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: flattenLeader(leaderMapRef.current) })
-  }, [openDiagnosticsPanel, setWorkspaceTab])
+    else if (name === 'commandPalette') {
+      const keyItems = flattenLeader(leaderMapRef.current)
+      const commandItems = commandRegistryItems(commandRegistryRef.current?.list() ?? [], id => {
+        const registry = commandRegistryRef.current
+        const ctxFactory = makeCtxRef.current
+        if (!registry || !ctxFactory) return
+        void registry.run(id, ctxFactory()).catch(error => setStatus(`error: command failed: ${String(error)}`))
+      }, keyItems)
+      setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: uniqueCommandPaletteItems([...keyItems, ...commandItems]) })
+    }
+  }, [openDiagnosticsPanel, setStatus, setWorkspaceTab])
 
   const openSplash = React.useCallback((options: { title: string; message?: string; hint?: string }) => {
     setPanel({ type: 'splash', title: options.title, message: options.message, hint: options.hint })
@@ -628,6 +681,51 @@ function App({
     if (level !== 'info') process.stderr.write(`qe: ${text}\n`)
   }, [setStatus])
 
+  const openBuildPanel = React.useCallback((cursor = 0) => {
+    const state = buildPanelState(lastTaskRun)
+    if (!state) {
+      notify('build: no task run yet', 'warn')
+      return
+    }
+    setPanel({ type: 'build', state, cursor })
+  }, [lastTaskRun, notify])
+
+  const jumpBuildError = React.useCallback((delta: number) => {
+    const state = buildPanelState(lastTaskRun)
+    if (!state || state.errors.length === 0) {
+      notify('build: no parsed errors', 'warn')
+      return
+    }
+    const current = panel?.type === 'build' ? panel.cursor : delta < 0 ? state.errors.length : -1
+    const cursor = moveBuildErrorCursor(state, current, delta)
+    const error = buildErrorAt(state, cursor)
+    setPanel({ type: 'build', state, cursor })
+    if (error) actions.openFile(resolvePath(error.cwd, error.file), { row: error.row, col: error.col })
+  }, [actions, lastTaskRun, notify, panel])
+
+  const openTroubleshootingPanel = React.useCallback(() => {
+    const projectRoot = detectProjectRoot({ filename: snapshot?.filename ?? activeBuffer.filename, cwd: process.cwd() })
+    const rows = troubleshootingRows({
+      configPath: getConfigPath(),
+      projectRoot,
+      workspaceRoots: config.workspace?.roots ?? [projectRoot],
+      aiModelLabel,
+      shellMode: shell.mode,
+      shellSpawnError: shell.spawnError ?? null,
+      lastRun: shell.lastRun,
+      lastFailedRun: shell.lastFailedRun,
+      indexedFileCount: workspaceIndex?.entries.length ?? 0,
+      commandCounts: commandRegistryRef.current?.sourceCounts() ?? { builtin: 0, config: 0, plugin: 0, eval: 0 },
+      openBufferCount: buffers.length,
+      temporaryBufferCount: buffers.filter(buffer => buffer.temporary).length,
+      activeFile: snapshot?.filename ?? activeBuffer.filename,
+      mode,
+      sidecarBinaryPath: resolveEditorCoreBinary(REPO_ROOT),
+      sidecarStatus: snapshot ? 'active' : 'starting',
+    })
+    setPanel({ type: 'troubleshooting', rows })
+  }, [activeBuffer.filename, aiModelLabel, buffers, config.workspace?.roots, mode, shell, snapshot, workspaceIndex])
+
   const commandRegistry = React.useMemo(() => {
     const registry = new CommandRegistry()
     registry.register('file.find', 'file: find', () => openFilePromptFromRoot(detectProjectRoot({ filename: snapshot?.filename ?? activeBuffer.filename, cwd: process.cwd() })))
@@ -637,6 +735,14 @@ function App({
       const selected = Math.max(0, sorted.findIndex(buffer => buffer.id === activeId))
       replacePrompt({ type: 'buffer', query: '', selected })
     })
+    registry.register('buffer.keep', 'buffer: keep temporary editor', () => actions.keepBuffer())
+    registry.register('cursor.back', 'cursor: back', () => actions.cursorBack())
+    registry.register('cursor.forward', 'cursor: forward', () => actions.cursorForward())
+    registry.register('qe.troubleshooting', 'qe: troubleshooting', () => openTroubleshootingPanel())
+    registry.register('build.errors', 'build: errors', () => openBuildPanel())
+    registry.register('build.nextError', 'build: next error', () => jumpBuildError(1))
+    registry.register('build.previousError', 'build: previous error', () => jumpBuildError(-1))
+    registry.register('workspace.rescan', 'workspace: rescan index', () => rescanWorkspace())
     registry.register('shell.run', 'shell: run command', (ctx, args) => {
       const command = typeof args?.command === 'string' ? args.command : ''
       if (command) ctx.shell.run(command)
@@ -673,30 +779,53 @@ function App({
     registry.register('workspace.code', 'workspace: code tab', () => setWorkspaceTab('code'))
     registry.register('workspace.process', 'workspace: process tab', () => setWorkspaceTab('process'))
     registry.register('workspace.ai', 'workspace: AI tab', () => setWorkspaceTab('ai'))
-    registry.register('tasks.pickAndRun', 'tasks: pick and run', async (ctx) => {
+    const runPickedTask = async (taskName?: string) => {
       const tasks = normalizeTasks(config.tasks)
       if (tasks.length === 0) {
-        ctx.ui.notify('tasks: no tasks configured', 'warn')
+        notify('tasks: no tasks configured', 'warn')
         return
       }
-      const picked = await ctx.ui.pick('Run task', tasks.map(task => ({
+      const picked = taskName ?? await uiPick('Run task', tasks.map(task => ({
         label: task.name,
         value: task.name,
-        description: task.command,
+        description: task.runCommand ? `${task.command} && ${task.runCommand}` : task.command,
       })))
       const task = tasks.find(candidate => candidate.name === picked)
       if (!task) return
-      ctx.shell.run(task.command)
       if (task.tab === 'process') setWorkspaceTab('process')
       else setPanel({ type: 'shell' })
+      const result = await runTaskProfile(task, shell)
+      setLastTaskRun({ task, result })
+      const loc = firstTaskLocation(result)
+      if (task.autoJumpToError && loc) {
+        actions.openFile(resolvePath(result.final.cwd, loc.file), { row: loc.row, col: loc.col })
+      }
+      if (task.closePanelOnSuccess && task.tab === 'process' && taskSucceeded(result)) {
+        setWorkspaceTab('code')
+      }
+    }
+    registry.register('tasks.pickAndRun', 'tasks: pick and run', async () => {
+      await runPickedTask()
+    })
+    registry.register('tasks.run', 'tasks: run named task', async (_ctx, args) => {
+      const name = typeof args?.task === 'string' ? args.task : typeof args?.name === 'string' ? args.name : undefined
+      await runPickedTask(name)
+    })
+    registry.register('tasks.rerun', 'tasks: rerun last task', async () => {
+      if (!lastTaskRun) {
+        notify('tasks: no task run yet', 'warn')
+        return
+      }
+      await runPickedTask(lastTaskRun.task.name)
     })
     registerConfigCommands(config, registry)
-    registerCommandActions(evalCommands, registry)
+    registerCommandActions(evalCommands, registry, 'eval')
     return registry
   }, [
-    activeBuffer.filename, activeId, buffers, commandEpoch, config, currentGitHunk, evalCommands, jumpToDiagnostic, openDiagnosticsPanel,
-    openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveCurrentBuffer, setStatus, setWorkspaceTab, sidecar, snapshot,
+    actions, activeBuffer.filename, activeId, buffers, commandEpoch, config, currentGitHunk, evalCommands, jumpBuildError, jumpToDiagnostic, lastTaskRun, notify, openBuildPanel, openDiagnosticsPanel,
+    openFilePromptFromRoot, openGitPanelForHunk, openTroubleshootingPanel, replacePrompt, rescanWorkspace, saveCurrentBuffer, setStatus, setWorkspaceTab, shell, sidecar, snapshot, uiPick,
   ])
+  commandRegistryRef.current = commandRegistry
 
   const makeCtx = React.useCallback((): EditorContext => createEditorContext({
       mode: 'interactive',
@@ -764,13 +893,14 @@ function App({
       openGitPanelForHunk, openNamedPanel, openSplash, saveCurrentBuffer, setStatus, shell, shellLines, sidecar, snapshot,
       uiConfirm, uiInput, uiPick,
     ])
+  makeCtxRef.current = makeCtx
 
   const pluginStartupRanRef = React.useRef(false)
 
   React.useEffect(() => {
     void (async () => {
       await registerPlugins(commandRegistry)
-      registerCommandActions(evalCommands, commandRegistry)
+      registerCommandActions(evalCommands, commandRegistry, 'eval')
       if (pluginStartupRanRef.current) return
       const startups = await loadPluginStartupActions()
       if (startups.length === 0) return
@@ -907,6 +1037,9 @@ function App({
       previous: actions.previousBuffer,
       kill: () => actions.killBuffer(activeId),
       newScratch: actions.newScratch,
+      keep: actions.keepBuffer,
+      cursorBack: actions.cursorBack,
+      cursorForward: actions.cursorForward,
       quitAll: actions.quitAll,
     },
     {
@@ -1022,9 +1155,31 @@ function App({
           notify(`task failed: ${String(error)}`, 'error')
         })
       },
+      buildErrors: () => {
+        void commandRegistry.run('build.errors', makeCtx()).catch(error => {
+          notify(`build panel failed: ${String(error)}`, 'error')
+        })
+      },
+      nextBuildError: () => {
+        void commandRegistry.run('build.nextError', makeCtx()).catch(error => {
+          notify(`build navigation failed: ${String(error)}`, 'error')
+        })
+      },
+      previousBuildError: () => {
+        void commandRegistry.run('build.previousError', makeCtx()).catch(error => {
+          notify(`build navigation failed: ${String(error)}`, 'error')
+        })
+      },
+      rerunTask: () => {
+        void commandRegistry.run('tasks.rerun', makeCtx()).catch(error => {
+          notify(`task rerun failed: ${String(error)}`, 'error')
+        })
+      },
+      rescanWorkspace,
     },
     {
       open:   actions.openConfig,
+      troubleshooting: openTroubleshootingPanel,
       reload: () => { void actions.reloadConfig() },
       evalFile: () => { void evalCurrentFile() },
       evalExpression: () => { void evalExpression() },
@@ -1052,16 +1207,12 @@ function App({
         ctx.ui.notify(`config action failed: ${String(error)}`, 'error')
       })
     },
-    commandRegistry.list().map(command => ({
-      label: command.label,
-      keys: command.id,
-      action: () => {
-        void commandRegistry.run(command.id, makeCtx()).catch(error => {
-          notify(`command failed: ${String(error)}`, 'error')
-        })
-      },
-    })),
-  ), [actions, activeBuffer.filename, activeId, buffers, commandEpoch, commandRegistry, currentGitHunk, evalCurrentFile, evalExpression, evalRegion, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, replacePrompt, saveBufferAndQuit, saveCurrentBuffer, setStatus, setWorkspaceTab, shell, sidecar, snapshot, userLeader])
+    commandRegistryItems(commandRegistry.list(), id => {
+      void commandRegistry.run(id, makeCtx()).catch(error => {
+        notify(`command failed: ${String(error)}`, 'error')
+      })
+    }),
+  ), [actions, activeBuffer.filename, activeId, buffers, commandEpoch, commandRegistry, currentGitHunk, evalCurrentFile, evalExpression, evalRegion, jumpToDiagnostic, makeCtx, notify, openDiagnosticsPanel, openFilePromptFromRoot, openGitPanelForHunk, openTroubleshootingPanel, replacePrompt, rescanWorkspace, saveBufferAndQuit, saveCurrentBuffer, setStatus, setWorkspaceTab, shell, sidecar, snapshot, userLeader])
 
   leaderMapRef.current = leaderMap
 
@@ -1453,11 +1604,64 @@ function App({
     }
   }
 
+  const applyDirectivePick = React.useCallback((value: string) => {
+    const p = prompt
+    if (p?.type !== 'directivePick') return
+    dismissInlineCompletion()
+    sidecar.deleteRange(p.row, p.replaceStartCol, p.row, p.col)
+    sidecar.insert(insertTextForDirective(value, p.quote))
+    replacePrompt(null)
+    setMode('insert')
+    actions.setActiveBufferStatus(`directive: ${value}`)
+  }, [actions, dismissInlineCompletion, prompt, replacePrompt, sidecar])
+
+  function openDirectivePick(
+    row: number,
+    col: number,
+    line: string,
+  ): boolean {
+    const fname = snapshot?.filename ?? activeBuffer.filename ?? null
+    if (!isConfigOrPluginSourceFile(fname)) return false
+    const ctx = parseConfigDirectiveContext(line, col)
+    if (!ctx) return false
+    dismissInlineCompletion()
+    replacePrompt({
+      type: 'directivePick',
+      row,
+      col,
+      quote: ctx.quote,
+      partial: ctx.partial,
+      replaceStartCol: ctx.replaceStartCol,
+      query: '',
+      items: directivePickItems(ctx.candidates),
+      selected: 0,
+    })
+    setMode('insert')
+    actions.setActiveBufferStatus(
+      `directive type: ${ctx.candidates.length} — j/k move  Ret/Tab pick  Esc cancel`,
+    )
+    return true
+  }
+
+  function suggestConfigDirectiveCompletion(
+    colOverride?: number,
+    rowOverride?: number,
+    lineOverride?: string,
+  ): boolean {
+    const lines = snapshot?.lines ?? ['']
+    const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+    const row = rowOverride ?? cursor.row
+    const line = lineOverride ?? lines[row] ?? ''
+    const col = colOverride ?? cursor.col
+    return openDirectivePick(row, col, line)
+  }
+
   function triggerCompletion() {
     // Native sidecar may not have sent snapshot yet — still offer completion on empty/scratch.
     const lines = snapshot?.lines ?? ['']
     const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
     const fname = snapshot?.filename ?? activeBuffer.filename ?? null
+    if (suggestConfigDirectiveCompletion()) return
     abortRef.current?.abort()
     const controller = new AbortController()
     abortRef.current = controller
@@ -1549,6 +1753,7 @@ function App({
       clearAiChat: clearAiChat,
       clearSearchHighlights: clearSearchHighlights,
       cmdBuf: cmdBuf,
+      dismissInlineCompletion: dismissInlineCompletion,
       completionStreaming: completionStreaming,
       dangerPrompt: dangerPrompt,
       enterNormal: enterNormal,
@@ -1607,6 +1812,8 @@ function App({
       switchWorkflowTabByIndex: switchWorkflowTabByIndex,
       cycleWorkflowTab: cycleWorkflowTab,
       triggerCompletion: triggerCompletion,
+      suggestConfigDirectiveCompletion: suggestConfigDirectiveCompletion,
+      applyDirectivePick: applyDirectivePick,
       visualAnchor: visualAnchor,
       visualExpandHistoryRef: visualExpandHistoryRef,
       visualLineMode: visualLineMode,
@@ -1719,12 +1926,18 @@ function App({
   }
 
   const lspOverlayRows = lspOverlay ? Math.min(10, lspOverlay.lines.length + 2) : 0
-  const panelRows = (panel === null ? 0
-    : panel.type === 'shell'      ? 3 + shellRows
-    : panel.type === 'dired'      ? totalRows
-    : panel.type === 'cmdpalette' ? Math.min(14, Math.max(5, totalRows - 4))
-    : panel.type === 'lsp'        ? Math.min(10, panel.lines.length + 2)
-    : 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4))) + lspOverlayRows
+  const panelRows = (() => {
+    if (panel === null) return 0 + lspOverlayRows
+    switch (panel.type) {
+      case 'shell': return 3 + shellRows + lspOverlayRows
+      case 'dired': return totalRows + lspOverlayRows
+      case 'cmdpalette': return Math.min(14, Math.max(5, totalRows - 4)) + lspOverlayRows
+      case 'troubleshooting':
+      case 'build': return Math.min(16, Math.max(8, totalRows - 4)) + lspOverlayRows
+      case 'lsp': return Math.min(10, panel.lines.length + 2) + lspOverlayRows
+      case 'whichkey': return 3 + Math.min(9, Math.ceil(Object.keys(panel.node).length / 4)) + lspOverlayRows
+    }
+  })()
   const editorHeight = panel?.type === 'dired' ? 0 : Math.max(1, totalRows - panelRows)
 
   const editorPane = (
@@ -1765,6 +1978,12 @@ function App({
       )}
       {panel?.type === 'cmdpalette' && (
         <CmdPalettePanel items={panel.items} query={panel.query} cursor={panel.cursor} width={Math.min(70, totalCols - 4)} />
+      )}
+      {panel?.type === 'troubleshooting' && (
+        <TroubleshootingPanel rows={panel.rows} totalCols={totalCols} />
+      )}
+      {panel?.type === 'build' && (
+        <BuildPanel state={panel.state} cursor={panel.cursor} totalCols={totalCols} />
       )}
       {panel?.type === 'lsp' && (
         <LspPanel title={panel.title} lines={panel.lines} totalCols={totalCols} />
@@ -1843,6 +2062,7 @@ async function main() {
   let activeSidecar: QeSidecar | null = null
   let bufferSwitchCount = 0
   const sidecarMap = new Map<string, QeSidecar>()
+  let cursorHistory = createCursorHistoryState()
   let shellLines: ShellLine[] = [...shell.lines]
   let instance: Instance | null = null
   let quitting = false
@@ -1876,17 +2096,44 @@ async function main() {
     registry.register('workspace.code', 'workspace: code tab', () => setWorkspaceTabMain('code'))
     registry.register('workspace.process', 'workspace: process tab', () => setWorkspaceTabMain('process'))
     registry.register('workspace.ai', 'workspace: AI tab', () => setWorkspaceTabMain('ai'))
+    const runResolvedTask = async (task: ReturnType<typeof normalizeTasks>[number]) => {
+      if (task.tab === 'process') setWorkspaceTabMain('process')
+      else openShellPanelFromHook?.()
+      const result = await runTaskProfile(task, shell)
+      const loc = firstTaskLocation(result)
+      if (task.autoJumpToError && loc) {
+        openFile(resolvePath(result.final.cwd, loc.file), { row: loc.row, col: loc.col })
+      }
+      if (task.closePanelOnSuccess && task.tab === 'process' && taskSucceeded(result)) {
+        setWorkspaceTabMain('code')
+      }
+    }
     registry.register('tasks.pickAndRun', 'tasks: pick and run', async (ctx, args) => {
       const resolved = resolveHookTask(cfg.tasks, args)
       if ('error' in resolved) {
         ctx.ui.notify(resolved.error, 'warn')
         return
       }
-      const { task } = resolved
-      ctx.shell.run(task.command)
-      if (task.tab === 'process') setWorkspaceTabMain('process')
-      else openShellPanelFromHook?.()
+      await runResolvedTask(resolved.task)
     })
+    registry.register('tasks.run', 'tasks: run named task', async (ctx, args) => {
+      const resolved = resolveHookTask(cfg.tasks, args)
+      if ('error' in resolved) {
+        ctx.ui.notify(resolved.error, 'warn')
+        return
+      }
+      await runResolvedTask(resolved.task)
+    })
+    registry.register('workspace.rescan', 'workspace: rescan index', async () => {
+      const previous = loadWorkspaceIndex(cwd)
+      const next = await buildWorkspaceIndexAsync(cwd, cfg.workspace, previous)
+      saveWorkspaceIndex(cwd, next)
+      activeBuffer().status = `workspace: indexed ${next.entries.length} files`
+      refresh()
+    })
+    registry.register('buffer.keep', 'buffer: keep temporary editor', () => keepBuffer())
+    registry.register('cursor.back', 'cursor: back', () => cursorBack())
+    registry.register('cursor.forward', 'cursor: forward', () => cursorForward())
     registry.register('code.format', 'code: format', () => activeSidecar?.format())
     registry.register('openFile', 'file: open', (_ctx, args) => {
       const path = typeof args?.path === 'string' ? args.path : null
@@ -1996,6 +2243,12 @@ async function main() {
             if (decision.revision !== null) changeHookRevisions.set(buffer.id, decision.revision)
             if (decision.schedule) scheduleChangeHook(buffer)
           }
+          if (message.dirty) markBufferPermanent(buffer)
+          cursorHistory = noteCursorHistoryLocation(cursorHistory, {
+            file: message.filename ?? buffer.filename,
+            row: message.cursor.row,
+            col: message.cursor.col,
+          })
           if (!buffer.openHookFired) {
             buffer.openHookFired = true
             if (cfg.hooks?.onOpen) runHookAction(cfg.hooks.onOpen, buffer)
@@ -2003,6 +2256,7 @@ async function main() {
           break
         case 'saved':
           buffer.status = 'saved'
+          markBufferPermanent(buffer)
           if (cfg.hooks?.onSave) runHookAction(cfg.hooks.onSave, buffer)
           break
         case 'error':
@@ -2054,7 +2308,37 @@ async function main() {
     return sc
   }
 
-  function createBuffer(file?: string | null): EditorBuffer {
+  function currentCursorLocation(): CursorHistoryLocation | null {
+    const buffer = activeBuffer()
+    const file = buffer.snapshot?.filename ?? buffer.filename
+    const cursor = buffer.snapshot?.cursor ?? { row: 0, col: 0 }
+    return { file, row: cursor.row, col: cursor.col }
+  }
+
+  function noteCursorLocation(): void {
+    const loc = currentCursorLocation()
+    if (loc) cursorHistory = noteCursorHistoryLocation(cursorHistory, loc)
+  }
+
+  function goToCursorHistory(target: CursorHistoryLocation | null): void {
+    if (!target) return
+    if (target.file) openFile(target.file, { row: target.row, col: target.col })
+    else activeSidecar?.moveTo(target.row, target.col)
+  }
+
+  function cursorBack(): void {
+    const moved = moveCursorHistoryBack(cursorHistory)
+    cursorHistory = moved.state
+    goToCursorHistory(moved.target)
+  }
+
+  function cursorForward(): void {
+    const moved = moveCursorHistoryForward(cursorHistory)
+    cursorHistory = moved.state
+    goToCursorHistory(moved.target)
+  }
+
+  function createBuffer(file?: string | null, temporary = false): EditorBuffer {
     const id = `buffer-${nextBufferId++}`
     const buffer: EditorBuffer = {
       id,
@@ -2063,6 +2347,7 @@ async function main() {
       snapshot: null,
       status: 'starting',
       lastUsedAt: Date.now(),
+      temporary: temporary && Boolean(file),
     }
     buffers = [...buffers, buffer]
     return buffer
@@ -2070,11 +2355,13 @@ async function main() {
 
   function activateBuffer(buffer: EditorBuffer): void {
     if (activeSidecar) { activeSidecar.kill(); activeSidecar = null }
+    noteCursorLocation()
     const previousId = activeId
     activeId = buffer.id
     buffer.lastUsedAt = Date.now()
     bufferSwitchCount++
     activeSidecar = createSidecarForBuffer(buffer)
+    noteCursorLocation()
     if (previousId !== buffer.id && cfg.hooks?.onBufEnter) {
       runHookAction(cfg.hooks.onBufEnter, buffer)
     }
@@ -2145,6 +2432,14 @@ async function main() {
     refresh()
   }
 
+  function keepBuffer(): void {
+    const buffer = activeBuffer()
+    markBufferPermanent(buffer)
+    buffer.status = 'buffer kept'
+    buffers = [...buffers]
+    refresh()
+  }
+
   function openFile(path: string, jump?: { row: number; col: number }): void {
     const resolved = resolvePath(path)
     const existing = buffers.find(b => {
@@ -2165,7 +2460,11 @@ async function main() {
       switchBuffer(existing.id)
       return
     }
-    const buffer = createBuffer(resolved)
+    const active = buffers.find(b => b.id === activeId)
+    if (shouldReplaceTemporaryBuffer(active)) {
+      removeBuffer(active!.id)
+    }
+    const buffer = createBuffer(resolved, true)
     if (jump) buffer.jumpTo = jump
     activateBuffer(buffer)
     refresh()
@@ -2277,6 +2576,10 @@ async function main() {
             nextBuffer,
             previousBuffer,
             newScratch,
+            keepBuffer,
+            cursorBack,
+            cursorForward,
+            noteCursorLocation,
             quitAll,
             reloadConfig: reloadCfg,
             applyConfig: applyCfg,

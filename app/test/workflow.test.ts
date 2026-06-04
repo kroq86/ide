@@ -96,13 +96,49 @@ describe('workflow workspace tabs', () => {
 describe('workflow tasks', () => {
   it('normalizes configured tasks and drops empty entries', () => {
     const tasks = normalizeTasks([
-      { name: ' dev ', command: ' npm run dev ', tab: 'process' },
+      {
+        name: ' dev ',
+        command: ' npm run dev ',
+        cwd: ' app ',
+        runCommand: ' npm start ',
+        errorRegex: '^(?<file>.*):(?<line>\\d+)$',
+        autoJumpToError: true,
+        closePanelOnSuccess: true,
+        timeoutSeconds: 2.8,
+        tab: 'process',
+      },
       { name: '', command: 'npm test' },
       { name: 'bad', command: '   ' },
     ])
 
     assert.deepEqual(tasks, [
-      { name: 'dev', command: 'npm run dev', tab: 'process' },
+      {
+        name: 'dev',
+        command: 'npm run dev',
+        cwd: 'app',
+        runCommand: 'npm start',
+        errorRegex: '^(?<file>.*):(?<line>\\d+)$',
+        autoJumpToError: true,
+        closePanelOnSuccess: true,
+        timeoutSeconds: 2,
+        tab: 'process',
+      },
+    ])
+  })
+
+  it('keeps old minimal task configs source-compatible', () => {
+    assert.deepEqual(normalizeTasks([{ name: 'test', command: 'npm test' }]), [
+      {
+        name: 'test',
+        command: 'npm test',
+        cwd: undefined,
+        runCommand: undefined,
+        errorRegex: undefined,
+        autoJumpToError: false,
+        closePanelOnSuccess: false,
+        timeoutSeconds: undefined,
+        tab: undefined,
+      },
     ])
   })
 })

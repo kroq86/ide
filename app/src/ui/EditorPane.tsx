@@ -47,6 +47,7 @@ export function EditorPane({
   const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
   const title  = snapshot?.filename ?? filename ?? bufferName
   const dirty  = snapshot?.dirty ?? false
+  const temporary = buffers.find(buffer => buffer.id === activeBufferId)?.temporary === true
   const diagnosticCount = snapshot?.diagnostics?.length ?? 0
   const matchCount = searchQuery ? findMatches(lines, searchQuery).length : 0
 
@@ -81,6 +82,8 @@ export function EditorPane({
     hintLine = `Commit: ${prompt.message}_`
   } else if (prompt?.type === 'model') {
     hintLine = `Select model: ${prompt.query}_  j/k=navigate  Ret=confirm  Esc=cancel`
+  } else if (prompt?.type === 'directivePick') {
+    hintLine = `Directive type: ${prompt.query}_  j/k=navigate  Ret/Tab=pick  Esc=cancel`
   } else if (prompt?.type === 'configPick') {
     hintLine = `${prompt.title}: ${prompt.query}_  j/k=navigate  Ret=choose  Esc=cancel`
   } else if (prompt?.type === 'configInput') {
@@ -104,7 +107,7 @@ export function EditorPane({
   const segFileBg = '#3e4452'
   const segInfoBg = '#21252b'
   const modelinePill = ` ${modeLabel} `
-  const modelineFile = `  ${pathShown}${dirty ? ' ●' : ''}  `
+  const modelineFile = `  ${temporary ? '~ ' : ''}${pathShown}${dirty ? ' ●' : ''}  `
   const modelineInfo = `  ${cursor.row + 1}:${cursor.col + 1}${diagnosticCount > 0 ? `  ⚠ ${diagnosticCount}` : ''}  `
   const modelineModel = `  ${aiModelLabel} `
   const modelinePadLen = Math.max(0, effectiveCols - modelinePill.length - modelineFile.length - modelineInfo.length - modelineModel.length)
@@ -180,6 +183,37 @@ export function EditorPane({
                     )
                   })}
               <Text color={C.grey}>{scrollStart > 0 ? `  ↑ ${scrollStart} more` : ' '}</Text>
+            </Box>
+          )
+        })()}
+        {prompt?.type === 'directivePick' && (() => {
+          const q = prompt.query.toLowerCase()
+          const filtered = prompt.items.filter(item =>
+            !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
+          )
+          const windowSize = 10
+          const scrollStart = Math.max(0, Math.min(prompt.selected - Math.floor(windowSize / 2), filtered.length - windowSize))
+          const visible = filtered.slice(scrollStart, scrollStart + windowSize)
+          return (
+            <Box flexDirection="column">
+              <Box flexDirection="row">
+                <Text backgroundColor={C.cyan} color={C.bg}> type </Text>
+                <Text color={C.grey}>{`  ${filtered.length}/${prompt.items.length}  type to filter  partial: ${prompt.partial || '·'}_`}</Text>
+              </Box>
+              {visible.length === 0
+                ? <Text color={C.grey}>  no matches</Text>
+                : visible.map((item, index) => {
+                    const isSelected = scrollStart + index === prompt.selected
+                    const desc = item.description ? `  — ${item.description}` : ''
+                    return (
+                      <Text key={`${item.value}:${index}`} color={isSelected ? C.bg : C.fg} backgroundColor={isSelected ? C.cyan : undefined}>
+                        {`  ${item.label}${desc}`}
+                      </Text>
+                    )
+                  })}
+              {filtered.length > windowSize
+                ? <Text color={C.grey}>{`  (${scrollStart + 1}-${scrollStart + visible.length} of ${filtered.length})`}</Text>
+                : null}
             </Box>
           )
         })()}

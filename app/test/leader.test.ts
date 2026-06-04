@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  buildLeaderMap, flattenLeader, isLeafAction, whichKeyDesc,
+  buildLeaderMap, commandPaletteMatch, commandRegistryItems, flattenLeader, isLeafAction, uniqueCommandPaletteItems, whichKeyDesc,
   COMMAND_LABELS, NODE_LABELS,
   type LeaderNode, type CmdItem,
 } from '../src/leader.ts'
@@ -159,7 +159,7 @@ describe('buildLeaderMap — specific key presence', () => {
 
   const required = [
     'SPC a p', 'SPC a c', 'SPC a e', 'SPC a f', 'SPC a t', 'SPC a l', 'SPC a r', 'SPC a k',
-    'SPC m t', 'SPC m f', 'SPC m a',
+    'SPC m t', 'SPC m b', 'SPC m n', 'SPC m p', 'SPC m R', 'SPC m r', 'SPC m f', 'SPC m a',
     'SPC g g', 'SPC g s', 'SPC g h n', 'SPC g h p', 'SPC g h s', 'SPC g h u', 'SPC g h v',
     'SPC g b', 'SPC g l', 'SPC g f',
     'SPC b b', 'SPC b k', 'SPC b n', 'SPC b p', 'SPC b s', 'SPC b N',
@@ -170,7 +170,7 @@ describe('buildLeaderMap — specific key presence', () => {
     'SPC s s', 'SPC s r',
     'SPC x x', 'SPC x b', 'SPC x d', 'SPC x n', 'SPC x p', 'SPC x e', 'SPC x w',
     'SPC u h', 'SPC u w', 'SPC u d',
-    'SPC p e', 'SPC p r',
+    'SPC p e', 'SPC p ?', 'SPC p r',
   ]
 
   for (const key of required) {
@@ -182,6 +182,45 @@ describe('buildLeaderMap — specific key presence', () => {
   it('includes SPC : (command palette)', () => {
     assert.ok(':' in map, 'SPC : not in leader map')
     assert.equal(typeof map[':'], 'function')
+  })
+})
+
+describe('command palette helpers', () => {
+  it('matches command palette items by label, id, key, and source', () => {
+    const item = {
+      label: 'build: errors',
+      id: 'build.errors',
+      keys: 'SPC m b',
+      source: 'builtin' as const,
+      action: noop,
+    }
+
+    assert.equal(commandPaletteMatch(item, 'errors'), true)
+    assert.equal(commandPaletteMatch(item, 'build.errors'), true)
+    assert.equal(commandPaletteMatch(item, 'SPC m'), true)
+    assert.equal(commandPaletteMatch(item, 'builtin'), true)
+    assert.equal(commandPaletteMatch(item, 'missing'), false)
+  })
+
+  it('creates registry-backed command palette items with metadata', () => {
+    const items = commandRegistryItems([
+      { id: 'tasks.rerun', label: 'tasks: rerun last task', source: 'builtin', run: () => undefined },
+    ], noop, [{ label: 'tasks: rerun last task', keys: 'SPC m R', action: noop }])
+
+    assert.equal(items[0]?.id, 'tasks.rerun')
+    assert.equal(items[0]?.source, 'builtin')
+    assert.equal(items[0]?.label, 'tasks: rerun last task')
+    assert.equal(items[0]?.keys, 'SPC m R')
+  })
+
+  it('deduplicates command palette items by command id', () => {
+    const items = uniqueCommandPaletteItems([
+      { id: 'x', label: 'x one', keys: '', action: noop },
+      { id: 'x', label: 'x two', keys: '', action: noop },
+      { label: 'key', keys: 'SPC k', action: noop },
+    ])
+
+    assert.deepEqual(items.map(item => item.label), ['x one', 'key'])
   })
 })
 

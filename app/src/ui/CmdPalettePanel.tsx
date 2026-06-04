@@ -1,6 +1,6 @@
 import React from 'react'
 import { Box, Text } from 'terminal-react-core'
-import type { CmdItem } from '../leader.js'
+import { commandPaletteMatch, type CmdItem } from '../leader.js'
 import { C } from './theme.js'
 
 export function CmdPalettePanel({
@@ -11,9 +11,7 @@ export function CmdPalettePanel({
   cursor: number
   width: number
 }) {
-  const filtered = query
-    ? items.filter(it => it.label.toLowerCase().includes(query.toLowerCase()) || it.keys.includes(query))
-    : items
+  const filtered = items.filter(it => commandPaletteMatch(it, query))
   const visible = filtered.slice(0, 12)
 
   return (
@@ -33,12 +31,18 @@ export function CmdPalettePanel({
           : visible.map((item, i) => {
               const active = i === cursor % visible.length
               return (
-                <Box key={item.keys} flexDirection="row">
+                <Box key={`${item.id ?? item.keys}:${item.label}`} flexDirection="row">
                   <Text color={active ? C.bg : C.grey} backgroundColor={active ? C.violet : undefined}>{' '}</Text>
                   <Text color={active ? C.cyan : C.fg} backgroundColor={active ? C.bg : undefined} bold={active}>
-                    {` ${item.label.padEnd(36)} `}
+                    {` ${item.label.padEnd(28).slice(0, 28)} `}
                   </Text>
-                  <Text color={C.grey} backgroundColor={active ? C.bg : undefined}>{item.keys}</Text>
+                  <Text color={C.grey} backgroundColor={active ? C.bg : undefined}>
+                    {`${(item.id ?? '').padEnd(24).slice(0, 24)} `}
+                  </Text>
+                  <Text color={C.yellow} backgroundColor={active ? C.bg : undefined}>
+                    {`${(item.keys || '-').padEnd(12).slice(0, 12)} `}
+                  </Text>
+                  <Text color={C.grey} backgroundColor={active ? C.bg : undefined}>{item.source ?? 'keymap'}</Text>
                 </Box>
               )
             })

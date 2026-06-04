@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url'
 import { applyPluginsToConfig, PLUGIN_DIR } from './config-plugins.js'
 import type { ShellRun } from './shell.js'
 import type { QeProjectProfile, QeTask } from './workflow.js'
+import type { WorkspaceConfig } from './workspace-index.js'
 
 // ── Public types — what users write in their config file ─────────────────────
 
@@ -65,6 +66,7 @@ export type BufferInfo = {
   name: string
   filename: string | null
   dirty: boolean
+  temporary?: boolean
   active: boolean
 }
 
@@ -159,6 +161,7 @@ export type QeConfig = {
   commands?: Record<string, ConfigAction>
   tasks?: QeTask[]
   projects?: QeProjectProfile[]
+  workspace?: WorkspaceConfig
 }
 
 export function defineConfig<const T extends QeConfig>(config: T): T {

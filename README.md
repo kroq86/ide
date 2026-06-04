@@ -134,9 +134,15 @@ export default defineConfig({
   },
 
   tasks: [
-    { name: 'typecheck', command: 'npm run typecheck', tab: 'process' },
+    { name: 'typecheck', command: 'npm run typecheck', tab: 'process', autoJumpToError: true },
     { name: 'app tests', command: 'npm --prefix app run test', tab: 'process' },
   ],
+
+  workspace: {
+    roots: ['.'],
+    ignore: ['coverage/**'],
+    allow: [],
+  },
 })
 ```
 
@@ -156,12 +162,14 @@ Built-in command IDs include:
 
 ```txt
 file.find          file.save          buffer.switch
+buffer.keep        cursor.back        cursor.forward
 shell.run          panel.open         ai.chat
 code.hover         code.definition    code.format
 git.status         git.hunk.stage     git.hunk.preview
 diagnostics.list   diagnostics.next   diagnostics.line
 workspace.code     workspace.process  workspace.ai
-tasks.pickAndRun
+workspace.rescan
+tasks.pickAndRun   tasks.run
 ```
 
 Supported directives:
@@ -262,6 +270,9 @@ Press **`SPC`** in normal mode for which-key. Bindings are defined in [`app/src/
 
 Shell **panel** vs **process** tab: same sidecar, different layout — see [`docs/workspace-ui.md`](docs/workspace-ui.md).
 | `SPC m t` | tasks: pick and run |
+| `SPC m r` | workspace: rescan file index |
+| `SPC b K` | buffer: keep temporary editor |
+| `SPC b [` / `SPC b ]` | cursor: back / forward |
 | `Option-1..9` | switch to numbered tab shown as `⌥N` |
 | `Option-[` / `Option-]` | previous / next workflow tab (buffers, then process, then AI); macOS may send `«` / `»` |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | same, when Option+[ does not register as Meta |

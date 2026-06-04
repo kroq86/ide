@@ -37,6 +37,25 @@ Unknown directive types call `ctx.ui.notify("unknown directive: <type>", "error"
 - User commands may override built-in command IDs.
 - Last registration wins.
 - This is intentional because config is trusted local code and overrides are a core customization mechanism.
+- `tasks.run` accepts `args.task` or `args.name` and runs a configured task without prompting.
+- `workspace.rescan` rebuilds the local `.qe/workspace-index.json` cache.
+
+## Tasks And Workspace
+
+Configured `tasks` keep the old `{ name, command, tab }` shape and may add Focus-style build profile fields:
+
+- `cwd` runs the task from another working directory.
+- `runCommand` runs after `command` succeeds.
+- `errorRegex` may use named groups `file`, `line`, optional `col`, optional `message`/`msg`, optional `type`; parsed matches are added to `ShellRun.locations`.
+- `autoJumpToError` opens the first parsed location after the task.
+- `closePanelOnSuccess` returns from the process tab to code after a successful process task.
+- `timeoutSeconds` overrides the tracked shell timeout for that task.
+
+`workspace` supports `{ roots, ignore, allow }`. The file index is stored in `.qe/workspace-index.json`, uses default ignores for common dependency/build/session directories, and powers the file picker. `allow` patterns override ignored files, including files inside ignored directories.
+
+New file buffers are temporary by default and are marked with `~`; they are replaced by the next file open until edited, saved, restored from session, or kept with `buffer.keep`.
+
+Cursor history is UI-level. `cursor.back` and `cursor.forward` record file switches and meaningful jumps while skipping tiny same-file moves.
 
 ## EditorContext modes
 

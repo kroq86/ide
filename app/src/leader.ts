@@ -2,6 +2,7 @@ import { basename, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync, readFileSync } from 'node:fs'
 import { mergeLeaderTree, type ConfigAction, type LeaderTree, type EditorContext } from './config.js'
+import type { RegisteredCommand, CommandSource } from './config-runtime.js'
 
 // Internal leader node: leaves are plain () => void (no EditorContext arg).
 // The config-level LeaderTree (with ctx arg) is merged in via mergeLeaderTree.
@@ -9,7 +10,26 @@ export interface LeaderNode {
   [key: string]: (() => void) | LeaderNode
 }
 
-export type CmdItem = { label: string; keys: string; action: () => void }
+export type CmdItem = {
+  label: string
+  keys: string
+  action: () => void
+  id?: string
+  source?: CommandSource | 'keymap'
+  description?: string
+}
+
+export function commandPaletteMatch(item: CmdItem, query: string): boolean {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return true
+  return [
+    item.label,
+    item.keys,
+    item.id ?? '',
+    item.source ?? '',
+    item.description ?? '',
+  ].some(value => value.toLowerCase().includes(needle))
+}
 
 // Repo root resolved at module load — same calculation as protocol.ts so that
 // relative snapshot filenames (which are relative to the repo root) resolve correctly.
@@ -45,6 +65,9 @@ export const COMMAND_LABELS: Record<string, string> = {
   'b n': 'buffer: next',
   'b p': 'buffer: previous',
   'b s': 'buffer: save',
+  'b K': 'buffer: keep',
+  'b [': 'cursor: back',
+  'b ]': 'cursor: forward',
   'b N': 'buffer: new scratch',
   'f f': 'file: open',
   'f n': 'file: new scratch',
@@ -93,11 +116,17 @@ export const COMMAND_LABELS: Record<string, string> = {
   'u w': 'ui: toggle wrap',
   'u d': 'ui: toggle diagnostics',
   'p e': 'config: edit config file',
+  'p ?': 'qe: troubleshooting',
   'p r': 'config: reload config',
   'p f': 'config: eval file',
   'p ;': 'config: eval expression',
   'p s': 'config: eval selection',
   'm t': 'tasks: pick and run',
+  'm b': 'build: errors',
+  'm n': 'build: next error',
+  'm p': 'build: previous error',
+  'm R': 'tasks: rerun',
+  'm r': 'workspace: rescan',
   'm f': 'mode: test current file',
   'm a': 'mode: test all',
   ':': 'command palette',
@@ -122,12 +151,42 @@ export function flattenLeader(node: LeaderNode, prefix = ''): CmdItem[] {
     const path = prefix ? `${prefix} ${key}` : key
     if (isLeafAction(val)) {
       const label = COMMAND_LABELS[path] ?? `SPC ${path}`
-      items.push({ label, keys: `SPC ${path}`, action: val })
+      items.push({ label, keys: `SPC ${path}`, action: val, source: 'keymap' })
     } else {
       items.push(...flattenLeader(val as LeaderNode, path))
     }
   }
   return items
+}
+
+export function commandRegistryItems(commands: RegisteredCommand[], run: (id: string) => void, keyItems: CmdItem[] = []): CmdItem[] {
+  const keysByLabel = new Map<string, string[]>()
+  for (const item of keyItems) {
+    const normalized = item.label.trim().toLowerCase()
+    const keys = keysByLabel.get(normalized) ?? []
+    if (item.keys) keys.push(item.keys)
+    keysByLabel.set(normalized, keys)
+  }
+  return commands.map(command => ({
+    id: command.id,
+    label: command.label,
+    keys: (keysByLabel.get(command.label.trim().toLowerCase()) ?? []).join(', '),
+    source: command.source,
+    description: command.description,
+    action: () => run(command.id),
+  }))
+}
+
+export function uniqueCommandPaletteItems(items: CmdItem[]): CmdItem[] {
+  const seen = new Set<string>()
+  const out: CmdItem[] = []
+  for (const item of items) {
+    const key = item.id ? `id:${item.id}` : `key:${item.keys}:${item.label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(item)
+  }
+  return out
 }
 
 // setPanel is typed as (v: unknown) => void so that leader.ts has no dependency
@@ -142,6 +201,9 @@ export function buildLeaderMap(
     previous: () => void
     kill: () => void
     newScratch: () => void
+    keep?: () => void
+    cursorBack?: () => void
+    cursorForward?: () => void
     quitAll: () => void
   },
   ai: {
@@ -200,9 +262,15 @@ export function buildLeaderMap(
   },
   tasks: {
     pickAndRun: () => void
+    rescanWorkspace?: () => void
+    buildErrors?: () => void
+    nextBuildError?: () => void
+    previousBuildError?: () => void
+    rerunTask?: () => void
   },
   config: {
     open: () => void
+    troubleshooting?: () => void
     reload: () => void
     evalFile: () => void
     evalExpression: () => void
@@ -217,6 +285,7 @@ export function buildLeaderMap(
   runAction?: (action: ConfigAction, ctx: EditorContext) => void,
   commandItems: CmdItem[] = [],
 ): LeaderNode {
+  const noop = () => {}
   const builtin: LeaderNode = {
     q: {
       q: buffers.quitAll,
@@ -229,6 +298,9 @@ export function buildLeaderMap(
       n: buffers.next,
       p: buffers.previous,
       s: () => sidecar.save(),
+      K: buffers.keep ?? noop,
+      '[': buffers.cursorBack ?? noop,
+      ']': buffers.cursorForward ?? noop,
       N: buffers.newScratch,
     },
     f: { f: buffers.openFilePrompt, n: buffers.newScratch, s: () => sidecar.save() },
@@ -296,6 +368,7 @@ export function buildLeaderMap(
     },
     p: {
       e: config.open,
+      '?': config.troubleshooting ?? noop,
       r: config.reload,
       f: config.evalFile,
       ';': config.evalExpression,
@@ -303,13 +376,24 @@ export function buildLeaderMap(
     },
     m: {
       t: tasks.pickAndRun,
+      b: tasks.buildErrors ?? noop,
+      n: tasks.nextBuildError ?? noop,
+      p: tasks.previousBuildError ?? noop,
+      R: tasks.rerunTask ?? noop,
+      r: tasks.rescanWorkspace ?? noop,
       f: mode.testFile,
       a: mode.testAll,
     },
   }
   const tree = mergeLeaderTree(builtin, userLeader, makeCtx, runAction) as LeaderNode
   ;(tree as LeaderNode)[':'] = () => {
-    setPanel({ type: 'cmdpalette', query: '', cursor: 0, items: [...flattenLeader(tree), ...commandItems] })
+    const keyItems = flattenLeader(tree)
+    setPanel({
+      type: 'cmdpalette',
+      query: '',
+      cursor: 0,
+      items: uniqueCommandPaletteItems([...keyItems, ...commandItems]),
+    })
   }
   return tree
 }

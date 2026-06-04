@@ -11,6 +11,7 @@ export function toBufferInfo(buffer: EditorBuffer, activeId: string): BufferInfo
     name: buffer.name,
     filename: buffer.snapshot?.filename ?? buffer.filename,
     dirty: isDirty(buffer),
+    temporary: buffer.temporary === true,
     active: buffer.id === activeId,
   }
 }

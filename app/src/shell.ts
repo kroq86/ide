@@ -30,11 +30,58 @@ export type ShellRun = {
   locations: ParsedLocation[]
 }
 
+export type ShellRunOptions = {
+  cwd?: string
+  errorRegex?: string
+  timeoutSeconds?: number
+}
+
+type RuntimeShellRunOptions = ShellRunOptions & {
+  compiledErrorRegex?: RegExp | null
+}
+
 export type ShellSession = ShellRun
 export type TrackedShellResult = ShellRun
 export type ShellMode = 'pty' | 'runner'
 
-function parseErrorLine(text: string): { isError: boolean; location: ParsedLocation | null } {
+export function parseConfiguredErrorLine(text: string, errorRegex: string): ParsedLocation | null {
+  let regex: RegExp
+  try {
+    regex = new RegExp(errorRegex)
+  } catch {
+    return null
+  }
+  return parseConfiguredErrorLineWithRegex(text, regex)
+}
+
+export function parseConfiguredErrorLineWithRegex(text: string, regex: RegExp): ParsedLocation | null {
+  const match = text.match(regex)
+  const groups = match?.groups
+  if (!groups?.['file'] || !groups['line']) return null
+  const line = Number.parseInt(groups['line'], 10)
+  const col = groups['col'] ? Number.parseInt(groups['col'], 10) : 1
+  if (!Number.isFinite(line) || line <= 0) return null
+  return {
+    file: groups['file'],
+    row: line - 1,
+    col: Number.isFinite(col) && col > 0 ? col - 1 : 0,
+    message: groups['message'] ?? groups['msg'] ?? groups['type'] ?? '',
+  }
+}
+
+export function parseErrorLine(text: string, errorRegex?: string): { isError: boolean; location: ParsedLocation | null } {
+  if (errorRegex) {
+    const configured = parseConfiguredErrorLine(text, errorRegex)
+    if (configured) return { isError: true, location: configured }
+  }
+  return parseErrorLineWithCompiledRegex(text, undefined)
+}
+
+export function parseErrorLineWithCompiledRegex(text: string, errorRegex?: RegExp | null): { isError: boolean; location: ParsedLocation | null } {
+  if (errorRegex) {
+    const configured = parseConfiguredErrorLineWithRegex(text, errorRegex)
+    if (configured) return { isError: true, location: configured }
+  }
   const tsMatch = text.match(/^(.+?\.tsx?)\((\d+),(\d+)\):\s+(?:error|warning)\s+TS\d+:\s+(.*)$/)
   if (tsMatch) {
     return {
@@ -98,6 +145,7 @@ export class ShellSidecar extends EventEmitter {
   #tracked = new Map<string, {
     run: ShellRun
     timer: ReturnType<typeof setTimeout>
+    options: RuntimeShellRunOptions
     resolve: (result: TrackedShellResult) => void
   }>()
 
@@ -139,10 +187,11 @@ export class ShellSidecar extends EventEmitter {
 
         if (this.#handleTrackedExit(text.trim())) continue
 
-        const { isError, location } = parseErrorLine(text)
+        const run = this.#runs[this.#runs.length - 1]
+        const tracked = run && !run.endedAt ? this.#tracked.get(run.id) : undefined
+        const { isError, location } = parseErrorLineWithCompiledRegex(text, tracked?.options.compiledErrorRegex)
         this.#pushLine(text, isError)
 
-        const run = this.#runs[this.#runs.length - 1]
         if (run && !run.endedAt) {
           appendTail(run, 'stdout', text)
           if (isError) appendTail(run, 'stderr', text)
@@ -220,57 +269,63 @@ export class ShellSidecar extends EventEmitter {
     return this.runTracked(cmd)
   }
 
-  runTracked(command: string): Promise<TrackedShellResult> {
+  runTracked(command: string, options: ShellRunOptions = {}): Promise<TrackedShellResult> {
     const cmd = command.trim()
     if (!cmd) {
       const now = new Date().toISOString()
-      return Promise.resolve({ id: '', command: cmd, cwd: this.#cwd, startedAt: now, endedAt: now, stdout: '', stderr: '', locations: [] })
+      return Promise.resolve({ id: '', command: cmd, cwd: options.cwd ?? this.#cwd, startedAt: now, endedAt: now, stdout: '', stderr: '', locations: [] })
     }
 
     const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`
-    const run = this.#startRun(id, cmd)
+    const runtimeOptions = compileRunOptions(options)
+    const run = this.#startRun(id, cmd, runtimeOptions.cwd)
 
     if (this.#mode === 'runner' || !this.#term) {
-      return this.#runProcess(cmd, run)
+      return this.#runProcess(cmd, run, runtimeOptions)
     }
 
     return new Promise(resolve => {
+      const timeoutMs = (options.timeoutSeconds ?? 120) * 1000
       const timer = setTimeout(() => {
         this.#tracked.delete(id)
-        run.endedAt = new Date().toISOString()
+        finalizeTimedOutRun(run, options.timeoutSeconds ?? 120)
+        this.#pushLine(`command timed out after ${options.timeoutSeconds ?? 120}s`, true)
+        this.#term?.write('\x03')
         const result = { ...run }
+        this.emit('update')
         this.emit('done', result)
         resolve(result)
-      }, 120000)
+      }, timeoutMs)
 
-      this.#tracked.set(id, { run, timer, resolve })
+      this.#tracked.set(id, { run, timer, options: runtimeOptions, resolve })
       const sentinel = `__CODECLAW_EXIT_${id}:`
-      this.#term?.write(`(${cmd}); __codeclaw_status=$?; printf '\\n${sentinel}%s\\n' "$__codeclaw_status"\r`)
+      const prefix = runtimeOptions.cwd ? `cd ${shellQuote(runtimeOptions.cwd)} && ` : ''
+      this.#term?.write(`(${prefix}${cmd}); __codeclaw_status=$?; printf '\\n${sentinel}%s\\n' "$__codeclaw_status"\r`)
     })
   }
 
-  #runProcess(cmd: string, run: ShellRun): Promise<TrackedShellResult> {
+  #runProcess(cmd: string, run: ShellRun, options: RuntimeShellRunOptions): Promise<TrackedShellResult> {
     this.#pushLine(`$ ${cmd}`, false)
     return new Promise(resolve => {
       const child = spawn(cmd, {
-        cwd: this.#cwd,
+        cwd: options.cwd ?? this.#cwd,
         env: process.env,
         shell: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       this.#runnerChild = child
+      const timeoutSeconds = options.timeoutSeconds ?? 120
       const timer = setTimeout(() => {
-        this.#pushLine('command timed out after 120s', true)
-        appendTail(run, 'stderr', 'command timed out after 120s')
-        run.exitCode = 124
+        this.#pushLine(`command timed out after ${timeoutSeconds}s`, true)
+        finalizeTimedOutRun(run, timeoutSeconds)
         child.kill('SIGTERM')
-      }, 120000)
+      }, timeoutSeconds * 1000)
 
       const consume = (chunk: Buffer | string, isError: boolean) => {
         for (const raw of String(chunk).split('\n')) {
           const text = stripAnsi(raw).trimEnd()
           if (!text.trim()) continue
-          const parsed = parseErrorLine(text)
+          const parsed = parseErrorLineWithCompiledRegex(text, options.compiledErrorRegex)
           const errorLine = isError || parsed.isError
           this.#pushLine(text, errorLine)
           appendTail(run, errorLine ? 'stderr' : 'stdout', text)
@@ -301,11 +356,11 @@ export class ShellSidecar extends EventEmitter {
     })
   }
 
-  #startRun(id: string, command: string): ShellRun {
+  #startRun(id: string, command: string, cwd = this.#cwd): ShellRun {
     const run: ShellRun = {
       id,
       command,
-      cwd: this.#cwd,
+      cwd,
       startedAt: new Date().toISOString(),
       stdout: '',
       stderr: '',
@@ -355,6 +410,26 @@ export class ShellSidecar extends EventEmitter {
 const ANSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\][^\x07]*\x07|\x1b[^[\]]/g
 function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '').replace(/\r/g, '')
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function compileRunOptions(options: ShellRunOptions): RuntimeShellRunOptions {
+  if (!options.errorRegex) return { ...options }
+  try {
+    return { ...options, compiledErrorRegex: new RegExp(options.errorRegex) }
+  } catch {
+    return { ...options, compiledErrorRegex: null }
+  }
+}
+
+export function finalizeTimedOutRun(run: ShellRun, timeoutSeconds: number): void {
+  const message = `command timed out after ${timeoutSeconds}s`
+  appendTail(run, 'stderr', message)
+  run.exitCode = 124
+  run.endedAt = new Date().toISOString()
 }
 
 function isPlainInput(data: string): boolean {

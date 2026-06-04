@@ -65,6 +65,24 @@ describe('CommandRegistry', () => {
     assert.deepEqual(events, ['shell:npm test'])
   })
 
+  it('keeps old register signature and records command sources', () => {
+    const registry = new CommandRegistry()
+    registry.register('builtin.one', 'builtin one', () => undefined)
+    registry.register('plugin.one', 'plugin one', () => undefined, { source: 'plugin', description: 'from plugin' })
+    registerConfigCommands({
+      commands: {
+        'config.one': { type: 'editor.insert', text: 'x' },
+      },
+    }, registry)
+
+    const byId = new Map(registry.list().map(command => [command.id, command]))
+    assert.equal(byId.get('builtin.one')?.source, 'builtin')
+    assert.equal(byId.get('plugin.one')?.source, 'plugin')
+    assert.equal(byId.get('plugin.one')?.description, 'from plugin')
+    assert.equal(byId.get('config.one')?.source, 'config')
+    assert.deepEqual(registry.sourceCounts(), { builtin: 1, config: 1, plugin: 1, eval: 0 })
+  })
+
   it('executes directive arrays in order', async () => {
     const events: string[] = []
     const ctx = makeCtx(events)

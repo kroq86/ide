@@ -37,6 +37,12 @@ export function shouldArmWorkflowTabBracket(key: { escape?: boolean }, input: st
 export type QeTask = {
   name: string
   command: string
+  cwd?: string
+  runCommand?: string
+  errorRegex?: string
+  autoJumpToError?: boolean
+  closePanelOnSuccess?: boolean
+  timeoutSeconds?: number
   tab?: 'process' | 'shell'
 }
 
@@ -52,6 +58,7 @@ export type BufferTabInput = {
   name: string
   filename: string | null
   dirty: boolean
+  temporary?: boolean
   active: boolean
   lastUsedAt: number
 }
@@ -103,9 +110,25 @@ export function normalizeTasks(tasks: readonly QeTask[] | undefined): QeTask[] {
     .map(task => ({
       name: task.name.trim(),
       command: task.command.trim(),
+      cwd: normalizeOptionalString(task.cwd),
+      runCommand: normalizeOptionalString(task.runCommand),
+      errorRegex: normalizeOptionalString(task.errorRegex),
+      autoJumpToError: task.autoJumpToError === true,
+      closePanelOnSuccess: task.closePanelOnSuccess === true,
+      timeoutSeconds: normalizeTimeoutSeconds(task.timeoutSeconds),
       tab: task.tab === 'shell' ? 'shell' as const : task.tab === 'process' ? 'process' as const : undefined,
     }))
     .filter(task => task.name.length > 0 && task.command.length > 0)
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function normalizeTimeoutSeconds(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.max(1, Math.floor(value))
+    : undefined
 }
 
 export function sessionFromBuffers(
@@ -194,12 +217,13 @@ function orderTabs(buffers: BufferTabInput[]): BufferTabInput[] {
 
 function makeTabSegment(buffer: BufferTabInput, index: number): Extract<BufferTabSegment, { kind: 'tab' }> {
   const marker = buffer.dirty ? '*' : ' '
+  const temp = buffer.temporary ? '~' : ' '
   const active = buffer.active ? '>' : ' '
   const name = buffer.name || buffer.filename || '*scratch*'
   return {
     kind: 'tab',
     id: buffer.id,
-    label: ` ⌥${index + 1} ${active}${marker} ${name} `,
+    label: ` ⌥${index + 1} ${active}${marker}${temp} ${name} `,
     active: buffer.active,
     dirty: buffer.dirty,
   }

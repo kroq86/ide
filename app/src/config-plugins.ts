@@ -115,8 +115,8 @@ export type PluginRegisterResult = {
 export async function registerPluginModule(mod: QePluginModule, registry: CommandRegistry): Promise<PluginRegisterResult> {
   const merged: Record<string, ConfigAction> = {}
   collectFromModule(mod, merged)
-  const commandIds = registerCommandActions(merged, registry)
-  await runSetupFromModule(mod, registry)
+  const commandIds = registerCommandActions(merged, registry, 'plugin')
+  await registry.withSource('plugin', () => runSetupFromModule(mod, registry))
   return { commandIds, commands: merged }
 }
 
@@ -148,18 +148,37 @@ export function collectStartupFromModule(mod: QePluginModule): ConfigAction | un
   return undefined
 }
 
+const EVAL_EXPORT_SKIP = new Set(['default', 'setup', 'commands'])
+
+/** Named exports that are config actions (onStartup, onShutdown, etc.). */
+export function collectEvalExportsFromModule(mod: QePluginModule): Array<{ name: string; action: ConfigAction }> {
+  const out: Array<{ name: string; action: ConfigAction }> = []
+  for (const [name, value] of Object.entries(mod as Record<string, unknown>)) {
+    if (EVAL_EXPORT_SKIP.has(name)) continue
+    if (isConfigAction(value)) out.push({ name, action: value as ConfigAction })
+  }
+  return out
+}
+
+export function moduleHasEvaluableShape(mod: QePluginModule): boolean {
+  if (Object.keys(extractCommandsFromModule(mod)).length > 0) return true
+  if (mod.setup != null) return true
+  if (collectEvalExportsFromModule(mod).length > 0) return true
+  if (mod.default != null && typeof mod.default !== 'function') return true
+  return false
+}
+
 /** Run plugin exports meant to execute immediately (e.g. eval selection of `onStartup`). */
 export async function runPluginEvalSideEffects(
   mod: QePluginModule,
   registry: CommandRegistry,
   ctx: import('./config.js').EditorContext,
 ): Promise<string[]> {
+  const { runConfigAction } = await import('./config-runtime.js')
   const ran: string[] = []
-  const startup = collectStartupFromModule(mod)
-  if (startup) {
-    const { runConfigAction } = await import('./config-runtime.js')
-    await runConfigAction(startup, ctx, registry)
-    ran.push('onStartup')
+  for (const { name, action } of collectEvalExportsFromModule(mod)) {
+    await runConfigAction(action, ctx, registry)
+    ran.push(name)
   }
   return ran
 }

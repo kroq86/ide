@@ -10,6 +10,8 @@ import type {
 import type { Diagnostic, Snapshot } from '../protocol.js'
 import type { GitDisplayLine, GitLogEntry, GitPanelView, GitStatusData } from '../git.js'
 import type { CmdItem, LeaderNode } from '../leader.js'
+import type { BuildPanelState } from '../build-panel.js'
+import type { TroubleshootingRow } from '../troubleshooting.js'
 
 export type EditorMode = 'normal' | 'insert' | 'visual' | 'command' | 'search'
 
@@ -20,6 +22,7 @@ export type EditorBuffer = {
   snapshot: Snapshot | null
   status: string
   lastUsedAt: number
+  temporary?: boolean
   jumpTo?: { row: number; col: number }
   openHookFired?: boolean
 }
@@ -45,6 +48,17 @@ export type PromptState =
   | { type: 'commit'; message: string }
   | { type: 'model'; query: string; candidates: string[]; selected: number }
   | { type: 'configPick'; id: number; title: string; query: string; items: NormalizedPickItem[]; selected: number }
+  | {
+    type: 'directivePick'
+    row: number
+    col: number
+    quote: string
+    partial: string
+    replaceStartCol: number
+    query: string
+    items: NormalizedPickItem[]
+    selected: number
+  }
   | { type: 'configInput'; id: number; title: string; value: string }
   | { type: 'configConfirm'; id: number; title: string; body?: string }
 
@@ -75,6 +89,8 @@ export type Panel =
   | { type: 'shell' }
   | { type: 'whichkey'; node: LeaderNode; path: string }
   | { type: 'cmdpalette'; query: string; cursor: number; items: CmdItem[] }
+  | { type: 'troubleshooting'; rows: TroubleshootingRow[] }
+  | { type: 'build'; state: BuildPanelState; cursor: number }
   | { type: 'diagnostics'; diagnostics: Diagnostic[]; cursor: number; title: string }
   | { type: 'lsp'; title: string; lines: string[] }
   | { type: 'git'; data: GitStatusData; cursor: number; pendingKey: string | null; logEntries: GitLogEntry[] | null; gitError?: string; view: GitPanelView }

@@ -22,6 +22,7 @@ export function WorkflowTabBar({
         name: buffer.name,
         filename: buffer.snapshot?.filename ?? buffer.filename,
         dirty: isDirty(buffer),
+        temporary: buffer.temporary === true,
         active: !processActive && !aiActive && buffer.id === activeBufferId,
         lastUsedAt: buffer.lastUsedAt,
       })),

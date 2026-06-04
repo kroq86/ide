@@ -5,7 +5,8 @@ import { dirname, resolve as resolvePath } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { checkCommandDanger } from '../shell.js'
 import { setActiveModel, getProviderLabel } from '../ai-registry.js'
-import { printable, printableText, isLeafAction, flattenLeader, bufferName } from '../leader.js'
+import { printable, printableText, isLeafAction, flattenLeader, bufferName, commandPaletteMatch } from '../leader.js'
+import { buildErrorAt, moveBuildErrorCursor } from '../build-panel.js'
 import {
   buildGitDisplayLines, getGitLog, loadFileHunks, hunkNewStartRow, resolveRepoFilePath,
   stageEntry, unstageEntry, commitGit, pullGit, pushGit, updateGitEntry,
@@ -18,6 +19,7 @@ import {
   isWorkflowTabPrevInput,
   shouldArmWorkflowTabBracket,
 } from '../workflow.js'
+import { newlineInsertText } from '../insert-indent.js'
 import { filterBuffers, selectionBounds, getVisualText, expandRegionOnce } from './index.js'
 import { readClipboardText, normalizePromptPaste, promptPasteText } from '../prompt-clipboard.js'
 
@@ -34,14 +36,15 @@ export type EditorInputDeps = {
   clearAiChat: unknown
   clearSearchHighlights: unknown
   cmdBuf: unknown
-  completionStreaming: unknown
+  completionStreaming: boolean
+  dismissInlineCompletion: () => void
   dangerPrompt: unknown
   enterNormal: unknown
   executeCommand: unknown
   filename: unknown
   fixState: unknown
   fuzzyRank: unknown
-  ghostTextRef: unknown
+  ghostTextRef: { current: string | null }
   jumpToMatch: unknown
   leaderMap: unknown
   lspOverlay: unknown
@@ -66,10 +69,10 @@ export type EditorInputDeps = {
   setAiScrollOffset: unknown
   setAiStreaming: unknown
   setCmdBuf: unknown
-  setCompletionStreaming: unknown
+  setCompletionStreaming: (value: boolean) => void
   setDangerPrompt: unknown
   setFixState: unknown
-  setGhostTextSync: unknown
+  setGhostTextSync: (value: string | null) => void
   setMode: unknown
   setPanel: unknown
   setPrompt: unknown
@@ -92,7 +95,9 @@ export type EditorInputDeps = {
   status: unknown
   switchWorkflowTabByIndex: unknown
   cycleWorkflowTab: unknown
-  triggerCompletion: unknown
+  triggerCompletion: () => void
+  suggestConfigDirectiveCompletion: (colOverride?: number, rowOverride?: number, lineOverride?: string) => boolean
+  applyDirectivePick: (value: string) => void
   visualAnchor: unknown
   visualExpandHistoryRef: unknown
   visualLineMode: unknown
@@ -118,6 +123,7 @@ export function createEditorInputHandler(
     clearSearchHighlights,
     cmdBuf,
     completionStreaming,
+    dismissInlineCompletion,
     dangerPrompt,
     enterNormal,
     executeCommand,
@@ -176,6 +182,8 @@ export function createEditorInputHandler(
     switchWorkflowTabByIndex,
     cycleWorkflowTab,
     triggerCompletion,
+    suggestConfigDirectiveCompletion,
+    applyDirectivePick,
     visualAnchor,
     visualExpandHistoryRef,
     visualLineMode,
@@ -184,8 +192,34 @@ export function createEditorInputHandler(
     yankText,
   } = deps
 
+  const hasInlineCompletionUi = () =>
+    (ghostTextRef.current?.length ?? 0) > 0 || completionStreaming
+
+  const handleInlineCompletionTab = () => {
+    const g = ghostTextRef.current
+    if (g !== null && g.length > 0) {
+      sidecar.insert(g)
+      dismissInlineCompletion()
+    } else if (completionStreaming) {
+      dismissInlineCompletion()
+    } else {
+      triggerCompletion()
+    }
+  }
+
+  const isShiftTab = (key: Key, ch: string) =>
+    Boolean(key.shift && (key.tab || ch === '\t'))
+
   return (input, key, event) => {
     const sequence = event?.keypress?.sequence
+    const pastedText = (() => {
+      if (event?.keypress?.isPasted) return normalizePromptPaste(input)
+      if ((key.ctrl || key.meta || key.super) && (input === 'v' || input === 'V')) {
+        const clip = readClipboardText()
+        return clip ? normalizePromptPaste(clip) : null
+      }
+      return null
+    })()
 
     if (shouldArmWorkflowTabBracket(key, input)) {
       workflowTabBracketArmUntilRef.current = Date.now() + 150
@@ -234,6 +268,52 @@ export function createEditorInputHandler(
     }
 
     // Config UI prompts must run before panels (AI/shell otherwise steal keystrokes).
+    if (prompt?.type === 'directivePick') {
+      if (key.escape) {
+        replacePrompt(null)
+        return
+      }
+      const q = prompt.query.toLowerCase()
+      const filtered = prompt.items.filter(item =>
+        !q || item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q),
+      )
+      const selected = Math.min(prompt.selected, Math.max(0, filtered.length - 1))
+      const chosen = filtered[selected]?.value
+      if (key.return || ((key.tab || input === '\t') && !key.shift)) {
+        if (chosen) applyDirectivePick(chosen)
+        return
+      }
+      if (isShiftTab(key, input)) {
+        setPrompt(prev => prev?.type === 'directivePick' ? { ...prev, query: prev.query + '\t' } : prev)
+        return
+      }
+      if (key.upArrow || input === 'k') {
+        setPrompt(prev => prev?.type === 'directivePick'
+          ? { ...prev, selected: Math.max(0, prev.selected - 1) }
+          : prev)
+        return
+      }
+      if (key.downArrow || input === 'j') {
+        setPrompt(prev => prev?.type === 'directivePick'
+          ? { ...prev, selected: Math.min(Math.max(0, filtered.length - 1), prev.selected + 1) }
+          : prev)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setPrompt(prev => prev?.type === 'directivePick'
+          ? { ...prev, query: prev.query.slice(0, -1), selected: 0 }
+          : prev)
+        return
+      }
+      if (!key.ctrl && !key.meta && printable(input)) {
+        setPrompt(prev => prev?.type === 'directivePick'
+          ? { ...prev, query: prev.query + input, selected: 0 }
+          : prev)
+        return
+      }
+      return
+    }
+
     if (prompt?.type === 'configPick') {
       if (key.escape) {
         resolveUiPrompt(prompt.id, null)
@@ -323,14 +403,41 @@ export function createEditorInputHandler(
       return
     }
 
+    // ── Read-only info panels ────────────────────────────────────────────────
+    if (panel?.type === 'troubleshooting') {
+      if (key.escape || key.return) { setPanel(null); return }
+      return
+    }
+
+    if (panel?.type === 'build') {
+      if (key.escape) { setPanel(null); return }
+      if (key.return) {
+        const error = buildErrorAt(panel.state, panel.cursor)
+        if (error) actions.openFile(resolvePath(error.cwd, error.file), { row: error.row, col: error.col })
+        setPanel(null)
+        return
+      }
+      if (input === 'j' || key.downArrow) {
+        setPanel(prev => prev?.type === 'build'
+          ? { ...prev, cursor: moveBuildErrorCursor(prev.state, prev.cursor, 1) }
+          : prev)
+        return
+      }
+      if (input === 'k' || key.upArrow) {
+        setPanel(prev => prev?.type === 'build'
+          ? { ...prev, cursor: moveBuildErrorCursor(prev.state, prev.cursor, -1) }
+          : prev)
+        return
+      }
+      return
+    }
+
     // ── Command palette ───────────────────────────────────────────────────────
     if (panel?.type === 'cmdpalette') {
       if (key.escape) { setPanel(null); return }
       if (key.return) {
         const { items, query, cursor } = panel
-        const filtered = query
-          ? items.filter(it => it.label.toLowerCase().includes(query.toLowerCase()) || it.keys.includes(query))
-          : items
+        const filtered = items.filter(it => commandPaletteMatch(it, query))
         const item = filtered[cursor % Math.max(1, filtered.length)]
         if (item) { item.action(); setPanel(null) }
         return
@@ -479,6 +586,7 @@ export function createEditorInputHandler(
         }
         return
       }
+      if (pastedText)                                  { setAiInput(prev => prev + pastedText); return }
       if (key.backspace || key.delete)                 { setAiInput(prev => prev.slice(0, -1)); return }
       if (!key.ctrl && !key.meta && printable(input))  { setAiInput(prev => prev + input); return }
       return
@@ -762,6 +870,10 @@ export function createEditorInputHandler(
         setPrompt(prev => prev?.type === 'commit' ? { ...prev, message: prev.message.slice(0, -1) } : prev)
         return
       }
+      if (pastedText) {
+        setPrompt(prev => prev?.type === 'commit' ? { ...prev, message: prev.message + pastedText.replace(/\n/g, ' ') } : prev)
+        return
+      }
       if (!key.ctrl && !key.meta && printable(input)) {
         setPrompt(prev => prev?.type === 'commit' ? { ...prev, message: prev.message + input } : prev)
         return
@@ -785,6 +897,10 @@ export function createEditorInputHandler(
       }
       if (key.backspace || key.delete) {
         setPrompt(prev => prev?.type === 'saveAs' ? { ...prev, query: prev.query.slice(0, -1) } : prev)
+        return
+      }
+      if (pastedText) {
+        setPrompt(prev => prev?.type === 'saveAs' ? { ...prev, query: prev.query + pastedText.replace(/\n/g, '') } : prev)
         return
       }
       if (!key.ctrl && !key.meta && printable(input)) {
@@ -817,6 +933,15 @@ export function createEditorInputHandler(
           if (prev?.type !== 'file') return prev
           const query = prev.query.slice(0, -1)
           const ranked = query ? fuzzyRank(query, prev.candidates).slice(0, 50) : prev.candidates.slice(0, 50).map(p => ({ path: p, score: 0, indices: [] }))
+          return { ...prev, query, ranked, selectedIdx: 0 }
+        })
+        return
+      }
+      if (pastedText) {
+        setPrompt(prev => {
+          if (prev?.type !== 'file') return prev
+          const query = prev.query + pastedText.replace(/\n/g, '')
+          const ranked = fuzzyRank(query, prev.candidates).slice(0, 50)
           return { ...prev, query, ranked, selectedIdx: 0 }
         })
         return
@@ -860,6 +985,12 @@ export function createEditorInputHandler(
         setPrompt(prev => prev?.type === 'buffer' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
         return
       }
+      if (pastedText) {
+        setPrompt(prev => prev?.type === 'buffer'
+          ? { ...prev, query: prev.query + pastedText.replace(/\n/g, ''), selected: 0 }
+          : prev)
+        return
+      }
       if (!key.ctrl && !key.meta && printable(input)) {
         setPrompt(prev => prev?.type === 'buffer' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
         return
@@ -897,6 +1028,12 @@ export function createEditorInputHandler(
         setPrompt(prev => prev?.type === 'model' ? { ...prev, query: prev.query.slice(0, -1), selected: 0 } : prev)
         return
       }
+      if (pastedText) {
+        setPrompt(prev => prev?.type === 'model'
+          ? { ...prev, query: prev.query + pastedText.replace(/\n/g, ''), selected: 0 }
+          : prev)
+        return
+      }
       if (!key.ctrl && !key.meta && printable(input)) {
         setPrompt(prev => prev?.type === 'model' ? { ...prev, query: prev.query + input, selected: 0 } : prev)
         return
@@ -913,6 +1050,7 @@ export function createEditorInputHandler(
         setCmdBuf(prev => { if (prev.length <= 0) { enterNormal(); return prev } return prev.slice(0, -1) })
         return
       }
+      if (pastedText) { setCmdBuf(prev => prev + pastedText.replace(/\n/g, ' ')); return }
       if (!key.ctrl && !key.meta && printable(input)) { setCmdBuf(prev => prev + input); return }
       return
     }
@@ -980,6 +1118,7 @@ export function createEditorInputHandler(
         return
       }
       if (key.backspace || key.delete) { setSearchBuf(prev => prev.slice(0, -1)); return }
+      if (pastedText) { setSearchBuf(prev => prev + pastedText.replace(/\n/g, '')); return }
       if (!key.ctrl && !key.meta && printable(input)) { setSearchBuf(prev => prev + input); return }
       return
     }
@@ -991,28 +1130,39 @@ export function createEditorInputHandler(
       if (key.leftArrow)              { sidecar.move('left');  return }
       if (key.rightArrow)             { sidecar.move('right'); return }
       if (key.backspace || key.delete){ sidecar.deleteBackward(); return }
-      if (key.return)                 { sidecar.insert('\n'); return }
+      if (key.return) {
+        const lines = snapshot?.lines ?? ['']
+        const cursor = snapshot?.cursor ?? { row: 0, col: 0 }
+        sidecar.insert(newlineInsertText(lines, cursor))
+        return
+      }
       if (key.ctrl && input === 's')  { saveCurrentBuffer(); return }
+      if (pastedText) {
+        if (hasInlineCompletionUi()) dismissInlineCompletion()
+        sidecar.insert(pastedText)
+        return
+      }
+      if (isShiftTab(key, input)) {
+        if (hasInlineCompletionUi()) dismissInlineCompletion()
+        sidecar.insert('\t')
+        return
+      }
       if (key.tab || input === '\t') {
-        const g = ghostTextRef.current
-        if (g !== null && g.length > 0) {
-          // Already sanitized each chunk while streaming — second full pass was stripping valid gaps to ''.
-          sidecar.insert(g)
-          setGhostTextSync(null)
-          abortRef.current = null
-        } else {
-          triggerCompletion()
-        }
+        handleInlineCompletionTab()
         return
       }
       if (!key.ctrl && !key.meta && printable(input)) {
-        if (ghostTextRef.current !== null || completionStreaming) {
-          abortRef.current?.abort()
-          abortRef.current = null
-          setGhostTextSync(null)
-          setCompletionStreaming(false)
-        }
+        if (hasInlineCompletionUi()) dismissInlineCompletion()
         sidecar.insert(input)
+        if (input === '.') {
+          const row = snapshot?.cursor?.row ?? 0
+          const col = snapshot?.cursor?.col ?? 0
+          const line = snapshot?.lines?.[row] ?? ''
+          const nextCol = col + input.length
+          const patched = line.slice(0, col) + input + line.slice(col)
+          suggestConfigDirectiveCompletion(nextCol, row, patched)
+        }
+        return
       }
       return
     }
@@ -1129,21 +1279,26 @@ export function createEditorInputHandler(
     }
     if (key.ctrl && input === 's') { saveCurrentBuffer(); return }
     if (key.ctrl && input === 'r') { sidecar.redo(); return }
+    if (input === 'p' && !key.ctrl && !key.meta && !key.super) {
+      const reg = yankRegisterRef.current
+      const text = reg
+        ? (reg.lineWise ? `${reg.text}\n` : reg.text)
+        : normalizePromptPaste(readClipboardText() ?? '')
+      if (text) sidecar.insert(text)
+      return
+    }
     if (key.upArrow)    { sidecar.move('up');    return }
     if (key.downArrow)  { sidecar.move('down');  return }
     if (key.leftArrow)  { sidecar.move('left');  return }
     if (key.rightArrow) { sidecar.move('right'); return }
 
     // Inline completion (same as insert mode — works after SPC a c while still in normal)
+    if (isShiftTab(key, input)) {
+      sidecar.insert('\t')
+      return
+    }
     if (key.tab || input === '\t') {
-      const g = ghostTextRef.current
-      if (g !== null && g.length > 0) {
-        sidecar.insert(g)
-        setGhostTextSync(null)
-        abortRef.current = null
-      } else {
-        triggerCompletion()
-      }
+      handleInlineCompletionTab()
       return
     }
 
